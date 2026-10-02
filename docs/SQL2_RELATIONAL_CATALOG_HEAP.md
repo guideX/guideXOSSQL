@@ -352,7 +352,7 @@ current state, last validation failure, and the SQL2 relational fields:
 ## 13. Verification status
 
 * **Hosted proof: complete.** Both the SQL1 suite (172 checks) and the SQL2
-  acceptance suite (10304 checks) pass on the hosted toolchain.
+  acceptance suite (10398 checks) pass on the hosted toolchain.
 * **QEMU / bare-metal proof: not performed** in SQL2.
 * **Native guideXOS VFS integration: deferred.** The guideXOS Server `FS`
   interface still lacks the positional read/write/flush primitives required by

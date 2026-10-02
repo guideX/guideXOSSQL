@@ -81,6 +81,6 @@ build/gxdb_cli inspect sample.gxdb
 
 ## Status
 
-Hosted proof complete (SQL1: 172 checks, SQL2: 10304 checks). QEMU and
+Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks). QEMU and
 bare-metal proof are deferred to the phase that provides a native
 `IDatabaseFile` backend over the guideXOS VFS / block device.
