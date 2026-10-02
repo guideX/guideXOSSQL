@@ -410,6 +410,66 @@ void testTypePersistence() {
     std::remove(path.c_str());
 }
 
+void testTypeBoundaries() {
+    std::printf("type boundaries\n");
+    const std::string path = uniquePath("boundaries");
+
+    std::unique_ptr<Database> db;
+    DatabaseCreateOptions options;
+    options.pageSize = 65536; // largest page
+    CHECK_STATUS(Database::create(path, options, db), DbStatus::Ok);
+    if (!db) return;
+
+    TableDefinition def("T");
+    def.columns.push_back(ColumnDefinition("Txt", DbType::Text, false));
+    def.columns.push_back(ColumnDefinition("Blb", DbType::Blob, false));
+    uint32_t id = 0;
+    CHECK_STATUS(db->createTable(def, id), DbStatus::Ok);
+    std::unique_ptr<Table> table;
+    CHECK_STATUS(db->openTable("T", table), DbStatus::Ok);
+
+    // A large text and blob that fit in a 64K page are accepted.
+    const uint32_t kBig = 30000;
+    std::vector<uint8_t> bigBlob(kBig, 0xAB);
+    CHECK_STATUS(table->insert({DbValue::text(std::string(kBig, 'x')),
+                                DbValue::blob(bigBlob.data(), bigBlob.size())}),
+                 DbStatus::Ok);
+
+    // The text policy maximum + 1 is rejected.
+    CHECK_STATUS(table->insert({DbValue::text(std::string(kMaxTextBytes + 1, 'y')),
+                                DbValue::blob(nullptr, 0)}),
+                 DbStatus::InvalidArgument);
+
+    // A blob at the policy maximum + 1 is rejected.
+    std::vector<uint8_t> hugeBlob(kMaxBlobBytes + 1, 0xCD);
+    CHECK_STATUS(table->insert({DbValue::text("ok"),
+                                DbValue::blob(hugeBlob.data(), hugeBlob.size())}),
+                 DbStatus::InvalidArgument);
+
+    // A text at the policy maximum does not fit any page and is rejected.
+    CHECK_STATUS(table->insert({DbValue::text(std::string(kMaxTextBytes, 'z')),
+                                DbValue::blob(nullptr, 0)}),
+                 DbStatus::InvalidArgument);
+
+    CHECK_STATUS(db->flush(), DbStatus::Ok);
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    std::unique_ptr<Database> reopened;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+    if (!reopened) return;
+    std::unique_ptr<Table> rt;
+    CHECK_STATUS(reopened->openTable("T", rt), DbStatus::Ok);
+    std::unique_ptr<TableScan> scan;
+    CHECK_STATUS(rt->scanStart(scan), DbStatus::Ok);
+    std::vector<DbValue> row;
+    CHECK(scan->next(row));
+    CHECK(row[0].textValue().size() == kBig);
+    CHECK(row[1].blobValue().size() == kBig);
+    CHECK(!scan->next(row));
+    CHECK_STATUS(reopened->close(), DbStatus::Ok);
+    std::remove(path.c_str());
+}
+
 void testTypeErrors() {
     std::printf("type errors\n");
     const std::string path = uniquePath("typeerr");
@@ -608,8 +668,8 @@ void testCatalogGrowth() {
             break;
         }
     }
-    CHECK(db->diagnostics().catalogPageCount >= 2);
     CHECK_STATUS(db->flush(), DbStatus::Ok);
+    CHECK(db->diagnostics().catalogPageCount >= 2);
     CHECK_STATUS(db->close(), DbStatus::Ok);
 
     std::unique_ptr<Database> reopened;
@@ -690,7 +750,12 @@ void testLifecycle() {
     bool allOk = true;
     for (int cycle = 0; cycle < 10 && allOk; ++cycle) {
         std::unique_ptr<Database> db;
-        DbResult result = Database::create(path, createOptions, db);
+        DbResult result;
+        if (cycle == 0) {
+            result = Database::create(path, createOptions, db);
+        } else {
+            result = Database::open(path, DatabaseOpenOptions(), db);
+        }
         if (!result.isOk() || !db) { allOk = false; break; }
 
         if (cycle == 0) {
@@ -734,6 +799,132 @@ void testLifecycle() {
         if (!reopened->close().isOk()) { allOk = false; break; }
     }
     CHECK(allOk);
+    std::remove(path.c_str());
+}
+
+void testStatsPersistenceAcrossSessions() {
+    std::printf("stats persistence across sessions\n");
+    const std::string path = uniquePath("statspersist");
+
+    // Session 1: create table, insert, flush, close.
+    std::unique_ptr<Database> db;
+    CHECK_STATUS(Database::create(path, DatabaseCreateOptions(), db), DbStatus::Ok);
+    if (!db) return;
+    uint32_t id = 0;
+    CHECK_STATUS(db->createTable(makeUsersSchema(), id), DbStatus::Ok);
+    std::unique_ptr<Table> table;
+    CHECK_STATUS(db->openTable("Users", table), DbStatus::Ok);
+    for (int i = 0; i < 10; ++i) {
+        CHECK_STATUS(table->insert({DbValue::int64(i), DbValue::text("A"),
+                                    DbValue::boolean(true)}), DbStatus::Ok);
+    }
+    CHECK_STATUS(db->flush(), DbStatus::Ok);
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    // Session 2: reopen, insert more, flush, close. The catalog was already
+    // saved in session 1, so this exercises the insert-marks-dirty path.
+    std::unique_ptr<Database> db2;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), db2), DbStatus::Ok);
+    if (!db2) return;
+    std::unique_ptr<Table> table2;
+    CHECK_STATUS(db2->openTable("Users", table2), DbStatus::Ok);
+    for (int i = 10; i < 20; ++i) {
+        CHECK_STATUS(table2->insert({DbValue::int64(i), DbValue::text("B"),
+                                     DbValue::boolean(false)}), DbStatus::Ok);
+    }
+    CHECK(table2->rowCount() == 20);
+    CHECK_STATUS(db2->flush(), DbStatus::Ok);
+    CHECK_STATUS(db2->close(), DbStatus::Ok);
+
+    // Session 3: verify the durable row count and heap page count.
+    std::unique_ptr<Database> db3;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), db3), DbStatus::Ok);
+    if (!db3) return;
+    std::unique_ptr<Table> table3;
+    CHECK_STATUS(db3->openTable("Users", table3), DbStatus::Ok);
+    CHECK(table3->rowCount() == 20);
+    CHECK(table3->heapPageCount() >= 1);
+    std::unique_ptr<TableScan> scan;
+    CHECK_STATUS(table3->scanStart(scan), DbStatus::Ok);
+    std::vector<DbValue> row;
+    int count = 0;
+    while (scan->next(row)) {
+        ++count;
+    }
+    CHECK(count == 20);
+    CHECK_STATUS(db3->close(), DbStatus::Ok);
+    std::remove(path.c_str());
+}
+
+void testBufferManagerDirect() {
+    std::printf("buffer manager direct\n");
+    const std::string path = uniquePath("bufdirect");
+    std::unique_ptr<Database> db;
+    CHECK_STATUS(Database::create(path, DatabaseCreateOptions(), db), DbStatus::Ok);
+    if (!db) return;
+    DatabaseFile& file = db->file();
+
+    uint64_t p[4];
+    for (int i = 0; i < 4; ++i) {
+        CHECK_STATUS(file.allocatePage(PageType::Data, p[i]), DbStatus::Ok);
+    }
+
+    BufferManager buf(file, 2);
+    CHECK(buf.capacity() == 2);
+
+    // Cache hit: pinning the same page twice returns the same slot.
+    BufferSlot* a = nullptr;
+    CHECK_STATUS(buf.pinPage(p[0], a), DbStatus::Ok);
+    BufferSlot* aAgain = nullptr;
+    CHECK_STATUS(buf.pinPage(p[0], aAgain), DbStatus::Ok);
+    CHECK(aAgain == a);
+    CHECK(buf.residentCount() == 1);
+    buf.unpin(*a);
+    buf.unpin(*aAgain);
+
+    // Eviction: with p0,p1 resident, pinning p2 evicts the LRU (p0).
+    BufferSlot* b = nullptr;
+    CHECK_STATUS(buf.pinPage(p[1], b), DbStatus::Ok);
+    BufferSlot* c = nullptr;
+    CHECK_STATUS(buf.pinPage(p[2], c), DbStatus::Ok);
+    CHECK(buf.residentCount() == 2);
+    buf.unpin(*b);
+    buf.unpin(*c);
+
+    // Pinning: a pinned page is never evicted; exhausting pins fails.
+    BufferSlot* d = nullptr;
+    CHECK_STATUS(buf.pinPage(p[1], d), DbStatus::Ok);
+    BufferSlot* e = nullptr;
+    CHECK_STATUS(buf.pinPage(p[2], e), DbStatus::Ok);
+    BufferSlot* f = nullptr;
+    CHECK_STATUS(buf.pinPage(p[3], f), DbStatus::Internal);
+    buf.unpin(*d);
+    buf.unpin(*e);
+
+    // Dirty eviction: a dirty page is written back when evicted.
+    BufferSlot* g = nullptr;
+    CHECK_STATUS(buf.pinPage(p[1], g), DbStatus::Ok);
+    buf.markDirty(*g);
+    CHECK(buf.dirtyCount() == 1);
+    buf.unpin(*g);
+    BufferSlot* g2 = nullptr;
+    CHECK_STATUS(buf.pinPage(p[2], g2), DbStatus::Ok);
+    buf.unpin(*g2);
+    BufferSlot* h = nullptr;
+    CHECK_STATUS(buf.pinPage(p[3], h), DbStatus::Ok);
+    CHECK(buf.dirtyCount() == 0);
+    buf.unpin(*h);
+
+    // Flush writes all dirty pages.
+    BufferSlot* i = nullptr;
+    CHECK_STATUS(buf.pinPage(p[1], i), DbStatus::Ok);
+    buf.markDirty(*i);
+    CHECK(buf.dirtyCount() == 1);
+    CHECK_STATUS(buf.flush(), DbStatus::Ok);
+    CHECK(buf.dirtyCount() == 0);
+    buf.unpin(*i);
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
     std::remove(path.c_str());
 }
 
@@ -954,6 +1145,39 @@ void buildCorruptBase(const std::string& path) {
     db->close();
 }
 
+// Builds a base with enough rows to span several heap pages.
+void buildMultiPageHeapBase(const std::string& path) {
+    std::unique_ptr<Database> db;
+    Database::create(path, DatabaseCreateOptions(), db);
+    uint32_t id = 0;
+    db->createTable(makeUsersSchema(), id);
+    std::unique_ptr<Table> table;
+    db->openTable("Users", table);
+    for (int i = 0; i < 300; ++i) {
+        table->insert({DbValue::int64(i), DbValue::text("N" + std::to_string(i)),
+                       DbValue::boolean(i % 2 == 0)});
+    }
+    db->flush();
+    db->close();
+}
+
+// Builds a base whose catalog spans multiple pages.
+void buildMultiPageCatalogBase(const std::string& path) {
+    std::unique_ptr<Database> db;
+    Database::create(path, DatabaseCreateOptions(), db);
+    for (int i = 0; i < 60; ++i) {
+        TableDefinition def("T" + std::to_string(i));
+        for (int c = 0; c < 5; ++c) {
+            def.columns.push_back(ColumnDefinition("C" + std::to_string(c),
+                                                   DbType::Int32, false));
+        }
+        uint32_t id = 0;
+        db->createTable(def, id);
+    }
+    db->flush();
+    db->close();
+}
+
 void testCatalogCorruption() {
     std::printf("catalog corruption\n");
     const std::string base = uniquePath("catcorruptbase");
@@ -1007,7 +1231,83 @@ void testCatalogCorruption() {
         CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
         std::remove(work.c_str());
     }
+    // Invalid table id (0) in the first table record.
+    {
+        const std::string work = uniquePath("cattableid");
+        std::vector<uint8_t> bytes = readFileBytes(base);
+        const size_t recOffset = static_cast<size_t>(kBootstrapPageId) * pageSize +
+                                 kPageHeaderSize + kCatalogRootHeaderSize;
+        storeLe32(bytes.data() + recOffset + 0, 0); // tableId = 0
+        fixPageCrc(bytes, kBootstrapPageId, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
+        std::remove(work.c_str());
+    }
+    // Impossible column count.
+    {
+        const std::string work = uniquePath("catcolcount");
+        std::vector<uint8_t> bytes = readFileBytes(base);
+        const size_t recOffset = static_cast<size_t>(kBootstrapPageId) * pageSize +
+                                 kPageHeaderSize + kCatalogRootHeaderSize;
+        storeLe32(bytes.data() + recOffset + 8, 0xFFFFu); // columnCount huge
+        fixPageCrc(bytes, kBootstrapPageId, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
+        std::remove(work.c_str());
+    }
+    // Malformed table name length.
+    {
+        const std::string work = uniquePath("catnamelen");
+        std::vector<uint8_t> bytes = readFileBytes(base);
+        const size_t recOffset = static_cast<size_t>(kBootstrapPageId) * pageSize +
+                                 kPageHeaderSize + kCatalogRootHeaderSize;
+        storeLe32(bytes.data() + recOffset + 36, 0xFFFFu); // nameLength huge
+        fixPageCrc(bytes, kBootstrapPageId, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
+        std::remove(work.c_str());
+    }
+    // Unsupported column type id.
+    {
+        const std::string work = uniquePath("cattypeid");
+        std::vector<uint8_t> bytes = readFileBytes(base);
+        // Table record layout from recOffset: 40-byte header, then the name
+        // "Users" (5 bytes), then column records. The first column's type
+        // field is at recOffset + 40 + 5 + 4 = recOffset + 49.
+        const size_t recOffset = static_cast<size_t>(kBootstrapPageId) * pageSize +
+                                 kPageHeaderSize + kCatalogRootHeaderSize;
+        storeLe16(bytes.data() + recOffset + 49, 99); // unsupported type
+        fixPageCrc(bytes, kBootstrapPageId, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
+        std::remove(work.c_str());
+    }
     std::remove(base.c_str());
+
+    // Catalog continuation cycle.
+    {
+        const std::string mbase = uniquePath("catcyclebase");
+        buildMultiPageCatalogBase(mbase);
+        const std::string work = uniquePath("catcycle");
+        std::vector<uint8_t> bytes = readFileBytes(mbase);
+        // Read firstContinuationPageId from the root header.
+        const size_t rootPayload = static_cast<size_t>(kBootstrapPageId) * pageSize + kPageHeaderSize;
+        const uint32_t firstCont = loadLe32(bytes.data() + rootPayload + 20);
+        CHECK(firstCont >= 2);
+        // Make the first continuation page point to itself (cycle).
+        const size_t contPayload = static_cast<size_t>(firstCont) * pageSize + kPageHeaderSize;
+        storeLe64(bytes.data() + contPayload + 8, firstCont); // next = self
+        fixPageCrc(bytes, firstCont, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, openOptions, out), DbStatus::CorruptPage);
+        std::remove(work.c_str());
+        std::remove(mbase.c_str());
+    }
 }
 
 void testHeapCorruption() {
@@ -1122,6 +1422,71 @@ void testHeapCorruption() {
         std::remove(work.c_str());
     }
     std::remove(base.c_str());
+
+    // Invalid next-page pointer and page-chain cycle need a multi-page table.
+    const std::string mbase = uniquePath("heapchainbase");
+    buildMultiPageHeapBase(mbase);
+
+    // Invalid next-page pointer (points outside the allocated range).
+    {
+        const std::string work = uniquePath("heapnext");
+        std::vector<uint8_t> bytes = readFileBytes(mbase);
+        // Heap page 2 header: nextPageId at payload offset 8.
+        const size_t hdr = static_cast<size_t>(2) * pageSize + kPageHeaderSize;
+        storeLe64(bytes.data() + hdr + kHeapNextPageOffset, 999u);
+        fixPageCrc(bytes, 2, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, openOptions, db), DbStatus::Ok);
+        if (db) {
+            std::unique_ptr<Table> table;
+            if (db->openTable("Users", table).isOk()) {
+                std::unique_ptr<TableScan> scan;
+                if (table->scanStart(scan).isOk()) {
+                    std::vector<DbValue> row;
+                    int count = 0;
+                    while (scan->next(row)) {
+                        ++count;
+                    }
+                    CHECK(count > 0);
+                    CHECK(count < 300);
+                    CHECK_STATUS(scan->status(), DbStatus::CorruptPage);
+                }
+            }
+            db->close();
+        }
+        std::remove(work.c_str());
+    }
+    // Page-chain cycle (page 2 points to itself).
+    {
+        const std::string work = uniquePath("heapcycle");
+        std::vector<uint8_t> bytes = readFileBytes(mbase);
+        const size_t hdr = static_cast<size_t>(2) * pageSize + kPageHeaderSize;
+        storeLe64(bytes.data() + hdr + kHeapNextPageOffset, 2u); // page 2 -> page 2
+        fixPageCrc(bytes, 2, pageSize);
+        writeFileBytes(work, bytes);
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, openOptions, db), DbStatus::Ok);
+        if (db) {
+            std::unique_ptr<Table> table;
+            if (db->openTable("Users", table).isOk()) {
+                std::unique_ptr<TableScan> scan;
+                if (table->scanStart(scan).isOk()) {
+                    std::vector<DbValue> row;
+                    int count = 0;
+                    while (scan->next(row)) {
+                        ++count;
+                    }
+                    CHECK(count > 0);
+                    CHECK(count < 300);
+                    CHECK_STATUS(scan->status(), DbStatus::CorruptPage);
+                }
+            }
+            db->close();
+        }
+        std::remove(work.c_str());
+    }
+    std::remove(mbase.c_str());
 }
 
 void testSql1Compatibility() {
@@ -1163,18 +1528,30 @@ void testSql1Compatibility() {
 } // namespace
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("guideXOS SQL2 relational catalog and heap table tests\n");
-    std::printf("temp dir: %s\n", testDir().c_str());
+    std::string dir = testDir();
+    std::printf("temp dir: %s\n", dir.c_str());
+
+    // Remove stale files from any previous crashed run so unique names do not
+    // collide (the case counter resets each run).
+    std::string cmd = "del /q \"" + dir + "\\*.gxdb\" >nul 2>nul";
+    if (std::system(cmd.c_str()) == 0) {
+        // best effort
+    }
 
     testCreateAndReopen();
     testDuplicateHandling();
     testTypePersistence();
+    testTypeBoundaries();
     testTypeErrors();
     testMultipleRows();
     testMultipleTables();
     testCatalogGrowth();
     testBufferManager();
+    testBufferManagerDirect();
     testLifecycle();
+    testStatsPersistenceAcrossSessions();
     testReadOnly();
     testEmptyTable();
     testApiDemo();

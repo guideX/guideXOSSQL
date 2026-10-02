@@ -74,10 +74,14 @@ public:
     // Marks the catalog as needing a durable re-save on the next flush().
     void markCatalogDirty();
 
+    // Updates only the buffer-related diagnostics fields (cheap; safe to call
+    // after every relational operation).
+    void refreshBufferDiagnostics();
+
 private:
     Database();
     DbResult openImpl(const std::string& path, const DatabaseOpenOptions& options,
-                      bool create);
+                      const DatabaseCreateOptions& createOptions, bool create);
     void refreshDiagnostics();
 
     std::unique_ptr<DatabaseFile> _file;

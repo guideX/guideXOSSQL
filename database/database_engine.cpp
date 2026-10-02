@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "database_endian.h"
+#include "database_relational.h"
 
 namespace gxos {
 namespace db {
@@ -60,8 +61,8 @@ DbResult DatabaseEngine::inspectDatabase(const std::string& path,
     options.readOnly = true;
     options.validateAllPages = true;
 
-    std::unique_ptr<DatabaseFile> database;
-    DbResult result = openDatabase(path, options, database);
+    std::unique_ptr<Database> database;
+    DbResult result = Database::open(path, options, database);
     if (result.isOk() && database) {
         out = database->diagnostics();
         database->close();

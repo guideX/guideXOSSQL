@@ -1,22 +1,25 @@
 # guideXOS SQL — Database Subsystem
 
-Native relational database subsystem for guideXOS. This repository currently
-contains **Phase SQL1: Durable Database Storage Foundation** — a bounded,
-versioned `.gxdb` file format and page-storage engine with integrity checking,
-append-only allocation and explicit flush/durability semantics.
+Native relational database subsystem for guideXOS. This repository contains:
 
-SQL1 intentionally contains **no SQL parser, no tables and no transactions**.
-It is the trustworthy storage base that later phases (schema, SQL, indexes,
-transactions, server, Developer Studio, REXX, `system.*` tables) will build on.
+- **Phase SQL1: Durable Database Storage Foundation** — a bounded, versioned
+  `.gxdb` file format and page-storage engine with integrity checking,
+  append-only allocation and explicit flush/durability semantics.
+- **Phase SQL2: Relational Catalog and Heap Tables** — durable table schemas,
+  typed columns, heap-backed row storage, bounded scanning and a small buffer
+  manager. No SQL parser yet; the native relational API is the execution
+  target for the future SQL layer.
 
-- Format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
+- SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
+- SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
 
 ```
-database/   storage engine (format, checksum, I/O, header, page, file, engine)
-tests/      hosted test suite
+database/   storage engine (format, checksum, I/O, header, page, file, engine,
+            buffer, catalog, heap, relational)
+tests/      hosted test suites (SQL1 + SQL2)
 tools/      gxdb_cli (create / inspect diagnostics)
 docs/       architecture and test reports
 ```
@@ -32,36 +35,41 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The test binary can also be run directly: `build/database_storage_tests`.
+The test binaries can also be run directly: `build/database_storage_tests` and
+`build/database_relational_test`.
 
 ## Quick example
 
 ```cpp
-#include "database_engine.h"
+#include "database_relational.h"
 using namespace gxos::db;
 
-std::unique_ptr<DatabaseFile> db;
-DbResult r = DatabaseEngine::createDatabase("app.gxdb", DatabaseCreateOptions(), db);
-if (!r.isOk()) { /* r.describe() */ }
+std::unique_ptr<Database> db;
+Database::create("app.gxdb", DatabaseCreateOptions(), db);
 
-uint64_t pageId = 0;
-db->allocatePage(PageType::Data, pageId);
+TableDefinition users;
+users.name = "Users";
+users.columns.push_back(ColumnDefinition("Id", DbType::Int64, false));
+users.columns.push_back(ColumnDefinition("Name", DbType::Text, false));
+users.columns.push_back(ColumnDefinition("Enabled", DbType::Boolean, false));
+uint32_t id = 0;
+db->createTable(users, id);
 
-DatabasePage page;
-page.pageId = pageId;
-page.type = PageType::Data;
-page.payload = {1, 2, 3, 4};
-page.payloadSize = 4;
-db->writePage(page);
+std::unique_ptr<Table> table;
+db->openTable("Users", table);
+table->insert({DbValue::int64(1), DbValue::text("Alice"), DbValue::boolean(true)});
 
 db->flush();
 db->close();
 
 // Later:
-DatabaseOpenOptions opts;
-DatabaseEngine::openDatabase("app.gxdb", opts, db);
-DatabasePage read;
-db->readPage(pageId, read); // read.payload == {1,2,3,4}
+Database::open("app.gxdb", DatabaseOpenOptions(), db);
+db->openTable("Users", table);
+std::unique_ptr<TableScan> scan;
+table->scanStart(scan);
+std::vector<DbValue> row;
+while (scan->next(row)) { /* ... */ }
+db->close();
 ```
 
 ## Command-line diagnostics
@@ -73,5 +81,6 @@ build/gxdb_cli inspect sample.gxdb
 
 ## Status
 
-Hosted proof complete. QEMU and bare-metal proof are deferred to the phase that
-provides a native `IDatabaseFile` backend over the guideXOS VFS / block device.
+Hosted proof complete (SQL1: 172 checks, SQL2: 10304 checks). QEMU and
+bare-metal proof are deferred to the phase that provides a native
+`IDatabaseFile` backend over the guideXOS VFS / block device.

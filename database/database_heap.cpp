@@ -90,6 +90,9 @@ void writeHeapHeader(std::vector<uint8_t>& payload, uint64_t nextPageId, uint32_
 // capacity; the slot directory grows backward from the end.
 bool readSlot(const std::vector<uint8_t>& payload, uint32_t index, uint32_t capacity,
               uint32_t& outOffset, uint32_t& outLength) {
+    if (8u * (index + 1) > capacity) {
+        return false;
+    }
     const uint32_t slotOffset = capacity - 8u * (index + 1);
     if (slotOffset < kHeapHeaderSize) {
         return false;
@@ -353,6 +356,7 @@ DbResult Table::updateStats(int64_t rowDelta, bool newPage, uint64_t firstPageId
             rec->firstHeapPageId = firstPageId;
         }
     }
+    _db.markCatalogDirty();
     return DbResult::ok();
 }
 
@@ -408,6 +412,9 @@ DbResult Table::ensureLastHeapPage() {
 }
 
 DbResult Table::insert(const std::vector<DbValue>& values) {
+    if (_db.isReadOnly()) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
     const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "table record not found");
@@ -475,7 +482,7 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
             _db.buffer().unpin(*slot);
             return result;
         }
-        if (info.rowAreaEnd + rowLength + 8u <= capacity) {
+        if (info.rowAreaEnd + rowLength <= capacity - 8u * (info.slotCount + 1)) {
             // Append the row and its slot.
             std::vector<uint8_t>& payload = slot->page.payload;
             std::memcpy(payload.data() + info.rowAreaEnd, rowBytes.data(), rowBytes.size());
@@ -486,7 +493,9 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
             storeLe32(payload.data() + kHeapRowAreaEndOffset, info.rowAreaEnd + rowLength);
             _db.buffer().markDirty(*slot);
             _db.buffer().unpin(*slot);
-            return updateStats(1, false, 0);
+            DbResult statsResult = updateStats(1, false, 0);
+            _db.refreshBufferDiagnostics();
+            return statsResult;
         }
         _db.buffer().unpin(*slot);
     }
@@ -536,7 +545,9 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
 
     _lastHeapPageId = newPageId;
     newPage = true;
-    return updateStats(1, newPage, firstPageId);
+    DbResult statsResult = updateStats(1, newPage, firstPageId);
+    _db.refreshBufferDiagnostics();
+    return statsResult;
 }
 
 DbResult Table::scanStart(std::unique_ptr<TableScan>& out) const {

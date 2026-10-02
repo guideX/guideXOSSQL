@@ -29,17 +29,29 @@ void Database::markCatalogDirty() {
     _catalogDirty = true;
 }
 
+void Database::refreshBufferDiagnostics() {
+    if (_buffer) {
+        _diagnostics.bufferCapacity = _buffer->capacity();
+        _diagnostics.bufferResident = _buffer->residentCount();
+        _diagnostics.bufferDirty = _buffer->dirtyCount();
+    } else {
+        _diagnostics.bufferCapacity = 0;
+        _diagnostics.bufferResident = 0;
+        _diagnostics.bufferDirty = 0;
+    }
+}
+
 uint32_t Database::bufferCapacity() const {
     return _buffer ? _buffer->capacity() : 0;
 }
 
 DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& options,
-                            bool create) {
+                            const DatabaseCreateOptions& createOptions, bool create) {
     const uint32_t bufferCapacity =
         options.bufferCapacity != 0 ? options.bufferCapacity : kDefaultBufferCapacity;
 
     if (create) {
-        DbResult result = DatabaseEngine::createDatabase(path, DatabaseCreateOptions(), _file);
+        DbResult result = DatabaseEngine::createDatabase(path, createOptions, _file);
         if (!result.isOk()) {
             return result;
         }
@@ -86,7 +98,9 @@ DbResult Database::create(const std::string& path, const DatabaseCreateOptions& 
     createOptions.creationTimeUnixNanos = options.creationTimeUnixNanos;
     createOptions.bufferCapacity = options.bufferCapacity;
 
-    DbResult result = db->openImpl(path, DatabaseOpenOptions(), true);
+    DatabaseOpenOptions createOpen;
+    createOpen.bufferCapacity = options.bufferCapacity;
+    DbResult result = db->openImpl(path, createOpen, createOptions, true);
     if (!result.isOk()) {
         return result;
     }
@@ -101,7 +115,7 @@ DbResult Database::open(const std::string& path, const DatabaseOpenOptions& opti
     }
 
     std::unique_ptr<Database> db(new Database());
-    DbResult result = db->openImpl(path, options, false);
+    DbResult result = db->openImpl(path, options, DatabaseCreateOptions(), false);
     if (!result.isOk()) {
         return result;
     }
@@ -247,6 +261,9 @@ void Database::refreshDiagnostics() {
         td.heapPageCount = tables[i].heapPageCount;
         td.rowCount = tables[i].rowCount;
         _diagnostics.tables.push_back(td);
+    }
+    if (_file) {
+        _diagnostics.state = _file->diagnostics().state;
     }
 }
 

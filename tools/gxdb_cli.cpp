@@ -15,6 +15,7 @@
 #include "database_engine.h"
 #include "database_file.h"
 #include "database_format.h"
+#include "database_relational.h"
 
 using namespace gxos::db;
 
@@ -32,6 +33,19 @@ void printDiagnostics(const DatabaseDiagnostics& d, DbStatus status) {
     std::printf("file size (bytes):   %llu\n",
                 static_cast<unsigned long long>(d.fileSizeBytes));
     std::printf("database identity:   %s\n", d.databaseId.c_str());
+    std::printf("table count:         %u\n", static_cast<unsigned>(d.tableCount));
+    std::printf("catalog pages:       %u\n", static_cast<unsigned>(d.catalogPageCount));
+    std::printf("buffer capacity:     %u\n", static_cast<unsigned>(d.bufferCapacity));
+    std::printf("buffer resident:     %u\n", static_cast<unsigned>(d.bufferResident));
+    std::printf("buffer dirty:        %u\n", static_cast<unsigned>(d.bufferDirty));
+    for (size_t i = 0; i < d.tables.size(); ++i) {
+        const TableDiagnostics& t = d.tables[i];
+        std::printf("  table [%u] \"%s\": %u columns, %u heap pages, %llu rows\n",
+                    static_cast<unsigned>(t.tableId), t.name.c_str(),
+                    static_cast<unsigned>(t.columnCount),
+                    static_cast<unsigned>(t.heapPageCount),
+                    static_cast<unsigned long long>(t.rowCount));
+    }
     if (!d.lastValidationFailure.empty()) {
         std::printf("last validation:     %s\n", d.lastValidationFailure.c_str());
     }
@@ -53,8 +67,8 @@ int main(int argc, char** argv) {
         if (argc >= 4) {
             options.pageSize = static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10));
         }
-        std::unique_ptr<DatabaseFile> db;
-        DbResult result = DatabaseEngine::createDatabase(path, options, db);
+        std::unique_ptr<Database> db;
+        DbResult result = Database::create(path, options, db);
         if (!result.isOk()) {
             std::printf("create failed: %s\n", result.describe().c_str());
             return 1;

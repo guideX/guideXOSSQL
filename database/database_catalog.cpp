@@ -365,7 +365,8 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
     const uint32_t tableCount = loadLe32(payload.data() + 8);
     _nextTableId = loadLe32(payload.data() + 12);
     const uint32_t continuationCount = loadLe32(payload.data() + 16);
-    const uint64_t firstContinuation = loadLe64(payload.data() + 20);
+    const uint64_t firstContinuation = loadLe32(payload.data() + 20);
+    const uint32_t rootRecordCount = loadLe32(payload.data() + 24);
 
     if (tableCount > kMaxTables) {
         buffer.unpin(*root);
@@ -382,10 +383,14 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
         buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "continuation pointer without continuations");
     }
+    if (rootRecordCount > tableCount) {
+        buffer.unpin(*root);
+        return DbResult::error(DbStatus::CorruptPage, "root record count exceeds table count");
+    }
 
     // Parse the root page's table records.
     size_t offset = kCatalogRootHeaderSize;
-    for (uint32_t i = 0; i < tableCount; ++i) {
+    for (uint32_t i = 0; i < rootRecordCount; ++i) {
         TableRecord rec;
         result = parseTableRecord(payload.data(), payload.size(), offset, rec);
         if (!result.isOk()) {
@@ -393,13 +398,6 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
             return result;
         }
         _tables.push_back(rec);
-    }
-
-    // The root page may also hold records beyond tableCount only if the on-disk
-    // tableCount was inconsistent; any leftover bytes are rejected.
-    if (offset != payload.size()) {
-        buffer.unpin(*root);
-        return DbResult::error(DbStatus::CorruptPage, "trailing bytes in catalog root page");
     }
 
     buffer.unpin(*root);
@@ -452,17 +450,16 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
             }
             _tables.push_back(rec);
         }
-        if (coffset != cpayload.size()) {
-            buffer.unpin(*cont);
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "trailing bytes in catalog continuation page");
-        }
         expectedNext = next;
         buffer.unpin(*cont);
     }
 
     if (expectedNext != 0) {
         return DbResult::error(DbStatus::CorruptPage, "catalog continuation chain length mismatch");
+    }
+
+    if (_tables.size() != tableCount) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog record count mismatch");
     }
 
     // Cross-record validation: unique table ids and names.
@@ -575,6 +572,7 @@ DbResult Catalog::save(BufferManager& buffer, DatabaseFile& file, uint64_t rootP
         storeLe32(rootPayload.data() + 16, static_cast<uint32_t>(contIds.size()));
         storeLe32(rootPayload.data() + 20,
                   contIds.empty() ? 0u : static_cast<uint32_t>(contIds[0]));
+        storeLe32(rootPayload.data() + 24, pageRecordCounts[0]);
     }
 
     // Patch continuation headers (next pointer + record count).
