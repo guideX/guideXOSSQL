@@ -1,0 +1,137 @@
+#pragma once
+// guideXOS SQL -- Phase SQL1
+// On-disk format constants for the native .gxdb database file.
+//
+// Byte order: little-endian for every multi-byte integer field. Fields are
+// serialized explicitly (never by dumping a C++ struct) so layout, packing and
+// byte order are controlled and stable across compilers and architectures.
+//
+// File layout (append-only, fixed-size pages):
+//
+//   offset 0                         pageSize
+//   +-----------------------------+-----------------------------+
+//   | Page 0: File Header         | Page 1: Root/Catalog Page    | ...
+//   +-----------------------------+-----------------------------+
+//
+// Page 0 is the database header page. Pages 1..pageCount-1 are ordinary pages
+// carrying a fixed page header followed by an opaque payload.
+
+#include <cstdint>
+
+namespace gxos {
+namespace db {
+
+// Recognizable 8-byte signature: "GXDB" followed by CR LF SUB LF. The control
+// bytes make accidental text collisions extremely unlikely and survive naive
+// text-mode transfers.
+extern const uint8_t kFileMagic[8];
+
+const uint16_t kFormatMajor = 1;
+const uint16_t kFormatMinor = 0;
+
+// Page size policy. 4096 matches the existing guideXOS server allocator page
+// granularity (gxos::PageSize) and common storage/cluster sizes. Larger sizes
+// are accepted for future flexibility.
+const uint32_t kDefaultPageSize = 4096;
+const uint32_t kMinPageSize = 512;
+const uint32_t kMaxPageSize = 65536;
+
+// Bytes occupied by the serialized database header at the start of page 0.
+// The remainder of page 0 is reserved and written as zero.
+const uint32_t kHeaderSize = 128;
+
+// Fixed page header at the start of every non-header page.
+const uint32_t kPageHeaderSize = 32;
+
+// Well-known page identifiers.
+const uint64_t kHeaderPageId = 0;
+const uint64_t kBootstrapPageId = 1;
+
+// Hard bound on total allocated pages. Keeps offsets representable in 64 bits
+// and rejects absurd on-disk allocation metadata before any arithmetic.
+const uint64_t kMaxPageCount = (static_cast<uint64_t>(1) << 32);
+
+// Catalog/bootstrap payload markers.
+const uint32_t kCatalogMagic = 0x54435847u; // 'G','X','C','T' little-endian
+const uint16_t kCatalogVersion = 2;         // SQL2: relational catalog
+const uint16_t kCatalogVersionLegacy = 1;   // SQL1: empty catalog (no tables)
+const uint32_t kCatalogPayloadSize = 16;    // SQL1 minimum payload size
+
+// ---- SQL2 catalog record layout -------------------------------------------
+// Root catalog page payload header.
+const uint32_t kCatalogRootHeaderSize = 32;
+// Catalog continuation page payload header.
+const uint32_t kCatalogContHeaderSize = 24;
+
+// ---- SQL2 heap page layout ------------------------------------------------
+const uint32_t kHeapMagic = 0x50485847u; // 'G','X','H','P' little-endian
+const uint16_t kHeapVersion = 1;
+const uint32_t kHeapHeaderSize = 24;
+
+// ---- SQL2 identifier and schema limits ------------------------------------
+const uint32_t kMaxTableNameBytes = 64;
+const uint32_t kMaxColumnNameBytes = 64;
+const uint32_t kMaxColumnsPerTable = 64;
+const uint32_t kMaxTables = 512;
+
+// ---- SQL2 value limits ----------------------------------------------------
+const uint32_t kMaxTextBytes = 65536;
+const uint32_t kMaxBlobBytes = 65536;
+const uint32_t kMaxRowBytes = 65536;
+
+// ---- Database header field offsets (within page 0) ------------------------
+namespace header_offset {
+enum : uint32_t {
+    Magic = 0,            // 8 bytes
+    FormatMajor = 8,      // u16
+    FormatMinor = 10,     // u16
+    PageSize = 12,        // u32
+    DatabaseId = 16,      // 16 bytes (RFC 4122 layout, raw bytes)
+    CreationTime = 32,    // u64, nanoseconds since Unix epoch (0 = unknown)
+    PageCount = 40,       // u64, total allocated pages incl. header page
+    RootPageId = 48,      // u64, page id of the bootstrap/catalog page
+    Flags = 56,           // u32
+    HeaderSize = 60,      // u32, must equal kHeaderSize
+    HeaderCrc32 = 64,     // u32, CRC32 over [0,kHeaderSize) with this field zeroed
+    Reserved = 68         // zero-filled through kHeaderSize
+};
+} // namespace header_offset
+
+// ---- Page header field offsets (within a non-header page) -----------------
+namespace page_offset {
+enum : uint32_t {
+    PageId = 0,           // u64, must equal the page's index
+    PageType = 8,         // u16, see PageType
+    Flags = 10,           // u16
+    PayloadSize = 12,     // u32, used bytes in the payload area
+    Generation = 16,      // u32
+    Reserved0 = 20,       // u32
+    PageCrc32 = 24,       // u32, CRC32 over the whole page with this field zeroed
+    Reserved1 = 28        // u32
+};
+} // namespace page_offset
+
+enum class PageType : uint16_t {
+    Unknown = 0,
+    Catalog = 1, // bootstrap/root page and catalog continuation pages
+    Data = 2     // SQL2 heap pages carry structured row data
+};
+
+inline const char* pageTypeName(PageType type) {
+    switch (type) {
+    case PageType::Unknown: return "Unknown";
+    case PageType::Catalog: return "Catalog";
+    case PageType::Data: return "Data";
+    }
+    return "Unknown";
+}
+
+// Header flags (reserved for forward-compatible use).
+namespace header_flags {
+enum : uint32_t {
+    None = 0
+};
+} // namespace header_flags
+
+} // namespace db
+} // namespace gxos
