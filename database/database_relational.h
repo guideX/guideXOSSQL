@@ -36,6 +36,8 @@ namespace db {
 
 class Table;
 class Transaction;
+struct IndexRangeBound;
+struct IndexValidation;
 
 class Database : public PageAccess {
 public:
@@ -91,6 +93,37 @@ public:
     DbResult listTables(std::vector<TableInfo>& out) const;
     DbResult describeTable(const std::string& name, TableDefinition& out) const;
     DbResult openTable(const std::string& name, std::unique_ptr<Table>& out);
+
+    // ---- SQL6 indexes ----------------------------------------------------
+    // Creates an index and builds it over the existing rows. When no explicit
+    // transaction is active the whole operation is wrapped in one implicit
+    // transaction, so a failure leaves no catalog entry and no index pages.
+    DbResult createIndex(const IndexDefinition& def, uint32_t& outIndexId);
+
+    DbResult listIndexes(std::vector<IndexInfo>& out) const;
+    DbResult describeIndex(const std::string& name, IndexInfo& out) const;
+
+    // The first index on (tableId, columnOrdinal), or nullptr. Used by the
+    // access-path selector.
+    const Catalog::IndexRecord* findIndexForColumn(uint32_t tableId,
+                                                   uint32_t columnOrdinal) const;
+
+    // Index access paths. `logicalKey` is an encoded key from encodeIndexKey.
+    // Lookup returns every row locator with that exact logical key; range
+    // returns locators satisfying the bound. Corrupt pages return CorruptPage
+    // (never a silent fallback).
+    DbResult indexLookup(uint32_t indexId, const std::vector<uint8_t>& logicalKey,
+                         std::vector<RowLocator>& out);
+    DbResult indexRange(uint32_t indexId, const IndexRangeBound& bound,
+                        std::vector<RowLocator>& out);
+
+    // Structural validation of one index (test/diagnostic).
+    DbResult validateIndex(uint32_t indexId, IndexValidation& out);
+
+    // Internal: scans the owning table and builds all entries for an index
+    // record that was just added to the catalog. Called by Transaction so the
+    // catalog entry and the index pages are in the same transaction.
+    DbResult buildIndex(uint32_t indexId);
 
     const DatabaseDiagnostics& diagnostics() const { return _diagnostics; }
 

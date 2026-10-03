@@ -8,6 +8,7 @@
 
 #include "database_endian.h"
 #include "database_format.h"
+#include "database_index.h"
 #include "database_page.h"
 #include "database_transaction.h"
 
@@ -364,6 +365,210 @@ DbResult decodeRow(const uint8_t* bytes, size_t length,
     return DbResult::ok();
 }
 
+// ---- SQL6 index maintenance helpers ---------------------------------------
+
+struct IndexTarget {
+    Catalog::IndexRecord record;
+    DbType type;
+};
+
+std::vector<IndexTarget> tableIndexTargets(Database& db, uint32_t tableId) {
+    std::vector<IndexTarget> out;
+    const Catalog::TableRecord* table = db.catalog().findTable(tableId);
+    if (table == nullptr) {
+        return out;
+    }
+    const std::vector<Catalog::IndexRecord>& indexes = db.catalog().indexes();
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (indexes[i].tableId != tableId) {
+            continue;
+        }
+        if (indexes[i].columnOrdinal >= table->columns.size()) {
+            continue;
+        }
+        IndexTarget target;
+        target.record = indexes[i];
+        target.type = table->columns[indexes[i].columnOrdinal].type;
+        out.push_back(target);
+    }
+    return out;
+}
+
+DbResult encodeKeyForColumn(Database& db, const Catalog::IndexRecord& rec, DbType type,
+                            const std::vector<DbValue>& values,
+                            std::vector<uint8_t>& outKey) {
+    if (rec.columnOrdinal >= values.size()) {
+        return DbResult::error(DbStatus::Internal, "index column out of range");
+    }
+    if (!encodeIndexKey(type, values[rec.columnOrdinal], outKey)) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "value is not indexable (non-finite Float64?)");
+    }
+    if (outKey.size() > maxIndexKeyBytes(db.pages().pageSize())) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "indexed value exceeds the maximum index key size");
+    }
+    return DbResult::ok();
+}
+
+DbResult encodeKeyFromRowBytes(Database& db, const Catalog::IndexRecord& rec, DbType type,
+                               const std::vector<ColumnDefinition>& columns,
+                               const std::vector<uint8_t>& rowBytes,
+                               std::vector<uint8_t>& outKey) {
+    std::vector<DbValue> values;
+    DbResult result = decodeRow(rowBytes.data(), rowBytes.size(), columns, values);
+    if (!result.isOk()) {
+        return result;
+    }
+    return encodeKeyForColumn(db, rec, type, values, outKey);
+}
+
+// A surviving row whose physical locator and/or indexed values changed.
+struct IndexChange {
+    RowLocator oldLocator;
+    RowLocator newLocator;
+    std::vector<uint8_t> oldBytes;
+    std::vector<uint8_t> newBytes;
+    IndexChange() : oldLocator(), newLocator(), oldBytes(), newBytes() {}
+};
+
+// A row removed by the mutation.
+struct IndexDeleted {
+    RowLocator locator;
+    std::vector<uint8_t> bytes;
+    IndexDeleted() : locator(), bytes() {}
+};
+
+// Applies every index change for one mutation: removes stale entries first
+// (so key swaps are legal), then inserts the new entries and enforces
+// uniqueness against the post-removal state.
+DbResult maintainIndexes(Database& db, uint32_t tableId,
+                         const std::vector<ColumnDefinition>& columns,
+                         const std::vector<IndexTarget>& targets,
+                         const std::vector<IndexDeleted>& deleted,
+                         const std::vector<IndexChange>& changes) {
+    (void)tableId;
+    for (size_t t = 0; t < targets.size(); ++t) {
+        const Catalog::IndexRecord rec = targets[t].record;
+        const DbType type = targets[t].type;
+        const bool unique = rec.unique();
+
+        struct Edit {
+            std::vector<uint8_t> key;
+            RowLocator locator;
+        };
+        std::vector<Edit> removals;
+        std::vector<Edit> insertions;
+
+        for (size_t i = 0; i < deleted.size(); ++i) {
+            std::vector<uint8_t> key;
+            DbResult r =
+                encodeKeyFromRowBytes(db, rec, type, columns, deleted[i].bytes, key);
+            if (!r.isOk()) {
+                return r;
+            }
+            Edit e;
+            e.key = key;
+            e.locator = deleted[i].locator;
+            removals.push_back(e);
+        }
+        for (size_t i = 0; i < changes.size(); ++i) {
+            std::vector<uint8_t> oldKey;
+            std::vector<uint8_t> newKey;
+            DbResult r =
+                encodeKeyFromRowBytes(db, rec, type, columns, changes[i].oldBytes, oldKey);
+            if (!r.isOk()) {
+                return r;
+            }
+            r = encodeKeyFromRowBytes(db, rec, type, columns, changes[i].newBytes, newKey);
+            if (!r.isOk()) {
+                return r;
+            }
+            const bool keySame =
+                compareEncodedKeys(oldKey.data(), oldKey.size(), newKey.data(),
+                                   newKey.size()) == 0;
+            const bool locSame =
+                changes[i].oldLocator.pageId == changes[i].newLocator.pageId &&
+                changes[i].oldLocator.slot == changes[i].newLocator.slot;
+            if (keySame && locSame) {
+                continue;
+            }
+            Edit oldEdit;
+            oldEdit.key = oldKey;
+            oldEdit.locator = changes[i].oldLocator;
+            removals.push_back(oldEdit);
+            Edit newEdit;
+            newEdit.key = newKey;
+            newEdit.locator = changes[i].newLocator;
+            insertions.push_back(newEdit);
+        }
+
+        if (removals.empty() && insertions.empty()) {
+            continue;
+        }
+
+        IndexTree tree(db.pages(), type, rec.indexId);
+        uint64_t root = rec.rootPageId;
+        uint64_t removedCount = 0;
+        for (size_t i = 0; i < removals.size(); ++i) {
+            if (root == 0) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "index entry missing for removal");
+            }
+            uint64_t newRoot = root;
+            bool removed = false;
+            DbResult r = tree.remove(removals[i].key, removals[i].locator, root, newRoot,
+                                     removed);
+            if (!r.isOk()) {
+                return r;
+            }
+            if (!removed) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "index entry missing for removal");
+            }
+            if (newRoot != root) {
+                root = newRoot;
+                db.catalog().setIndexRoot(rec.indexId, root);
+            }
+            ++removedCount;
+        }
+        uint64_t insertedCount = 0;
+        for (size_t i = 0; i < insertions.size(); ++i) {
+            if (root == 0) {
+                DbResult r = tree.createEmpty(root);
+                if (!r.isOk()) {
+                    return r;
+                }
+                db.catalog().setIndexRoot(rec.indexId, root);
+            }
+            uint64_t newRoot = root;
+            bool inserted = false;
+            DbResult r = tree.insert(insertions[i].key, insertions[i].locator, root,
+                                     unique, newRoot, inserted);
+            if (!r.isOk()) {
+                return r;
+            }
+            if (newRoot != root) {
+                root = newRoot;
+                db.catalog().setIndexRoot(rec.indexId, root);
+            }
+            if (inserted) {
+                ++insertedCount;
+            }
+        }
+        if (removedCount != 0) {
+            db.catalog().adjustIndexEntryCount(rec.indexId,
+                                               -static_cast<int64_t>(removedCount));
+        }
+        if (insertedCount != 0) {
+            db.catalog().adjustIndexEntryCount(rec.indexId,
+                                               static_cast<int64_t>(insertedCount));
+        }
+        db.markCatalogDirty();
+    }
+    return DbResult::ok();
+}
+
 } // namespace
 
 Table::Table(Database& db, uint32_t tableId)
@@ -517,11 +722,66 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
         return result;
     }
 
+    // SQL6: validate every indexed key and enforce UNIQUE / PRIMARY KEY before
+    // touching the heap, so a constraint violation leaves no partial change.
+    const std::vector<IndexTarget> targets = tableIndexTargets(_db, _tableId);
+    std::vector<std::vector<uint8_t> > keys(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        result = encodeKeyForColumn(_db, targets[i].record, targets[i].type, values,
+                                    keys[i]);
+        if (!result.isOk()) {
+            return result;
+        }
+        if (targets[i].record.unique() &&
+            !encodedKeyIsNull(keys[i].data(), keys[i].size()) &&
+            targets[i].record.rootPageId != 0) {
+            IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId);
+            std::vector<IndexEntry> existing;
+            result = tree.lookupAll(keys[i], targets[i].record.rootPageId, existing);
+            if (!result.isOk()) {
+                return result;
+            }
+            if (!existing.empty()) {
+                return DbResult::error(DbStatus::AlreadyExists,
+                                       "unique index constraint violation");
+            }
+        }
+    }
+
+    RowLocator locator;
     uint32_t newPages = 0;
     uint64_t firstNewPage = 0;
-    result = appendEncodedRowToTail(rowBytes, newPages, firstNewPage);
+    result = appendEncodedRowToTail(rowBytes, newPages, firstNewPage, &locator);
     if (!result.isOk()) {
         return result;
+    }
+
+    for (size_t i = 0; i < targets.size(); ++i) {
+        IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId);
+        uint64_t root = targets[i].record.rootPageId;
+        if (root == 0) {
+            result = tree.createEmpty(root);
+            if (!result.isOk()) {
+                return result;
+            }
+            _db.catalog().setIndexRoot(targets[i].record.indexId, root);
+        }
+        uint64_t newRoot = root;
+        bool inserted = false;
+        result = tree.insert(keys[i], locator, root, targets[i].record.unique(),
+                             newRoot, inserted);
+        if (!result.isOk()) {
+            return result;
+        }
+        if (newRoot != root) {
+            _db.catalog().setIndexRoot(targets[i].record.indexId, newRoot);
+        }
+        if (inserted) {
+            _db.catalog().adjustIndexEntryCount(targets[i].record.indexId, 1);
+        }
+    }
+    if (!targets.empty()) {
+        _db.markCatalogDirty();
     }
 
     DbResult statsResult = updateStats(1, newPages, firstNewPage);
@@ -530,7 +790,8 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
 }
 
 DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
-                                       uint32_t& newPagesOut, uint64_t& firstNewPageOut) {
+                                       uint32_t& newPagesOut, uint64_t& firstNewPageOut,
+                                       RowLocator* outLocator) {
     const uint32_t pageSize = _db.pages().pageSize();
     const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
     const uint32_t rowLength = static_cast<uint32_t>(rowBytes.size());
@@ -566,6 +827,9 @@ DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
             storeLe32(payload.data() + slotOffset + 4, rowLength);
             storeLe32(payload.data() + kHeapSlotCountOffset, info.slotCount + 1);
             storeLe32(payload.data() + kHeapRowAreaEndOffset, info.rowAreaEnd + rowLength);
+            if (outLocator != nullptr) {
+                *outLocator = RowLocator(_lastHeapPageId, info.slotCount);
+            }
             return _db.pages().writePage(page);
         }
     }
@@ -620,6 +884,9 @@ DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
     }
     ++newPagesOut;
     _lastHeapPageId = newPageId;
+    if (outLocator != nullptr) {
+        *outLocator = RowLocator(newPageId, 0);
+    }
     return DbResult::ok();
 }
 
@@ -728,7 +995,14 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
         }
     }
 
-    std::vector<std::vector<uint8_t> > relocations;
+    // Physical changes to report to the index layer. `changes` covers every
+    // surviving row whose locator or indexed values changed, including rows
+    // moved indirectly by page compaction, not only the rows explicitly
+    // updated. `relocations` are the rows that no longer fit their page and are
+    // appended to the tail; their new locator is known only after the append.
+    std::vector<IndexChange> changes;
+    std::vector<IndexDeleted> deletedRows;
+    std::vector<IndexChange> relocations;
     std::set<uint64_t> processed;
 
     for (size_t ci = 0; ci < chain.size(); ++ci) {
@@ -755,7 +1029,12 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
             return result;
         }
 
-        std::vector<std::vector<uint8_t> > finalRows;
+        struct RowSlot {
+            uint32_t oldSlot;
+            std::vector<uint8_t> oldBytes;
+            std::vector<uint8_t> newBytes;
+        };
+        std::vector<RowSlot> finalRows;
         size_t entryIndex = 0;
         for (uint32_t slot = 0; slot < info.slotCount; ++slot) {
             if (entryIndex < entries.size() && entries[entryIndex].slot < slot) {
@@ -767,25 +1046,30 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
                 entry = &entries[entryIndex];
                 ++entryIndex;
             }
+            uint32_t offset = 0;
+            uint32_t length = 0;
+            if (!readSlot(page.payload, slot, capacity, offset, length)) {
+                return DbResult::error(DbStatus::CorruptPage, "invalid heap slot");
+            }
+            if (offset < kHeapHeaderSize || length < 8u ||
+                offset + length > info.rowAreaEnd) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "heap slot row out of range");
+            }
+            std::vector<uint8_t> oldBytes(page.payload.begin() + offset,
+                                          page.payload.begin() + offset + length);
             if (entry != nullptr && entry->deleted) {
+                IndexDeleted removed;
+                removed.locator = RowLocator(pageId, slot);
+                removed.bytes = oldBytes;
+                deletedRows.push_back(removed);
                 continue;
             }
-            if (entry != nullptr) {
-                finalRows.push_back(entry->encoded);
-            } else {
-                uint32_t offset = 0;
-                uint32_t length = 0;
-                if (!readSlot(page.payload, slot, capacity, offset, length)) {
-                    return DbResult::error(DbStatus::CorruptPage, "invalid heap slot");
-                }
-                if (offset < kHeapHeaderSize || length < 8u ||
-                    offset + length > info.rowAreaEnd) {
-                    return DbResult::error(DbStatus::CorruptPage,
-                                           "heap slot row out of range");
-                }
-                finalRows.push_back(std::vector<uint8_t>(
-                    page.payload.begin() + offset, page.payload.begin() + offset + length));
-            }
+            RowSlot rowSlot;
+            rowSlot.oldSlot = slot;
+            rowSlot.oldBytes = oldBytes;
+            rowSlot.newBytes = (entry != nullptr) ? entry->encoded : oldBytes;
+            finalRows.push_back(rowSlot);
         }
         if (entryIndex < entries.size()) {
             return DbResult::error(DbStatus::InvalidArgument,
@@ -797,7 +1081,7 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
         uint32_t used = kHeapHeaderSize;
         size_t keep = 0;
         for (; keep < finalRows.size(); ++keep) {
-            const uint32_t need = 8u + static_cast<uint32_t>(finalRows[keep].size());
+            const uint32_t need = 8u + static_cast<uint32_t>(finalRows[keep].newBytes.size());
             if (used + need > capacity) {
                 break;
             }
@@ -806,10 +1090,25 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
         std::vector<std::vector<uint8_t> > kept;
         kept.reserve(keep);
         for (size_t i = 0; i < keep; ++i) {
-            kept.push_back(finalRows[i]);
+            kept.push_back(finalRows[i].newBytes);
+            const RowLocator oldLocator(pageId, finalRows[i].oldSlot);
+            const RowLocator newLocator(pageId, static_cast<uint32_t>(i));
+            if (oldLocator.slot != newLocator.slot ||
+                finalRows[i].oldBytes != finalRows[i].newBytes) {
+                IndexChange change;
+                change.oldLocator = oldLocator;
+                change.newLocator = newLocator;
+                change.oldBytes = finalRows[i].oldBytes;
+                change.newBytes = finalRows[i].newBytes;
+                changes.push_back(change);
+            }
         }
         for (size_t i = keep; i < finalRows.size(); ++i) {
-            relocations.push_back(finalRows[i]);
+            IndexChange relocation;
+            relocation.oldLocator = RowLocator(pageId, finalRows[i].oldSlot);
+            relocation.oldBytes = finalRows[i].oldBytes;
+            relocation.newBytes = finalRows[i].newBytes;
+            relocations.push_back(relocation);
         }
 
         result = packHeapPage(page, kept, info.nextPageId, capacity);
@@ -833,15 +1132,75 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
     uint32_t newPages = 0;
     uint64_t firstNewPage = 0;
     for (size_t i = 0; i < relocations.size(); ++i) {
-        DbResult result = appendEncodedRowToTail(relocations[i], newPages, firstNewPage);
+        RowLocator newLocator;
+        DbResult result = appendEncodedRowToTail(relocations[i].newBytes, newPages,
+                                                 firstNewPage, &newLocator);
         if (!result.isOk()) {
             return result;
+        }
+        IndexChange change;
+        change.oldLocator = relocations[i].oldLocator;
+        change.newLocator = newLocator;
+        change.oldBytes = relocations[i].oldBytes;
+        change.newBytes = relocations[i].newBytes;
+        changes.push_back(change);
+    }
+
+    // Keep every table index consistent with the heap. This includes locator
+    // remaps for rows that were moved only because a page was repacked.
+    const std::vector<IndexTarget> targets = tableIndexTargets(_db, _tableId);
+    if (!targets.empty() && (!deletedRows.empty() || !changes.empty())) {
+        DbResult indexResult =
+            maintainIndexes(_db, _tableId, cols, targets, deletedRows, changes);
+        if (!indexResult.isOk()) {
+            return indexResult;
         }
     }
 
     DbResult statsResult = updateStats(rowDelta, newPages, firstNewPage);
     _db.refreshBufferDiagnostics();
     return statsResult;
+}
+
+DbResult Table::fetchRow(const RowLocator& locator, std::vector<DbValue>& out) const {
+    const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::Internal, "table record not found");
+    }
+    const uint64_t pageCount = _db.pages().pageCount();
+    if (locator.pageId == 0 || locator.pageId >= pageCount) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index locator page out of range");
+    }
+    DatabasePage page;
+    DbResult result = _db.pages().readPage(locator.pageId, page);
+    if (!result.isOk()) {
+        return result;
+    }
+    if (page.type != PageType::Data) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index locator points at a non-heap page");
+    }
+    const uint32_t pageSize = _db.pages().pageSize();
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    HeapPageInfo info;
+    result = readHeapPage(page, pageSize, info);
+    if (!result.isOk()) {
+        return result;
+    }
+    if (locator.slot >= info.slotCount) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index locator slot out of range");
+    }
+    uint32_t offset = 0;
+    uint32_t length = 0;
+    if (!readSlot(page.payload, locator.slot, capacity, offset, length)) {
+        return DbResult::error(DbStatus::CorruptPage, "invalid heap slot");
+    }
+    if (offset < kHeapHeaderSize || length < 8u || offset + length > info.rowAreaEnd) {
+        return DbResult::error(DbStatus::CorruptPage, "heap slot row out of range");
+    }
+    return decodeRow(page.payload.data() + offset, length, rec->columns, out);
 }
 
 DbResult Table::scanStart(std::unique_ptr<TableScan>& out) const {

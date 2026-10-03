@@ -112,6 +112,11 @@ SqlTokenKind keywordKind(const std::string& upper) {
     if (upper == "AND") return SqlTokenKind::And;
     if (upper == "OR") return SqlTokenKind::Or;
     if (upper == "IS") return SqlTokenKind::Is;
+    if (upper == "INDEX") return SqlTokenKind::Index;
+    if (upper == "UNIQUE") return SqlTokenKind::Unique;
+    if (upper == "PRIMARY") return SqlTokenKind::Primary;
+    if (upper == "KEY") return SqlTokenKind::Key;
+    if (upper == "ON") return SqlTokenKind::On;
     return SqlTokenKind::Identifier;
 }
 

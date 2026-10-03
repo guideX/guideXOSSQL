@@ -170,6 +170,12 @@ enum class SqlTokenKind {
     And,
     Or,
     Is,
+    // SQL6 index and constraint keywords.
+    Index,
+    Unique,
+    Primary,
+    Key,
+    On,
     // Literals.
     Identifier,
     IntegerLiteral,

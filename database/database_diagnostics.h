@@ -48,6 +48,24 @@ struct TableDiagnostics {
         : tableId(0), columnCount(0), heapPageCount(0), rowCount(0) {}
 };
 
+// Per-index relational diagnostics (read-only). SQL6.
+struct IndexDiagnostics {
+    uint32_t indexId;
+    std::string name;
+    uint32_t tableId;
+    std::string tableName;
+    std::string columnName;
+    bool unique;
+    bool primaryKey;
+    uint64_t rootPageId;
+    uint64_t entryCount;
+    uint16_t formatVersion;
+
+    IndexDiagnostics()
+        : indexId(0), tableId(0), unique(false), primaryKey(false), rootPageId(0),
+          entryCount(0), formatVersion(0) {}
+};
+
 struct DatabaseDiagnostics {
     bool open;
     bool readOnly;
@@ -68,6 +86,10 @@ struct DatabaseDiagnostics {
     uint32_t bufferResident;
     uint32_t bufferDirty;
     std::vector<TableDiagnostics> tables;
+
+    // SQL6 index diagnostics.
+    uint32_t indexCount;
+    std::vector<IndexDiagnostics> indexes;
 
     // SQL3 transaction / write-ahead-log diagnostics (read-only).
     bool transactionActive;
@@ -95,6 +117,7 @@ struct DatabaseDiagnostics {
           bufferCapacity(0),
           bufferResident(0),
           bufferDirty(0),
+          indexCount(0),
           transactionActive(false),
           transactionId(0),
           transactionModifiedPages(0),

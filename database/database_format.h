@@ -53,15 +53,28 @@ const uint64_t kMaxPageCount = (static_cast<uint64_t>(1) << 32);
 
 // Catalog/bootstrap payload markers.
 const uint32_t kCatalogMagic = 0x54435847u; // 'G','X','C','T' little-endian
-const uint16_t kCatalogVersion = 2;         // SQL2: relational catalog
+const uint16_t kCatalogVersion = 2;         // SQL2: relational catalog (tables)
 const uint16_t kCatalogVersionLegacy = 1;   // SQL1: empty catalog (no tables)
+const uint16_t kCatalogVersionV3 = 3;       // SQL6: tables + indexes/constraints
 const uint32_t kCatalogPayloadSize = 16;    // SQL1 minimum payload size
 
 // ---- SQL2 catalog record layout -------------------------------------------
-// Root catalog page payload header.
+// Root catalog page payload header (catalog v2).
 const uint32_t kCatalogRootHeaderSize = 32;
 // Catalog continuation page payload header.
 const uint32_t kCatalogContHeaderSize = 24;
+
+// ---- SQL6 catalog v3 layout -----------------------------------------------
+// The v3 root header extends the v2 header with index-allocation metadata. The
+// continuation header is byte-identical to v2 (the version field distinguishes
+// them). v3 records are type-tagged so table and index records can share one
+// record stream:
+//
+//   u8 recordType (1 = table, 2 = index), then the record payload.
+const uint32_t kCatalogV3RootHeaderSize = 40;
+const uint32_t kCatalogV3ContHeaderSize = kCatalogContHeaderSize;
+const uint8_t kCatalogRecordTable = 1;
+const uint8_t kCatalogRecordIndex = 2;
 
 // ---- SQL2 heap page layout ------------------------------------------------
 const uint32_t kHeapMagic = 0x50485847u; // 'G','X','H','P' little-endian
@@ -74,10 +87,57 @@ const uint32_t kMaxColumnNameBytes = 64;
 const uint32_t kMaxColumnsPerTable = 64;
 const uint32_t kMaxTables = 512;
 
+// ---- SQL6 index limits ----------------------------------------------------
+const uint32_t kMaxIndexNameBytes = 64;
+const uint32_t kMaxIndexes = 2048;
+const uint32_t kMaxIndexesPerTable = 64;
+
 // ---- SQL2 value limits ----------------------------------------------------
 const uint32_t kMaxTextBytes = 65536;
 const uint32_t kMaxBlobBytes = 65536;
 const uint32_t kMaxRowBytes = 65536;
+
+// ---- SQL6 B+ tree index page layout ---------------------------------------
+// Every index page keeps the ordinary SQL1 page header (and CRC) and adds a
+// small index header followed by a slot directory that grows backward from the
+// end of the payload, exactly like a heap page.
+const uint32_t kIndexLeafMagic = 0x4C495847u;   // 'G','X','I','L'
+const uint32_t kIndexInternalMagic = 0x4E495847u; // 'G','X','I','N'
+const uint16_t kIndexPageVersion = 1;
+const uint32_t kIndexLeafHeaderSize = 24;
+const uint32_t kIndexInternalHeaderSize = 24;
+const uint32_t kIndexSlotSize = 8;              // {u32 offset, u32 length}
+// Entry payload: u32 keyLength, key bytes, u64 pageId, u32 slot.
+const uint32_t kIndexLeafEntryOverhead = 4 + 12;      // keyLength + locator
+// Child payload: u64 childPageId, u32 keyLength, key bytes.
+const uint32_t kIndexInternalEntryOverhead = 8 + 4;
+
+// Maximum tree depth accepted by any traversal. A defensive bound independent
+// of the catalog's recorded height.
+const uint32_t kMaxIndexDepth = 32;
+
+// Minimum entries that must be able to coexist in one leaf page. Used to derive
+// the maximum encoded index-key size for a given page size.
+const uint32_t kIndexMinEntriesPerLeaf = 4;
+// Absolute cap on an encoded index key, independent of page size.
+const uint32_t kMaxIndexKeyBytesCap = 1024;
+
+// Returns the largest encoded index key (in bytes) that still guarantees
+// kIndexMinEntriesPerLeaf entries fit in a leaf page of `pageSize`.
+inline uint32_t maxIndexKeyBytes(uint32_t pageSize) {
+    const uint32_t capacity = pageSize > kPageHeaderSize ? pageSize - kPageHeaderSize : 0;
+    const uint32_t perEntry = kIndexSlotSize + kIndexLeafEntryOverhead;
+    const uint32_t reserved =
+        kIndexLeafHeaderSize + kIndexMinEntriesPerLeaf * perEntry;
+    if (capacity <= reserved) {
+        return 0;
+    }
+    uint32_t limit = (capacity - reserved) / kIndexMinEntriesPerLeaf;
+    if (limit > kMaxIndexKeyBytesCap) {
+        limit = kMaxIndexKeyBytesCap;
+    }
+    return limit;
+}
 
 // ---- Database header field offsets (within page 0) ------------------------
 namespace header_offset {
@@ -113,8 +173,10 @@ enum : uint32_t {
 
 enum class PageType : uint16_t {
     Unknown = 0,
-    Catalog = 1, // bootstrap/root page and catalog continuation pages
-    Data = 2     // SQL2 heap pages carry structured row data
+    Catalog = 1,       // bootstrap/root page and catalog continuation pages
+    Data = 2,          // SQL2 heap pages carry structured row data
+    IndexLeaf = 3,     // SQL6 B+ tree leaf page
+    IndexInternal = 4  // SQL6 B+ tree internal page
 };
 
 inline const char* pageTypeName(PageType type) {
@@ -122,8 +184,14 @@ inline const char* pageTypeName(PageType type) {
     case PageType::Unknown: return "Unknown";
     case PageType::Catalog: return "Catalog";
     case PageType::Data: return "Data";
+    case PageType::IndexLeaf: return "IndexLeaf";
+    case PageType::IndexInternal: return "IndexInternal";
     }
     return "Unknown";
+}
+
+inline bool isIndexPageType(PageType type) {
+    return type == PageType::IndexLeaf || type == PageType::IndexInternal;
 }
 
 // Header flags (reserved for forward-compatible use).

@@ -30,6 +30,19 @@
 namespace gxos {
 namespace db {
 
+// An ephemeral, internal row locator: the physical position of a row in a heap
+// chain. It is valid only for the relevant scan/database generation and is
+// never a SQL-visible key. SQL6 indexes store it as their entry payload, so it
+// is defined here (rather than in the heap header) to keep the relational and
+// index layers free of an include cycle.
+struct RowLocator {
+    uint64_t pageId;
+    uint32_t slot;
+
+    RowLocator() : pageId(0), slot(0) {}
+    RowLocator(uint64_t pageIdIn, uint32_t slotIn) : pageId(pageIdIn), slot(slotIn) {}
+};
+
 enum class DbType : uint16_t {
     Unknown = 0,
     Boolean = 1,

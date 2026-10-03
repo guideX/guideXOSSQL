@@ -56,6 +56,16 @@ void printDiagnostics(const DatabaseDiagnostics& d, DbStatus status) {
                     static_cast<unsigned>(t.heapPageCount),
                     static_cast<unsigned long long>(t.rowCount));
     }
+    std::printf("index count:         %u\n", static_cast<unsigned>(d.indexCount));
+    for (size_t i = 0; i < d.indexes.size(); ++i) {
+        const IndexDiagnostics& x = d.indexes[i];
+        const char* kind = x.primaryKey ? "PRIMARY KEY" : (x.unique ? "UNIQUE" : "INDEX");
+        std::printf("  index [%u] \"%s\": %s on %s(%s), root %llu, %llu entries\n",
+                    static_cast<unsigned>(x.indexId), x.name.c_str(), kind,
+                    x.tableName.c_str(), x.columnName.c_str(),
+                    static_cast<unsigned long long>(x.rootPageId),
+                    static_cast<unsigned long long>(x.entryCount));
+    }
     if (!d.lastValidationFailure.empty()) {
         std::printf("last validation:     %s\n", d.lastValidationFailure.c_str());
     }
@@ -130,9 +140,20 @@ void printResultSet(const SqlResultSet& rs) {
 void printStatementResult(const SqlStatementResult& sr) {
     if (sr.ok) {
         if (sr.resultSet.hasResult()) {
+            if (std::getenv("GXDB_CLI_EXPLAIN") != nullptr) {
+                std::printf("Access path: %s", sr.accessPath.empty() ? "FullScan"
+                                                                     : sr.accessPath.c_str());
+                if (!sr.accessIndexName.empty()) {
+                    std::printf(" %s", sr.accessIndexName.c_str());
+                }
+                std::printf(" (candidates: %llu)\n",
+                            static_cast<unsigned long long>(sr.candidateRowsVisited));
+            }
             printResultSet(sr.resultSet);
         } else if (sr.type == SqlStatementType::CreateTable) {
             std::printf("OK: created table '%s'\n", sr.objectName.c_str());
+        } else if (sr.type == SqlStatementType::CreateIndex) {
+            std::printf("OK: created index '%s'\n", sr.objectName.c_str());
         } else if (sr.type == SqlStatementType::Insert) {
             std::printf("OK: inserted %llu row%s\n",
                         static_cast<unsigned long long>(sr.affectedRows),

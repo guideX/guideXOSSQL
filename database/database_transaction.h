@@ -74,6 +74,7 @@ public:
     DbResult allocatePage(PageType type, uint64_t& outPageId) override;
 
     DbResult createTable(const TableDefinition& def, uint32_t& outTableId);
+    DbResult createIndex(const IndexDefinition& def, uint32_t& outIndexId);
     DbResult openTable(const std::string& name, std::unique_ptr<Table>& out);
 
     DbResult commit();

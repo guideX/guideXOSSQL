@@ -24,21 +24,30 @@ Native relational database subsystem for guideXOS. This repository contains:
   located through internal ephemeral locators and mutated through generic
   transaction-aware relational primitives with statement-level atomicity. Still
   a full-scan, index-free engine; no `.gxdb`/`.gxwal` format change.
+- **Phase SQL6: B+ Tree Indexes and Constraints** — persistent single-column
+  B+ tree indexes, `CREATE INDEX` / `CREATE UNIQUE INDEX`, `PRIMARY KEY` and
+  `UNIQUE`, and a deterministic rule-based access path that uses an index for
+  supported equality/range predicates. Indexes live in the transaction-private
+  page/WAL path, are maintained by the relational layer on every INSERT /
+  UPDATE / DELETE, survive row relocation and page compaction, and are enforced
+  below the SQL layer. Catalog upgraded to a backward-compatible v3; outer
+  `.gxdb` format and the WAL format are unchanged.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
 - SQL3 WAL/transaction design: [`docs/SQL3_WAL_TRANSACTIONS.md`](docs/SQL3_WAL_TRANSACTIONS.md)
 - SQL4 language reference: [`docs/SQL4_LANGUAGE.md`](docs/SQL4_LANGUAGE.md)
 - SQL5 predicates/mutation/ordering: [`docs/SQL5_PREDICATES_MUTATION_ORDERING.md`](docs/SQL5_PREDICATES_MUTATION_ORDERING.md)
+- SQL6 B+ tree indexes/constraints: [`docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md`](docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
 
 ```
 database/   storage engine (format, checksum, I/O, header, page, file, engine,
-            buffer, catalog, heap, wal, transaction, relational) and the SQL
-            language layer (sql_token, sql_tokenizer, sql_parser, sql)
-tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4)
+            buffer, catalog, heap, index, wal, transaction, relational) and the
+            SQL language layer (sql_token, sql_tokenizer, sql_parser, sql)
+tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4 + SQL5 + SQL6)
 tools/      gxdb_cli (create / inspect / sql / run / shell)
 docs/       architecture and test reports
 ```
@@ -150,6 +159,46 @@ const SqlResultSet& rows = result.statements[0].resultSet;
 // rows.columnCount(), rows.column(i).name/type, rows.row(r), rows.isNull(r, c)
 ```
 
+## Indexed example (SQL6)
+
+```sql
+CREATE TABLE Users (
+    Id INT64 PRIMARY KEY,
+    Email TEXT UNIQUE,
+    Name TEXT NOT NULL,
+    Enabled BOOLEAN NOT NULL
+);
+
+CREATE INDEX IX_Users_Name
+ON Users (Name);
+
+INSERT INTO Users VALUES (1, 'alice@example.com', 'Alice', TRUE);
+INSERT INTO Users VALUES (2, 'bob@example.com', 'Bob', FALSE);
+
+-- Uses the PRIMARY KEY index.
+SELECT *
+FROM Users
+WHERE Id = 1;
+
+-- Uses IX_Users_Name as a range access path.
+SELECT Name
+FROM Users
+WHERE Name >= 'A';
+```
+
+`PRIMARY KEY` implies `NOT NULL` and is backed by a persistent unique B+ tree.
+`UNIQUE` allows any number of `NULL` values but rejects duplicate non-NULL
+values. Indexed lookups return exactly the same logical rows as a full scan.
+Composite indexes and foreign keys are not supported in SQL6.
+
+```sh
+build/gxdb_cli sql app.gxdb "CREATE TABLE Users (Id INT64 PRIMARY KEY, Email TEXT UNIQUE, Name TEXT NOT NULL, Enabled BOOLEAN NOT NULL);"
+build/gxdb_cli sql app.gxdb "CREATE INDEX IX_Users_Name ON Users (Name);"
+build/gxdb_cli sql app.gxdb "SELECT * FROM Users WHERE Id = 1;"
+GXDB_CLI_EXPLAIN=1 build/gxdb_cli sql app.gxdb "SELECT Name FROM Users WHERE Name >= 'A';"
+build/gxdb_cli inspect app.gxdb   # lists every index and its root page
+```
+
 ## Command-line diagnostics
 
 ```sh
@@ -163,11 +212,18 @@ build/gxdb_cli shell sample.gxdb
 ## Status
 
 Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
-SQL4: 429 checks, SQL5: 1775 checks). SQL3 proves crash-atomic transactions on
-the hosted backend, including a full commit crash matrix and a 250-lifecycle
-transaction/recovery stress suite. SQL4 proves a bounded SQL language over that
-engine. SQL5 proves predicates with three-valued logic, deterministic ordering
-and LIMIT/OFFSET, plus UPDATE/DELETE with statement-level atomicity, variable
-width row relocation, multi-page compaction and SQL-driven UPDATE/DELETE crash
-matrices. QEMU and bare-metal proof are deferred to the phase that provides a
-native `IDatabaseFile` backend over the guideXOS VFS / block device.
+SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks). SQL3 proves
+crash-atomic transactions on the hosted backend, including a full commit crash
+matrix and a 250-lifecycle transaction/recovery stress suite. SQL4 proves a
+bounded SQL language over that engine. SQL5 proves predicates with three-valued
+logic, deterministic ordering and LIMIT/OFFSET, plus UPDATE/DELETE with
+statement-level atomicity, variable width row relocation, multi-page compaction
+and SQL-driven UPDATE/DELETE crash matrices. SQL6 proves persistent single-column
+B+ tree indexes: multi-level splits, duplicate-key and range traversal,
+PRIMARY KEY / UNIQUE enforcement, transactional CREATE INDEX over existing rows,
+locator remapping under page compaction, indexed-vs-full-scan equivalence,
+multi-index consistency, index corruption safety, CREATE INDEX / INSERT / UPDATE
+/ DELETE crash matrices, and a 3000-row deterministic workload plus a
+250-lifecycle indexed transaction stress suite. QEMU and bare-metal proof are
+deferred to the phase that provides a native `IDatabaseFile` backend over the
+guideXOS VFS / block device.

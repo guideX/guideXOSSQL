@@ -5,6 +5,7 @@
 #include "database_endian.h"
 #include "database_engine.h"
 #include "database_heap.h"
+#include "database_index.h"
 #include "database_transaction.h"
 
 namespace gxos {
@@ -441,6 +442,236 @@ DbResult Database::createTable(const TableDefinition& def, uint32_t& outTableId)
     return tx->commit();
 }
 
+DbResult Database::createIndex(const IndexDefinition& def, uint32_t& outIndexId) {
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    if (_activeTx != nullptr) {
+        return _activeTx->createIndex(def, outIndexId);
+    }
+
+    std::unique_ptr<Transaction> tx;
+    DbResult result = beginTransaction(tx);
+    if (!result.isOk()) {
+        return result;
+    }
+    result = tx->createIndex(def, outIndexId);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    return tx->commit();
+}
+
+DbResult Database::buildIndex(uint32_t indexId) {
+    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::Internal, "index record not found");
+    }
+    const Catalog::TableRecord* tableRec = _catalog.findTable(rec->tableId);
+    if (tableRec == nullptr) {
+        return DbResult::error(DbStatus::Internal, "index table not found");
+    }
+    const DbType type = tableRec->columns[rec->columnOrdinal].type;
+    const uint32_t maxKey = maxIndexKeyBytes(pageSize());
+    const bool unique = rec->unique();
+
+    IndexTree tree(pages(), type, indexId);
+    uint64_t root = rec->rootPageId;
+    uint64_t entryCount = 0;
+
+    Table table(*this, rec->tableId);
+    std::unique_ptr<TableScan> scan;
+    DbResult result = table.scanStart(scan);
+    if (!result.isOk()) {
+        return result;
+    }
+    std::vector<DbValue> row;
+    while (scan->next(row)) {
+        std::vector<uint8_t> key;
+        if (!encodeIndexKey(type, row[rec->columnOrdinal], key)) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "value is not indexable for this index");
+        }
+        if (key.size() > maxKey) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "indexed value exceeds the maximum index key size");
+        }
+        if (root == 0) {
+            result = tree.createEmpty(root);
+            if (!result.isOk()) {
+                return result;
+            }
+            _catalog.setIndexRoot(indexId, root);
+        }
+        uint64_t newRoot = root;
+        bool inserted = false;
+        result = tree.insert(key, RowLocator(scan->currentPageId(), scan->currentSlotIndex()),
+                             root, unique, newRoot, inserted);
+        if (!result.isOk()) {
+            return result;
+        }
+        if (newRoot != root) {
+            root = newRoot;
+            _catalog.setIndexRoot(indexId, root);
+        }
+        if (inserted) {
+            ++entryCount;
+        }
+    }
+    if (!scan->status().isOk()) {
+        return scan->status();
+    }
+    _catalog.setIndexEntryCount(indexId, entryCount);
+    markCatalogDirty();
+    return DbResult::ok();
+}
+
+DbResult Database::listIndexes(std::vector<IndexInfo>& out) const {
+    out.clear();
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    const std::vector<Catalog::IndexRecord>& indexes = _catalog.indexes();
+    out.reserve(indexes.size());
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        IndexInfo info;
+        info.indexId = indexes[i].indexId;
+        info.name = indexes[i].name;
+        info.tableId = indexes[i].tableId;
+        info.columnOrdinal = indexes[i].columnOrdinal;
+        info.kind = indexes[i].kind();
+        info.rootPageId = indexes[i].rootPageId;
+        info.entryCount = indexes[i].entryCount;
+        info.formatVersion = indexes[i].formatVersion;
+        const Catalog::TableRecord* table = _catalog.findTable(indexes[i].tableId);
+        if (table != nullptr) {
+            info.tableName = table->name;
+            if (indexes[i].columnOrdinal < table->columns.size()) {
+                info.columnName = table->columns[indexes[i].columnOrdinal].name;
+                info.columnType = table->columns[indexes[i].columnOrdinal].type;
+            }
+        }
+        out.push_back(info);
+    }
+    return DbResult::ok();
+}
+
+DbResult Database::describeIndex(const std::string& name, IndexInfo& out) const {
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    const Catalog::IndexRecord* rec = _catalog.findIndex(name);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    out = IndexInfo();
+    out.indexId = rec->indexId;
+    out.name = rec->name;
+    out.tableId = rec->tableId;
+    out.columnOrdinal = rec->columnOrdinal;
+    out.kind = rec->kind();
+    out.rootPageId = rec->rootPageId;
+    out.entryCount = rec->entryCount;
+    out.formatVersion = rec->formatVersion;
+    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
+    if (table != nullptr) {
+        out.tableName = table->name;
+        if (rec->columnOrdinal < table->columns.size()) {
+            out.columnName = table->columns[rec->columnOrdinal].name;
+            out.columnType = table->columns[rec->columnOrdinal].type;
+        }
+    }
+    return DbResult::ok();
+}
+
+const Catalog::IndexRecord* Database::findIndexForColumn(uint32_t tableId,
+                                                         uint32_t columnOrdinal) const {
+    const std::vector<Catalog::IndexRecord>& indexes = _catalog.indexes();
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (indexes[i].tableId == tableId &&
+            indexes[i].columnOrdinal == columnOrdinal) {
+            return &indexes[i];
+        }
+    }
+    return nullptr;
+}
+
+DbResult Database::indexLookup(uint32_t indexId, const std::vector<uint8_t>& logicalKey,
+                               std::vector<RowLocator>& out) {
+    out.clear();
+    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    if (rec->rootPageId == 0) {
+        return DbResult::ok();
+    }
+    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::Internal, "index table not found");
+    }
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    std::vector<IndexEntry> entries;
+    DbResult result = tree.lookupAll(logicalKey, rec->rootPageId, entries);
+    if (!result.isOk()) {
+        return result;
+    }
+    out.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        out.push_back(entries[i].locator);
+    }
+    return DbResult::ok();
+}
+
+DbResult Database::indexRange(uint32_t indexId, const IndexRangeBound& bound,
+                              std::vector<RowLocator>& out) {
+    out.clear();
+    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    if (rec->rootPageId == 0) {
+        return DbResult::ok();
+    }
+    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::Internal, "index table not found");
+    }
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    std::vector<IndexEntry> entries;
+    DbResult result = tree.rangeScan(bound, rec->rootPageId, entries);
+    if (!result.isOk()) {
+        return result;
+    }
+    out.reserve(entries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        out.push_back(entries[i].locator);
+    }
+    return DbResult::ok();
+}
+
+DbResult Database::validateIndex(uint32_t indexId, IndexValidation& out) {
+    out = IndexValidation();
+    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::Internal, "index table not found");
+    }
+    if (rec->rootPageId == 0) {
+        out.ok = true;
+        return DbResult::ok();
+    }
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    return tree.validate(rec->rootPageId, out);
+}
+
 DbResult Database::listTables(std::vector<TableInfo>& out) const {
     out.clear();
     if (!_open) {
@@ -526,6 +757,29 @@ void Database::refreshDiagnostics() {
         td.heapPageCount = tables[i].heapPageCount;
         td.rowCount = tables[i].rowCount;
         _diagnostics.tables.push_back(td);
+    }
+
+    _diagnostics.indexes.clear();
+    _diagnostics.indexCount = _catalog.indexCount();
+    const std::vector<Catalog::IndexRecord>& indexes = _catalog.indexes();
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        IndexDiagnostics id;
+        id.indexId = indexes[i].indexId;
+        id.name = indexes[i].name;
+        id.tableId = indexes[i].tableId;
+        id.unique = indexes[i].unique();
+        id.primaryKey = indexes[i].primaryKey();
+        id.rootPageId = indexes[i].rootPageId;
+        id.entryCount = indexes[i].entryCount;
+        id.formatVersion = indexes[i].formatVersion;
+        const Catalog::TableRecord* table = _catalog.findTable(indexes[i].tableId);
+        if (table != nullptr) {
+            id.tableName = table->name;
+            if (indexes[i].columnOrdinal < table->columns.size()) {
+                id.columnName = table->columns[indexes[i].columnOrdinal].name;
+            }
+        }
+        _diagnostics.indexes.push_back(id);
     }
     if (_file) {
         _diagnostics.state = _file->diagnostics().state;

@@ -6,6 +6,7 @@ namespace db {
 const char* sqlStatementTypeName(SqlStatementType type) {
     switch (type) {
     case SqlStatementType::CreateTable: return "CREATE TABLE";
+    case SqlStatementType::CreateIndex: return "CREATE INDEX";
     case SqlStatementType::Insert: return "INSERT";
     case SqlStatementType::Select: return "SELECT";
     case SqlStatementType::Update: return "UPDATE";
@@ -131,9 +132,15 @@ bool SqlParser::parseStatement(SqlStatementAst& out, SqlError& error) {
     out.line = token.line;
     out.column = token.column;
     switch (token.kind) {
-    case SqlTokenKind::Create:
+    case SqlTokenKind::Create: {
+        const SqlTokenKind next = peek(1).kind;
+        if (next == SqlTokenKind::Index || next == SqlTokenKind::Unique) {
+            out.type = SqlStatementType::CreateIndex;
+            return parseCreateIndex(out, error);
+        }
         out.type = SqlStatementType::CreateTable;
         return parseCreateTable(out, error);
+    }
     case SqlTokenKind::Insert:
         out.type = SqlStatementType::Insert;
         return parseInsert(out, error);
@@ -202,6 +209,8 @@ bool SqlParser::parseCreateTable(SqlStatementAst& out, SqlError& error) {
 }
 
 bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
+    out.primaryKey = false;
+    out.unique = false;
     if (!parseIdentifier(out.name, error, "column name")) {
         return false;
     }
@@ -220,6 +229,7 @@ bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
         return false;
     }
     out.nullable = true;
+    bool explicitNull = false;
     if (match(SqlTokenKind::Not)) {
         if (!expect(SqlTokenKind::Null, error, "NULL after NOT")) {
             return false;
@@ -227,7 +237,70 @@ bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
         out.nullable = false;
     } else if (match(SqlTokenKind::Null)) {
         out.nullable = true;
+        explicitNull = true;
     }
+
+    // SQL6 column constraints. PRIMARY KEY implies NOT NULL and rejects a
+    // contradictory explicit NULL declaration.
+    for (;;) {
+        if (match(SqlTokenKind::Primary)) {
+            if (!expect(SqlTokenKind::Key, error, "KEY after PRIMARY")) {
+                return false;
+            }
+            if (out.primaryKey) {
+                error = makeError(SqlErrorCode::SemanticError,
+                                  "duplicate PRIMARY KEY constraint", peek());
+                return false;
+            }
+            if (explicitNull) {
+                error = makeError(SqlErrorCode::SemanticError,
+                                  "PRIMARY KEY column cannot be declared NULL", peek());
+                return false;
+            }
+            out.primaryKey = true;
+            out.nullable = false;
+        } else if (match(SqlTokenKind::Unique)) {
+            out.unique = true;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+bool SqlParser::parseCreateIndex(SqlStatementAst& out, SqlError& error) {
+    advance(); // CREATE
+    bool unique = false;
+    if (match(SqlTokenKind::Unique)) {
+        unique = true;
+    }
+    if (!expect(SqlTokenKind::Index, error, "INDEX after CREATE")) {
+        return false;
+    }
+    if (!parseIdentifier(out.createIndex.index, error, "index name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::On, error, "ON after index name")) {
+        return false;
+    }
+    if (!parseIdentifier(out.createIndex.table, error, "table name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::LeftParen, error, "'(' after table name")) {
+        return false;
+    }
+    if (!parseIdentifier(out.createIndex.columnName, error, "column name")) {
+        return false;
+    }
+    if (check(SqlTokenKind::Comma)) {
+        error = makeError(SqlErrorCode::Unsupported,
+                          "composite indexes are not supported", peek());
+        return false;
+    }
+    if (!expect(SqlTokenKind::RightParen, error, "')' after column name")) {
+        return false;
+    }
+    out.createIndex.unique = unique;
     return true;
 }
 

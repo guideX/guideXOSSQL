@@ -44,19 +44,6 @@ const uint32_t kHeapRowAreaEndOffset = 20;
 
 class TableScan;
 
-// An ephemeral, internal row locator: the physical position of a row in the
-// heap chain. It is valid only for the relevant scan/database generation and is
-// never a SQL-visible key. UPDATE/DELETE use locators collected during one scan
-// so every original row is considered exactly once even when a mutation
-// relocates rows.
-struct RowLocator {
-    uint64_t pageId;
-    uint32_t slot;
-
-    RowLocator() : pageId(0), slot(0) {}
-    RowLocator(uint64_t pageIdIn, uint32_t slotIn) : pageId(pageIdIn), slot(slotIn) {}
-};
-
 // A planned row mutation: either a full replacement row or a deletion. The
 // relational layer validates and applies a bounded set of these atomically.
 struct RowMutation {
@@ -73,6 +60,11 @@ public:
 
     DbResult insert(const std::vector<DbValue>& values);
     DbResult scanStart(std::unique_ptr<TableScan>& out) const;
+
+    // Fetches the row at an exact physical locator. Returns CorruptPage when the
+    // page/slot is invalid or the page is not a heap page; callers treat that as
+    // index corruption rather than "row not found".
+    DbResult fetchRow(const RowLocator& locator, std::vector<DbValue>& out) const;
 
     // Applies a bounded set of row replacements/deletions. Each target locator
     // must have come from a single prior scan. The whole set is applied inside
@@ -97,7 +89,8 @@ private:
     DbResult insertInTransaction(const std::vector<DbValue>& values);
     DbResult applyMutationsInTransaction(const std::vector<RowMutation>& mutations);
     DbResult appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
-                                    uint32_t& newPagesOut, uint64_t& firstNewPageOut);
+                                    uint32_t& newPagesOut, uint64_t& firstNewPageOut,
+                                    RowLocator* outLocator);
     DbResult ensureLastHeapPage();
     DbResult updateStats(int64_t rowDelta, uint32_t newPageCount, uint64_t firstPageId);
     void markCatalogDirty();

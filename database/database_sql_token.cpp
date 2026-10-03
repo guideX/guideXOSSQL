@@ -72,6 +72,11 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::And: return "AND";
     case SqlTokenKind::Or: return "OR";
     case SqlTokenKind::Is: return "IS";
+    case SqlTokenKind::Index: return "INDEX";
+    case SqlTokenKind::Unique: return "UNIQUE";
+    case SqlTokenKind::Primary: return "PRIMARY";
+    case SqlTokenKind::Key: return "KEY";
+    case SqlTokenKind::On: return "ON";
     case SqlTokenKind::Identifier: return "identifier";
     case SqlTokenKind::IntegerLiteral: return "integer literal";
     case SqlTokenKind::FloatLiteral: return "float literal";
@@ -94,7 +99,7 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
 }
 
 bool sqlTokenIsKeyword(SqlTokenKind kind) {
-    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::Is;
+    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::On;
 }
 
 bool sqlTokenIsTypeKeyword(SqlTokenKind kind) {

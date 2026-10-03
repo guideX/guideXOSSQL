@@ -91,6 +91,18 @@ DbResult Transaction::createTable(const TableDefinition& def, uint32_t& outTable
     return DbResult::ok();
 }
 
+DbResult Transaction::createIndex(const IndexDefinition& def, uint32_t& outIndexId) {
+    if (!_active) {
+        return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
+    }
+    DbResult result = _db.catalog().addIndex(def, pageSize(), outIndexId);
+    if (!result.isOk()) {
+        return result;
+    }
+    markCatalogChanged();
+    return _db.buildIndex(outIndexId);
+}
+
 DbResult Transaction::openTable(const std::string& name, std::unique_ptr<Table>& out) {
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");

@@ -16,6 +16,7 @@ add_library(gxos_database STATIC
     database/database_engine.cpp
     database/database_buffer.cpp
     database/database_catalog.cpp
+    database/database_index.cpp
     database/database_heap.cpp
     database/database_wal.cpp
     database/database_transaction.cpp
@@ -75,6 +76,16 @@ else()
 endif()
 
 add_test(NAME database_sql_test COMMAND database_sql_test)
+
+add_executable(database_index_test tests/database_index_test.cpp)
+target_link_libraries(database_index_test PRIVATE gxos_database)
+if(MSVC)
+    target_compile_options(database_index_test PRIVATE /W4)
+else()
+    target_compile_options(database_index_test PRIVATE -Wall -Wextra)
+endif()
+
+add_test(NAME database_index_test COMMAND database_index_test)
 
 add_executable(gxdb_cli tools/gxdb_cli.cpp)
 target_link_libraries(gxdb_cli PRIVATE gxos_database)

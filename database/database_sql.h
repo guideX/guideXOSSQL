@@ -91,6 +91,11 @@ struct SqlStatementResult {
     bool transactionActiveAfter;
     uint64_t transactionIdAfter;
 
+    // SQL6 access-path diagnostics (read-only; not persistent state).
+    std::string accessPath;      // "FullScan" | "IndexLookup" | "IndexRange"
+    std::string accessIndexName; // chosen index, when any
+    uint64_t candidateRowsVisited;
+
     SqlStatementResult();
 };
 
@@ -133,6 +138,7 @@ private:
     bool executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
                           SqlStatementResult& out);
     bool executeCreateTable(const SqlCreateTableAst& ast, SqlStatementResult& out);
+    bool executeCreateIndex(const SqlCreateIndexAst& ast, SqlStatementResult& out);
     bool executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
                        SqlStatementResult& out);
     bool executeSelect(const SqlSelectAst& ast, ExecContext& ctx,

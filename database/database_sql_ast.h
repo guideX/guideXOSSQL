@@ -26,6 +26,7 @@ namespace db {
 enum class SqlStatementType {
     Unknown = 0,
     CreateTable,
+    CreateIndex,
     Insert,
     Select,
     Update,
@@ -120,8 +121,11 @@ struct SqlColumnDefAst {
     SqlIdentifier name;
     DbType type;
     bool nullable;
+    bool primaryKey;
+    bool unique;
 
-    SqlColumnDefAst() : type(DbType::Unknown), nullable(true) {}
+    SqlColumnDefAst()
+        : type(DbType::Unknown), nullable(true), primaryKey(false), unique(false) {}
 };
 
 struct SqlCreateTableAst {
@@ -131,6 +135,18 @@ struct SqlCreateTableAst {
     uint32_t column;
 
     SqlCreateTableAst() : line(0), column(0) {}
+};
+
+// CREATE [UNIQUE] INDEX name ON table (column)
+struct SqlCreateIndexAst {
+    SqlIdentifier index;
+    SqlIdentifier table;
+    SqlIdentifier columnName;
+    bool unique;
+    uint32_t line;
+    uint32_t column;
+
+    SqlCreateIndexAst() : unique(false), line(0), column(0) {}
 };
 
 struct SqlInsertAst {
@@ -191,6 +207,7 @@ struct SqlDeleteAst {
 struct SqlStatementAst {
     SqlStatementType type;
     SqlCreateTableAst createTable;
+    SqlCreateIndexAst createIndex;
     SqlInsertAst insert;
     SqlSelectAst select;
     SqlUpdateAst update;

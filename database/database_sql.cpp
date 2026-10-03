@@ -6,6 +6,7 @@
 
 #include "database_format.h"
 #include "database_heap.h"
+#include "database_index.h"
 #include "database_sql_expr.h"
 #include "database_sql_parser.h"
 #include "database_sql_tokenizer.h"
@@ -197,6 +198,159 @@ int compareOrderValues(const DbValue& a, const DbValue& b, DbType type) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SQL6 access-path selection and row sources.
+
+struct AccessPathChoice {
+    enum class Kind { FullScan, IndexLookup, IndexRange };
+    Kind kind;
+    const Catalog::IndexRecord* index;
+    uint32_t columnOrdinal;
+    SqlCompareOp op;
+    DbValue value;
+    int score;
+
+    AccessPathChoice()
+        : kind(Kind::FullScan), index(nullptr), columnOrdinal(0),
+          op(SqlCompareOp::Eq), value(), score(0) {}
+};
+
+int compareOpScore(SqlCompareOp op) {
+    return op == SqlCompareOp::Eq ? 2 : 1;
+}
+
+void considerIndexCandidate(const std::vector<SqlExprNode>& nodes, int32_t index,
+                            const std::vector<ColumnDefinition>& columns,
+                            Database& db, uint32_t tableId, AccessPathChoice& best) {
+    if (index < 0 || static_cast<size_t>(index) >= nodes.size()) {
+        return;
+    }
+    const SqlExprNode& node = nodes[static_cast<size_t>(index)];
+    if (node.kind == SqlExprKind::And) {
+        considerIndexCandidate(nodes, node.left, columns, db, tableId, best);
+        considerIndexCandidate(nodes, node.right, columns, db, tableId, best);
+        return;
+    }
+    if (node.kind != SqlExprKind::Compare || node.left < 0 || node.right < 0) {
+        return;
+    }
+    const SqlExprNode& lhs = nodes[static_cast<size_t>(node.left)];
+    const SqlExprNode& rhs = nodes[static_cast<size_t>(node.right)];
+    const SqlExprNode* colNode = nullptr;
+    const SqlExprNode* litNode = nullptr;
+    SqlCompareOp op = node.compareOp;
+    if (lhs.kind == SqlExprKind::ColumnRef && rhs.kind == SqlExprKind::Literal) {
+        colNode = &lhs;
+        litNode = &rhs;
+    } else if (lhs.kind == SqlExprKind::Literal &&
+               rhs.kind == SqlExprKind::ColumnRef) {
+        colNode = &rhs;
+        litNode = &lhs;
+        switch (op) {
+        case SqlCompareOp::Lt: op = SqlCompareOp::Gt; break;
+        case SqlCompareOp::Le: op = SqlCompareOp::Ge; break;
+        case SqlCompareOp::Gt: op = SqlCompareOp::Lt; break;
+        case SqlCompareOp::Ge: op = SqlCompareOp::Le; break;
+        default: break;
+        }
+    } else {
+        return;
+    }
+    if (op == SqlCompareOp::Ne || litNode->literal.kind == SqlLiteralKind::Null) {
+        return;
+    }
+    size_t ordinal = columns.size();
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (columns[i].name == colNode->identifier.name) {
+            ordinal = i;
+            break;
+        }
+    }
+    if (ordinal == columns.size() || !isIndexableType(columns[ordinal].type)) {
+        return;
+    }
+    const Catalog::IndexRecord* idx =
+        db.findIndexForColumn(tableId, static_cast<uint32_t>(ordinal));
+    if (idx == nullptr) {
+        return;
+    }
+    std::vector<DbValue> coerced;
+    SqlError error;
+    if (!coerceLiteral(litNode->literal, columns[ordinal], coerced, error) ||
+        coerced.empty() || coerced[0].isNull()) {
+        return;
+    }
+    std::vector<uint8_t> probe;
+    if (!encodeIndexKey(columns[ordinal].type, coerced[0], probe)) {
+        return;
+    }
+    const int score = compareOpScore(op);
+    if (score > best.score) {
+        best.kind = (op == SqlCompareOp::Eq) ? AccessPathChoice::Kind::IndexLookup
+                                             : AccessPathChoice::Kind::IndexRange;
+        best.index = idx;
+        best.columnOrdinal = static_cast<uint32_t>(ordinal);
+        best.op = op;
+        best.value = coerced[0];
+        best.score = score;
+    }
+}
+
+AccessPathChoice selectAccessPath(const SqlPredicateAst& where,
+                                  const std::vector<ColumnDefinition>& columns,
+                                  Database& db, uint32_t tableId) {
+    AccessPathChoice best;
+    if (!where.present) {
+        return best;
+    }
+    considerIndexCandidate(where.nodes, where.root, columns, db, tableId, best);
+    return best;
+}
+
+// A uniform row source so SELECT can stream from either a heap scan or an
+// index candidate list without changing predicate/projection/ordering code.
+class RowSource {
+public:
+    virtual ~RowSource() {}
+    virtual bool next(std::vector<DbValue>& row) = 0;
+    virtual DbResult status() const = 0;
+};
+
+class ScanRowSource : public RowSource {
+public:
+    explicit ScanRowSource(std::unique_ptr<TableScan> scan) : _scan(std::move(scan)) {}
+    bool next(std::vector<DbValue>& row) override { return _scan->next(row); }
+    DbResult status() const override { return _scan->status(); }
+
+private:
+    std::unique_ptr<TableScan> _scan;
+};
+
+class LocatorRowSource : public RowSource {
+public:
+    LocatorRowSource(Table* table, const std::vector<RowLocator>& locators)
+        : _table(table), _locators(locators), _index(0), _status(DbResult::ok()) {}
+    bool next(std::vector<DbValue>& row) override {
+        if (!_status.isOk() || _index >= _locators.size()) {
+            return false;
+        }
+        DbResult result = _table->fetchRow(_locators[_index], row);
+        ++_index;
+        if (!result.isOk()) {
+            _status = result;
+            return false;
+        }
+        return true;
+    }
+    DbResult status() const override { return _status; }
+
+private:
+    Table* _table;
+    std::vector<RowLocator> _locators;
+    size_t _index;
+    DbResult _status;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -239,7 +393,8 @@ void SqlResultSet::clear() {
 SqlStatementResult::SqlStatementResult()
     : type(SqlStatementType::Unknown), ok(false), error(), affectedRows(0),
       objectName(), resultSet(), transactionActiveAfter(false),
-      transactionIdAfter(0) {}
+      transactionIdAfter(0), accessPath(), accessIndexName(),
+      candidateRowsVisited(0) {}
 
 SqlExecutionResult::SqlExecutionResult()
     : ok(false), error(), statements(), failedStatementIndex(0), stoppedEarly(false),
@@ -386,6 +541,9 @@ bool SqlEngine::executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
     case SqlStatementType::CreateTable:
         ok = executeCreateTable(stmt.createTable, out);
         break;
+    case SqlStatementType::CreateIndex:
+        ok = executeCreateIndex(stmt.createIndex, out);
+        break;
     case SqlStatementType::Insert:
         ok = executeInsert(stmt.insert, ctx, out);
         break;
@@ -435,6 +593,13 @@ bool SqlEngine::executeCreateTable(const SqlCreateTableAst& ast,
     for (size_t i = 0; i < ast.columns.size(); ++i) {
         definition.columns.push_back(ColumnDefinition(
             ast.columns[i].name.name, ast.columns[i].type, ast.columns[i].nullable));
+        if (ast.columns[i].primaryKey) {
+            definition.indexes.push_back(IndexDefinition(
+                std::string(), 0, static_cast<uint32_t>(i), IndexKind::PrimaryKey));
+        } else if (ast.columns[i].unique) {
+            definition.indexes.push_back(IndexDefinition(
+                std::string(), 0, static_cast<uint32_t>(i), IndexKind::Unique));
+        }
     }
 
     uint32_t tableId = 0;
@@ -444,6 +609,62 @@ bool SqlEngine::executeCreateTable(const SqlCreateTableAst& ast,
         return false;
     }
     out.objectName = definition.name;
+    out.affectedRows = 0;
+    return true;
+}
+
+bool SqlEngine::executeCreateIndex(const SqlCreateIndexAst& ast,
+                                   SqlStatementResult& out) {
+    const Catalog::TableRecord* table = _db.catalog().findTable(ast.table.name);
+    if (table == nullptr) {
+        out.error = makeSemantic("unknown table '" + ast.table.name + "'",
+                                 ast.table.line, ast.table.column);
+        return false;
+    }
+    size_t ordinal = table->columns.size();
+    for (size_t i = 0; i < table->columns.size(); ++i) {
+        if (table->columns[i].name == ast.columnName.name) {
+            ordinal = i;
+            break;
+        }
+    }
+    if (ordinal == table->columns.size()) {
+        out.error = makeSemantic(
+            "unknown column '" + ast.columnName.name + "' in table '" + ast.table.name + "'",
+            ast.columnName.line, ast.columnName.column);
+        return false;
+    }
+    if (!isIndexableType(table->columns[ordinal].type)) {
+        out.error = makeSemantic(
+            "column '" + ast.columnName.name + "' has a type that cannot be indexed",
+            ast.columnName.line, ast.columnName.column);
+        return false;
+    }
+
+    IndexDefinition def;
+    def.name = ast.index.name;
+    def.tableId = table->tableId;
+    def.columnOrdinal = static_cast<uint32_t>(ordinal);
+    def.kind = ast.unique ? IndexKind::Unique : IndexKind::Ordinary;
+
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        _tx->beginStatement(savepoint);
+    }
+    uint32_t indexId = 0;
+    DbResult result = _db.createIndex(def, indexId);
+    if (!result.isOk()) {
+        if (explicitTransaction) {
+            _tx->rollbackStatement(savepoint);
+        }
+        out.error = errorFromResult(result, ast.index.line, ast.index.column);
+        return false;
+    }
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
+    }
+    out.objectName = ast.index.name;
     out.affectedRows = 0;
     return true;
 }
@@ -574,11 +795,67 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         orderKeys.push_back(key);
     }
 
-    std::unique_ptr<TableScan> scan;
-    DbResult result = table->scanStart(scan);
-    if (!result.isOk()) {
-        out.error = errorFromResult(result, ast.table.line, ast.table.column);
-        return false;
+    // SQL6: choose a deterministic access path. The index only produces
+    // candidate row locators; the full predicate is still evaluated below.
+    AccessPathChoice path = selectAccessPath(ast.where, columns, _db, table->tableId());
+    std::unique_ptr<RowSource> source;
+    if (path.kind == AccessPathChoice::Kind::FullScan) {
+        std::unique_ptr<TableScan> scan;
+        DbResult result = table->scanStart(scan);
+        if (!result.isOk()) {
+            out.error = errorFromResult(result, ast.table.line, ast.table.column);
+            return false;
+        }
+        source.reset(new ScanRowSource(std::move(scan)));
+        out.accessPath = "FullScan";
+    } else {
+        std::vector<RowLocator> locators;
+        DbResult result = DbResult::ok();
+        const DbType indexType = columns[path.columnOrdinal].type;
+        if (path.kind == AccessPathChoice::Kind::IndexLookup) {
+            std::vector<uint8_t> key;
+            if (!encodeIndexKey(indexType, path.value, key)) {
+                out.error = makeSemantic("value cannot be indexed", ast.line, ast.column);
+                return false;
+            }
+            result = _db.indexLookup(path.index->indexId, key, locators);
+            out.accessPath = "IndexLookup";
+        } else {
+            IndexRangeBound bound;
+            switch (path.op) {
+            case SqlCompareOp::Lt:
+                bound.hasUpper = true;
+                bound.upperInclusive = false;
+                bound.upper = path.value;
+                break;
+            case SqlCompareOp::Le:
+                bound.hasUpper = true;
+                bound.upperInclusive = true;
+                bound.upper = path.value;
+                break;
+            case SqlCompareOp::Gt:
+                bound.hasLower = true;
+                bound.lowerInclusive = false;
+                bound.lower = path.value;
+                break;
+            case SqlCompareOp::Ge:
+                bound.hasLower = true;
+                bound.lowerInclusive = true;
+                bound.lower = path.value;
+                break;
+            default:
+                break;
+            }
+            result = _db.indexRange(path.index->indexId, bound, locators);
+            out.accessPath = "IndexRange";
+        }
+        if (!result.isOk()) {
+            out.error = errorFromResult(result, ast.table.line, ast.table.column);
+            return false;
+        }
+        out.accessIndexName = path.index->name;
+        out.candidateRowsVisited = static_cast<uint64_t>(locators.size());
+        source.reset(new LocatorRowSource(table, locators));
     }
 
     out.resultSet.setColumns(resultColumns);
@@ -595,7 +872,7 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         // once a bounded LIMIT has been satisfied.
         uint64_t skipped = 0;
         uint64_t emitted = 0;
-        while (limit != 0 && scan->next(row)) {
+        while (limit != 0 && source->next(row)) {
             if (predicate.evaluate(row) != SqlTruth::True) {
                 continue;
             }
@@ -629,7 +906,7 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         };
         std::vector<Materialized> rows;
         size_t bytes = 0;
-        while (scan->next(row)) {
+        while (source->next(row)) {
             if (predicate.evaluate(row) != SqlTruth::True) {
                 continue;
             }
@@ -696,8 +973,8 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         }
     }
 
-    if (!scan->status().isOk()) {
-        out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
+    if (!source->status().isOk()) {
+        out.error = errorFromResult(source->status(), ast.table.line, ast.table.column);
         return false;
     }
     return true;

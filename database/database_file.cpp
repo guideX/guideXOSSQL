@@ -150,6 +150,12 @@ DbResult DatabaseFile::validateBootstrap(const DatabasePage& root) {
         // SQL1 database: empty catalog, no tables.
         return DbResult::ok();
     }
+    if (catalogVersion == kCatalogVersionV3) {
+        if (root.payloadSize < kCatalogV3RootHeaderSize) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog root header truncated");
+        }
+        return DbResult::ok();
+    }
     if (catalogVersion != kCatalogVersion) {
         return DbResult::error(DbStatus::UnsupportedVersion,
                                "unsupported catalog version " +

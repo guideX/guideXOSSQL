@@ -39,6 +39,7 @@ private:
 
     bool parseStatement(SqlStatementAst& out, SqlError& error);
     bool parseCreateTable(SqlStatementAst& out, SqlError& error);
+    bool parseCreateIndex(SqlStatementAst& out, SqlError& error);
     bool parseInsert(SqlStatementAst& out, SqlError& error);
     bool parseSelect(SqlStatementAst& out, SqlError& error);
     bool parseUpdate(SqlStatementAst& out, SqlError& error);
