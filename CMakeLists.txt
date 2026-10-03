@@ -20,6 +20,10 @@ add_library(gxos_database STATIC
     database/database_wal.cpp
     database/database_transaction.cpp
     database/database_relational.cpp
+    database/database_sql_token.cpp
+    database/database_sql_tokenizer.cpp
+    database/database_sql_parser.cpp
+    database/database_sql.cpp
 )
 target_include_directories(gxos_database PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/database")
 
@@ -60,6 +64,16 @@ else()
 endif()
 
 add_test(NAME database_transaction_test COMMAND database_transaction_test)
+
+add_executable(database_sql_test tests/database_sql_test.cpp)
+target_link_libraries(database_sql_test PRIVATE gxos_database)
+if(MSVC)
+    target_compile_options(database_sql_test PRIVATE /W4)
+else()
+    target_compile_options(database_sql_test PRIVATE -Wall -Wextra)
+endif()
+
+add_test(NAME database_sql_test COMMAND database_sql_test)
 
 add_executable(gxdb_cli tools/gxdb_cli.cpp)
 target_link_libraries(gxdb_cli PRIVATE gxos_database)

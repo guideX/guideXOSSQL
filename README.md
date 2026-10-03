@@ -13,19 +13,26 @@ Native relational database subsystem for guideXOS. This repository contains:
   `.gxwal` redo log plus single-writer transactions make bounded multi-page
   relational mutations crash-atomic: after any interruption, recovery exposes
   either the complete pre-transaction state or the complete committed state.
+- **Phase SQL4: SQL Language Layer** — a bounded tokenizer, recursive-descent
+  parser, typed AST and execution facade (`SqlEngine`) over the existing
+  relational engine. Supports `CREATE TABLE`, `INSERT ... VALUES`, `SELECT`,
+  `BEGIN`/`COMMIT`/`ROLLBACK`, multi-statement input, typed literals, NULL,
+  string escaping and BLOB literals. No `.gxdb`/`.gxwal` format change.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
 - SQL3 WAL/transaction design: [`docs/SQL3_WAL_TRANSACTIONS.md`](docs/SQL3_WAL_TRANSACTIONS.md)
+- SQL4 language reference: [`docs/SQL4_LANGUAGE.md`](docs/SQL4_LANGUAGE.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
 
 ```
 database/   storage engine (format, checksum, I/O, header, page, file, engine,
-            buffer, catalog, heap, wal, transaction, relational)
-tests/      hosted test suites (SQL1 + SQL2 + SQL3)
-tools/      gxdb_cli (create / inspect diagnostics)
+            buffer, catalog, heap, wal, transaction, relational) and the SQL
+            language layer (sql_token, sql_tokenizer, sql_parser, sql)
+tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4)
+tools/      gxdb_cli (create / inspect / sql / run / shell)
 docs/       architecture and test reports
 ```
 
@@ -41,7 +48,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 The test binaries can also be run directly: `build/database_storage_tests`,
-`build/database_relational_test` and `build/database_transaction_test`.
+`build/database_relational_test`, `build/database_transaction_test` and
+`build/database_sql_test`.
 
 ## Quick example
 
@@ -77,17 +85,61 @@ while (scan->next(row)) { /* ... */ }
 db->close();
 ```
 
+## SQL quick example
+
+The same SQL text works through the library (`SqlEngine`) and the CLI:
+
+```sql
+CREATE TABLE Users (
+    Id INT64 NOT NULL,
+    Name TEXT NOT NULL,
+    Enabled BOOLEAN NOT NULL
+);
+
+INSERT INTO Users VALUES (1, 'Alice', TRUE);
+INSERT INTO Users VALUES (2, 'Bob', FALSE);
+
+SELECT Id, Name, Enabled FROM Users;
+```
+
+```sh
+build/gxdb_cli sql app.gxdb "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, Enabled BOOLEAN NOT NULL);"
+build/gxdb_cli sql app.gxdb "INSERT INTO Users VALUES (1, 'Alice', TRUE);"
+build/gxdb_cli sql app.gxdb "SELECT Id, Name, Enabled FROM Users;"
+```
+
+The `.gxdb` can be closed and reopened; the same `SELECT` returns the same
+logical rows.
+
+```cpp
+#include "database_sql.h"
+using namespace gxos::db;
+
+std::unique_ptr<Database> db;
+Database::open("app.gxdb", DatabaseOpenOptions(), db);
+
+SqlEngine engine(*db);
+SqlExecutionResult result = engine.execute("SELECT Id, Name FROM Users;");
+const SqlResultSet& rows = result.statements[0].resultSet;
+// rows.columnCount(), rows.column(i).name/type, rows.row(r), rows.isNull(r, c)
+```
+
 ## Command-line diagnostics
 
 ```sh
 build/gxdb_cli create sample.gxdb 4096
 build/gxdb_cli inspect sample.gxdb
+build/gxdb_cli sql sample.gxdb "SELECT * FROM Users;"
+build/gxdb_cli run sample.gxdb schema.sql
+build/gxdb_cli shell sample.gxdb
 ```
 
 ## Status
 
-Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2266
-checks). SQL3 proves crash-atomic transactions on the hosted backend, including
-a full commit crash matrix and a 250-lifecycle transaction/recovery stress
-suite. QEMU and bare-metal proof are deferred to the phase that provides a
+Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
+SQL4: 429 checks). SQL3 proves crash-atomic transactions on the hosted backend,
+including a full commit crash matrix and a 250-lifecycle transaction/recovery
+stress suite. SQL4 proves a bounded SQL language over that engine, including a
+SQL-driven crash matrix, a multi-page dataset and a deterministic 1000-row
+dataset. QEMU and bare-metal proof are deferred to the phase that provides a
 native `IDatabaseFile` backend over the guideXOS VFS / block device.
