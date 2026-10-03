@@ -11,7 +11,8 @@ namespace db {
 
 DbResult DatabaseEngine::createDatabase(const std::string& path,
                                         const DatabaseCreateOptions& options,
-                                        std::unique_ptr<DatabaseFile>& out) {
+                                        std::unique_ptr<DatabaseFile>& out,
+                                        IDatabaseFileSystem* fileSystem) {
     if (path.empty()) {
         return DbResult::error(DbStatus::InvalidArgument, "empty database path");
     }
@@ -19,9 +20,10 @@ DbResult DatabaseEngine::createDatabase(const std::string& path,
         return DbResult::error(DbStatus::InvalidArgument, "unsupported page size");
     }
 
-    const bool existedBefore = hostFileExists(path);
+    IDatabaseFileSystem& filesystem = fileSystem ? *fileSystem : defaultFileSystem();
+    const bool existedBefore = filesystem.exists(path);
 
-    std::unique_ptr<IDatabaseFile> file(new HostDatabaseFile());
+    std::unique_ptr<IDatabaseFile> file = filesystem.createFile();
     DbResult result = file->open(path, FileOpenMode::Create, options.overwriteExisting);
     if (!result.isOk()) {
         return result;
@@ -37,15 +39,17 @@ DbResult DatabaseEngine::createDatabase(const std::string& path,
 
 DbResult DatabaseEngine::openDatabase(const std::string& path,
                                       const DatabaseOpenOptions& options,
-                                      std::unique_ptr<DatabaseFile>& out) {
+                                      std::unique_ptr<DatabaseFile>& out,
+                                      IDatabaseFileSystem* fileSystem) {
     if (path.empty()) {
         return DbResult::error(DbStatus::InvalidArgument, "empty database path");
     }
-    if (!hostFileExists(path)) {
+    IDatabaseFileSystem& filesystem = fileSystem ? *fileSystem : defaultFileSystem();
+    if (!filesystem.exists(path)) {
         return DbResult::error(DbStatus::NotDatabase, "no such database file");
     }
 
-    std::unique_ptr<IDatabaseFile> file(new HostDatabaseFile());
+    std::unique_ptr<IDatabaseFile> file = filesystem.createFile();
     const FileOpenMode mode = options.readOnly ? FileOpenMode::ReadOnly
                                                : FileOpenMode::ReadWrite;
     DbResult result = file->open(path, mode, false);

@@ -168,6 +168,45 @@ DbResult BufferManager::pinAllocatedPage(uint64_t pageId, BufferSlot*& outSlot) 
     return DbResult::ok();
 }
 
+DbResult BufferManager::installPage(uint64_t pageId, const DatabasePage& page) {
+    if (pageId == kHeaderPageId) {
+        return DbResult::error(DbStatus::InvalidArgument, "page 0 is the header page");
+    }
+
+    BufferSlot* existing = findSlot(pageId);
+    if (existing != nullptr) {
+        existing->page = page;
+        existing->page.pageId = pageId;
+        existing->lastUsed = ++_clock;
+        markDirty(*existing);
+        return DbResult::ok();
+    }
+
+    uint32_t index = findEmptySlot();
+    if (index == 0xFFFFFFFFu) {
+        DbResult result = evictOne();
+        if (!result.isOk()) {
+            return result;
+        }
+        index = findEmptySlot();
+        if (index == 0xFFFFFFFFu) {
+            return DbResult::error(DbStatus::Internal,
+                                   "buffer pool exhausted: no slot available");
+        }
+    }
+
+    BufferSlot& slot = _slots[index];
+    slot.pageId = pageId;
+    slot.page = page;
+    slot.page.pageId = pageId;
+    slot.dirty = true;
+    slot.pinCount = 0;
+    slot.lastUsed = ++_clock;
+    ++_resident;
+    ++_dirty;
+    return DbResult::ok();
+}
+
 void BufferManager::markDirty(BufferSlot& slot) {
     if (!slot.dirty) {
         slot.dirty = true;

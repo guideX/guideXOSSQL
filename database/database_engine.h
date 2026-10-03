@@ -18,13 +18,18 @@ namespace db {
 
 class DatabaseEngine {
 public:
+    // `fileSystem` selects the storage backend. A null value uses the hosted
+    // stdio backend. Supplying a provider enables the native VFS boundary and
+    // hosted crash injection.
     static DbResult createDatabase(const std::string& path,
                                    const DatabaseCreateOptions& options,
-                                   std::unique_ptr<DatabaseFile>& out);
+                                   std::unique_ptr<DatabaseFile>& out,
+                                   IDatabaseFileSystem* fileSystem = nullptr);
 
     static DbResult openDatabase(const std::string& path,
                                  const DatabaseOpenOptions& options,
-                                 std::unique_ptr<DatabaseFile>& out);
+                                 std::unique_ptr<DatabaseFile>& out,
+                                 IDatabaseFileSystem* fileSystem = nullptr);
 
     // Opens read-only with full page validation and returns diagnostics. On
     // failure `out` still receives a best-effort description of the fault.

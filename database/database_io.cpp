@@ -44,6 +44,26 @@ bool hostFileExists(const std::string& path) {
     return fileExists(path);
 }
 
+std::unique_ptr<IDatabaseFile> HostFileSystem::createFile() {
+    return std::unique_ptr<IDatabaseFile>(new HostDatabaseFile());
+}
+
+bool HostFileSystem::exists(const std::string& path) {
+    return fileExists(path);
+}
+
+bool HostFileSystem::remove(const std::string& path) {
+    if (!fileExists(path)) {
+        return true;
+    }
+    return std::remove(path.c_str()) == 0;
+}
+
+IDatabaseFileSystem& defaultFileSystem() {
+    static HostFileSystem instance;
+    return instance;
+}
+
 HostDatabaseFile::HostDatabaseFile() : _file(nullptr), _readOnly(false) {}
 
 HostDatabaseFile::~HostDatabaseFile() {

@@ -24,6 +24,7 @@ CMakeUserPresets.json
 # Test scratch / database artifacts
 *.gxdb
 *.gxdb.tmp
+*.gxwal
 tmp/
 test-output/
 

@@ -62,6 +62,7 @@ public:
 private:
     friend class TableScan;
 
+    DbResult insertInTransaction(const std::vector<DbValue>& values);
     DbResult ensureLastHeapPage();
     DbResult updateStats(int64_t rowDelta, bool newPage, uint64_t firstPageId);
     void markCatalogDirty();
@@ -70,6 +71,7 @@ private:
     uint32_t _tableId;
     mutable uint64_t _lastHeapPageId;
     mutable bool _lastResolved;
+    mutable uint64_t _resolvedEpoch;
 };
 
 class TableScan {
@@ -84,7 +86,7 @@ public:
 private:
     const Table& _table;
     DbResult _status;
-    BufferSlot* _slot;
+    DatabasePage _page;
     uint64_t _currentPageId;
     uint64_t _nextPageId;
     uint32_t _slotIndex;

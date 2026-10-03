@@ -5,6 +5,7 @@
 #include "database_endian.h"
 #include "database_format.h"
 #include "database_page.h"
+#include "database_transaction.h"
 
 namespace gxos {
 namespace db {
@@ -306,7 +307,8 @@ DbResult decodeRow(const uint8_t* bytes, size_t length,
 } // namespace
 
 Table::Table(Database& db, uint32_t tableId)
-    : _db(db), _tableId(tableId), _lastHeapPageId(0), _lastResolved(false) {}
+    : _db(db), _tableId(tableId), _lastHeapPageId(0), _lastResolved(false),
+      _resolvedEpoch(0) {}
 
 const std::string& Table::name() const {
     static const std::string empty;
@@ -361,10 +363,11 @@ DbResult Table::updateStats(int64_t rowDelta, bool newPage, uint64_t firstPageId
 }
 
 DbResult Table::ensureLastHeapPage() {
-    if (_lastResolved) {
+    if (_lastResolved && _resolvedEpoch == _db.dataEpoch()) {
         return DbResult::ok();
     }
     _lastResolved = true;
+    _resolvedEpoch = _db.dataEpoch();
     const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "table record not found");
@@ -375,7 +378,7 @@ DbResult Table::ensureLastHeapPage() {
     }
     // Walk the chain to find the last page.
     uint64_t current = rec->firstHeapPageId;
-    uint64_t pageCount = _db.file().pageCount();
+    uint64_t pageCount = _db.pages().pageCount();
     std::vector<uint64_t> visited;
     while (current != 0) {
         if (current >= pageCount) {
@@ -390,18 +393,16 @@ DbResult Table::ensureLastHeapPage() {
         if (visited.size() > pageCount) {
             return DbResult::error(DbStatus::CorruptPage, "heap page chain cycle");
         }
-        BufferSlot* slot = nullptr;
-        DbResult result = _db.buffer().pinPage(current, slot);
+        DatabasePage page;
+        DbResult result = _db.pages().readPage(current, page);
         if (!result.isOk()) {
             return result;
         }
-        if (slot->page.type != PageType::Data) {
-            _db.buffer().unpin(*slot);
+        if (page.type != PageType::Data) {
             return DbResult::error(DbStatus::CorruptPage, "heap page has wrong page type");
         }
         HeapPageInfo info;
-        result = readHeapPage(slot->page, _db.file().pageSize(), info);
-        _db.buffer().unpin(*slot);
+        result = readHeapPage(page, _db.pages().pageSize(), info);
         if (!result.isOk()) {
             return result;
         }
@@ -415,6 +416,25 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
     if (_db.isReadOnly()) {
         return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
     }
+    // If an explicit transaction is active the insert participates in it;
+    // otherwise wrap the single operation in an implicit transaction.
+    if (_db.activeTransaction() != nullptr) {
+        return insertInTransaction(values);
+    }
+    std::unique_ptr<Transaction> tx;
+    DbResult begin = _db.beginTransaction(tx);
+    if (!begin.isOk()) {
+        return begin;
+    }
+    DbResult result = insertInTransaction(values);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    return tx->commit();
+}
+
+DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
     const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "table record not found");
@@ -451,7 +471,7 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
         return result;
     }
 
-    const uint32_t pageSize = _db.file().pageSize();
+    const uint32_t pageSize = _db.pages().pageSize();
     const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
     const uint32_t rowLength = static_cast<uint32_t>(rowBytes.size());
     if (rowLength + 8u > capacity) {
@@ -467,57 +487,58 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
     uint64_t firstPageId = 0;
 
     if (_lastHeapPageId != 0) {
-        BufferSlot* slot = nullptr;
-        result = _db.buffer().pinPage(_lastHeapPageId, slot);
+        DatabasePage page;
+        result = _db.pages().readPage(_lastHeapPageId, page);
         if (!result.isOk()) {
             return result;
         }
-        if (slot->page.type != PageType::Data) {
-            _db.buffer().unpin(*slot);
+        if (page.type != PageType::Data) {
             return DbResult::error(DbStatus::CorruptPage, "heap page has wrong page type");
         }
         HeapPageInfo info;
-        result = readHeapPage(slot->page, pageSize, info);
+        result = readHeapPage(page, pageSize, info);
         if (!result.isOk()) {
-            _db.buffer().unpin(*slot);
             return result;
         }
         if (info.rowAreaEnd + rowLength <= capacity - 8u * (info.slotCount + 1)) {
             // Append the row and its slot.
-            std::vector<uint8_t>& payload = slot->page.payload;
+            std::vector<uint8_t>& payload = page.payload;
             std::memcpy(payload.data() + info.rowAreaEnd, rowBytes.data(), rowBytes.size());
             const uint32_t slotOffset = capacity - 8u * (info.slotCount + 1);
             storeLe32(payload.data() + slotOffset, info.rowAreaEnd);
             storeLe32(payload.data() + slotOffset + 4, rowLength);
             storeLe32(payload.data() + kHeapSlotCountOffset, info.slotCount + 1);
             storeLe32(payload.data() + kHeapRowAreaEndOffset, info.rowAreaEnd + rowLength);
-            _db.buffer().markDirty(*slot);
-            _db.buffer().unpin(*slot);
+            result = _db.pages().writePage(page);
+            if (!result.isOk()) {
+                return result;
+            }
             DbResult statsResult = updateStats(1, false, 0);
             _db.refreshBufferDiagnostics();
             return statsResult;
         }
-        _db.buffer().unpin(*slot);
     }
 
     // Allocate a new heap page.
     uint64_t newPageId = 0;
-    result = _db.file().allocatePage(PageType::Data, newPageId);
+    result = _db.pages().allocatePage(PageType::Data, newPageId);
     if (!result.isOk()) {
         return result;
     }
 
-    BufferSlot* slot = nullptr;
-    result = _db.buffer().pinAllocatedPage(newPageId, slot);
+    DatabasePage newPageImage;
+    result = _db.pages().readPage(newPageId, newPageImage);
     if (!result.isOk()) {
         return result;
     }
-    slot->page.payload.assign(capacity, 0);
-    writeHeapHeader(slot->page.payload, 0, 0, kHeapHeaderSize);
-    slot->page.payloadSize = capacity;
+    newPageImage.pageId = newPageId;
+    newPageImage.type = PageType::Data;
+    newPageImage.payload.assign(capacity, 0);
+    writeHeapHeader(newPageImage.payload, 0, 0, kHeapHeaderSize);
+    newPageImage.payloadSize = capacity;
 
     {
-        std::vector<uint8_t>& payload = slot->page.payload;
+        std::vector<uint8_t>& payload = newPageImage.payload;
         std::memcpy(payload.data() + kHeapHeaderSize, rowBytes.data(), rowBytes.size());
         const uint32_t slotOffset = capacity - 8u;
         storeLe32(payload.data() + slotOffset, kHeapHeaderSize);
@@ -526,19 +547,23 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
         storeLe32(payload.data() + kHeapRowAreaEndOffset,
                   kHeapHeaderSize + rowLength);
     }
-    _db.buffer().markDirty(*slot);
-    _db.buffer().unpin(*slot);
+    result = _db.pages().writePage(newPageImage);
+    if (!result.isOk()) {
+        return result;
+    }
 
     // Link the new page into the chain.
     if (_lastHeapPageId != 0) {
-        BufferSlot* oldSlot = nullptr;
-        result = _db.buffer().pinPage(_lastHeapPageId, oldSlot);
+        DatabasePage oldPage;
+        result = _db.pages().readPage(_lastHeapPageId, oldPage);
         if (!result.isOk()) {
             return result;
         }
-        storeLe64(oldSlot->page.payload.data() + kHeapNextPageOffset, newPageId);
-        _db.buffer().markDirty(*oldSlot);
-        _db.buffer().unpin(*oldSlot);
+        storeLe64(oldPage.payload.data() + kHeapNextPageOffset, newPageId);
+        result = _db.pages().writePage(oldPage);
+        if (!result.isOk()) {
+            return result;
+        }
     } else {
         firstPageId = newPageId;
     }
@@ -556,10 +581,10 @@ DbResult Table::scanStart(std::unique_ptr<TableScan>& out) const {
 }
 
 TableScan::TableScan(const Table& table)
-    : _table(table), _status(DbResult::ok()), _slot(nullptr), _currentPageId(0), _nextPageId(0),
-      _slotIndex(0), _slotCount(0), _rowAreaEnd(0),
-      _pageSize(table._db.file().pageSize()),
-      _capacity(DatabasePage::payloadCapacity(table._db.file().pageSize())),
+    : _table(table), _status(DbResult::ok()), _page(),
+      _currentPageId(0), _nextPageId(0), _slotIndex(0), _slotCount(0), _rowAreaEnd(0),
+      _pageSize(table._db.pages().pageSize()),
+      _capacity(DatabasePage::payloadCapacity(table._db.pages().pageSize())),
       _started(false), _done(false) {}
 
 bool TableScan::next(std::vector<DbValue>& row) {
@@ -586,7 +611,7 @@ bool TableScan::next(std::vector<DbValue>& row) {
                 _done = true;
                 return false;
             }
-            const uint64_t pageCount = _table._db.file().pageCount();
+            const uint64_t pageCount = _table._db.pages().pageCount();
             if (_currentPageId >= pageCount) {
                 _status = DbResult::error(DbStatus::CorruptPage,
                                           "heap page id outside allocated range");
@@ -604,22 +629,18 @@ bool TableScan::next(std::vector<DbValue>& row) {
             }
             _visited.push_back(_currentPageId);
 
-            DbResult result = _table._db.buffer().pinPage(_currentPageId, _slot);
+            DbResult result = _table._db.pages().readPage(_currentPageId, _page);
             if (!result.isOk()) {
                 _status = result;
                 return false;
             }
-            if (_slot->page.type != PageType::Data) {
-                _table._db.buffer().unpin(*_slot);
-                _slot = nullptr;
+            if (_page.type != PageType::Data) {
                 _status = DbResult::error(DbStatus::CorruptPage, "heap page has wrong page type");
                 return false;
             }
             HeapPageInfo info;
-            result = readHeapPage(_slot->page, _pageSize, info);
+            result = readHeapPage(_page, _pageSize, info);
             if (!result.isOk()) {
-                _table._db.buffer().unpin(*_slot);
-                _slot = nullptr;
                 _status = result;
                 return false;
             }
@@ -627,31 +648,26 @@ bool TableScan::next(std::vector<DbValue>& row) {
             _slotIndex = 0;
             _slotCount = info.slotCount;
             _rowAreaEnd = info.rowAreaEnd;
+
         }
 
         while (_slotIndex < _slotCount) {
             uint32_t offset = 0;
             uint32_t length = 0;
-            if (!readSlot(_slot->page.payload, _slotIndex, _capacity, offset, length)) {
+            if (!readSlot(_page.payload, _slotIndex, _capacity, offset, length)) {
                 _status = DbResult::error(DbStatus::CorruptPage, "invalid heap slot");
-                _table._db.buffer().unpin(*_slot);
-                _slot = nullptr;
                 return false;
             }
             ++_slotIndex;
             if (offset < kHeapHeaderSize || length < 8u ||
                 offset + length > _rowAreaEnd) {
                 _status = DbResult::error(DbStatus::CorruptPage, "heap slot row out of range");
-                _table._db.buffer().unpin(*_slot);
-                _slot = nullptr;
                 return false;
             }
             std::vector<DbValue> values;
-            DbResult result = decodeRow(_slot->page.payload.data() + offset, length, cols, values);
+            DbResult result = decodeRow(_page.payload.data() + offset, length, cols, values);
             if (!result.isOk()) {
                 _status = result;
-                _table._db.buffer().unpin(*_slot);
-                _slot = nullptr;
                 return false;
             }
             row = values;
@@ -660,8 +676,7 @@ bool TableScan::next(std::vector<DbValue>& row) {
 
         // Current page exhausted; advance.
         _currentPageId = 0;
-        _table._db.buffer().unpin(*_slot);
-        _slot = nullptr;
+
     }
 }
 

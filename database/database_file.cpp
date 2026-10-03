@@ -423,6 +423,50 @@ DbResult DatabaseFile::allocatePage(PageType type, uint64_t& outPageId) {
     return DbResult::ok();
 }
 
+DbResult DatabaseFile::setPageCount(uint64_t pageCount) {
+    _lastError = DbResult::ok();
+    if (!_open) {
+        return fail(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return fail(DbStatus::ReadOnly, "database opened read-only");
+    }
+    if (pageCount < 2 || pageCount > kMaxPageCount) {
+        return fail(DbStatus::CorruptHeader, "page count outside policy range");
+    }
+    if (pageCount < _header.pageCount) {
+        return fail(DbStatus::InvalidArgument, "page count cannot shrink");
+    }
+    _header.pageCount = pageCount;
+    _headerDirty = true;
+    refreshDiagnostics();
+    return DbResult::ok();
+}
+
+DbResult DatabaseFile::applyHeaderImage(const DatabaseHeader& image) {
+    _lastError = DbResult::ok();
+    if (!_open) {
+        return fail(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return fail(DbStatus::ReadOnly, "database opened read-only");
+    }
+    if (image.pageSize != _header.pageSize) {
+        return fail(DbStatus::CorruptHeader, "WAL header page size does not match database");
+    }
+    if (image.pageCount < 2 || image.pageCount > kMaxPageCount) {
+        return fail(DbStatus::CorruptHeader, "WAL header page count outside policy range");
+    }
+    if (image.rootPageId < 1 || image.rootPageId >= image.pageCount) {
+        return fail(DbStatus::CorruptHeader, "WAL root page id outside allocated range");
+    }
+    _header.pageCount = image.pageCount;
+    _header.rootPageId = image.rootPageId;
+    _headerDirty = true;
+    refreshDiagnostics();
+    return DbResult::ok();
+}
+
 DbResult DatabaseFile::flush() {
     _lastError = DbResult::ok();
     if (!_open) {

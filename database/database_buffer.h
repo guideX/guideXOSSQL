@@ -58,6 +58,13 @@ public:
     // content is guaranteed to reach the file on flush/close.
     DbResult pinAllocatedPage(uint64_t pageId, BufferSlot*& outSlot);
 
+    // SQL3: installs a complete committed page image into the cache without
+    // reading it from the file. The slot is marked dirty so the image reaches
+    // the file on the next flush. Used by transaction commit/recovery to
+    // publish committed page images (including newly allocated pages) into the
+    // committed cache. Never used for uncommitted data.
+    DbResult installPage(uint64_t pageId, const DatabasePage& page);
+
     void markDirty(BufferSlot& slot);
     void unpin(BufferSlot& slot);
 

@@ -23,6 +23,7 @@
 #include "database_header.h"
 #include "database_io.h"
 #include "database_page.h"
+#include "database_pagestore.h"
 #include "database_result.h"
 
 namespace gxos {
@@ -56,7 +57,7 @@ struct DatabaseOpenOptions {
     DatabaseOpenOptions() : readOnly(false), validateAllPages(false), bufferCapacity(0) {}
 };
 
-class DatabaseFile {
+class DatabaseFile : public PageAccess {
 public:
     DatabaseFile();
     ~DatabaseFile();
@@ -81,23 +82,33 @@ public:
     // result when a write-back was attempted.
     DbResult close();
     bool isOpen() const { return _open; }
-    bool isReadOnly() const { return _readOnly; }
+    bool isReadOnly() const override { return _readOnly; }
 
     // Reads a full page. Page 0 (the header page) is not readable here.
-    DbResult readPage(uint64_t pageId, DatabasePage& out);
+    DbResult readPage(uint64_t pageId, DatabasePage& out) override;
 
     // Overwrites an already-allocated page (1 <= pageId < pageCount).
-    DbResult writePage(const DatabasePage& page);
+    DbResult writePage(const DatabasePage& page) override;
 
     // Appends a new page. Returns its id in `outPageId`.
-    DbResult allocatePage(PageType type, uint64_t& outPageId);
+    DbResult allocatePage(PageType type, uint64_t& outPageId) override;
 
     // Durability barrier: writes a dirty header, then flushes the file.
     DbResult flush();
 
+    // SQL3: updates the in-memory allocated page count and marks the header
+    // dirty. Used by commit/recovery to publish transaction allocations before
+    // committed page images are installed. Does not write to the file.
+    DbResult setPageCount(uint64_t pageCount);
+
+    // SQL3 recovery: adopts the durable page count / root page id recorded in a
+    // committed WAL header image, preserving the database identity. Does not
+    // write to the file until the next flush().
+    DbResult applyHeaderImage(const DatabaseHeader& image);
+
     const DatabaseHeader& header() const { return _header; }
-    uint32_t pageSize() const { return _header.pageSize; }
-    uint64_t pageCount() const { return _header.pageCount; }
+    uint32_t pageSize() const override { return _header.pageSize; }
+    uint64_t pageCount() const override { return _header.pageCount; }
     uint64_t rootPageId() const { return _header.rootPageId; }
     const DatabaseDiagnostics& diagnostics() const { return _diagnostics; }
     DbResult lastError() const { return _lastError; }

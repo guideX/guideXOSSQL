@@ -9,17 +9,22 @@ Native relational database subsystem for guideXOS. This repository contains:
   typed columns, heap-backed row storage, bounded scanning and a small buffer
   manager. No SQL parser yet; the native relational API is the execution
   target for the future SQL layer.
+- **Phase SQL3: Write-Ahead Log and Atomic Transactions** — a sidecar
+  `.gxwal` redo log plus single-writer transactions make bounded multi-page
+  relational mutations crash-atomic: after any interruption, recovery exposes
+  either the complete pre-transaction state or the complete committed state.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
+- SQL3 WAL/transaction design: [`docs/SQL3_WAL_TRANSACTIONS.md`](docs/SQL3_WAL_TRANSACTIONS.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
 
 ```
 database/   storage engine (format, checksum, I/O, header, page, file, engine,
-            buffer, catalog, heap, relational)
-tests/      hosted test suites (SQL1 + SQL2)
+            buffer, catalog, heap, wal, transaction, relational)
+tests/      hosted test suites (SQL1 + SQL2 + SQL3)
 tools/      gxdb_cli (create / inspect diagnostics)
 docs/       architecture and test reports
 ```
@@ -35,8 +40,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The test binaries can also be run directly: `build/database_storage_tests` and
-`build/database_relational_test`.
+The test binaries can also be run directly: `build/database_storage_tests`,
+`build/database_relational_test` and `build/database_transaction_test`.
 
 ## Quick example
 
@@ -81,6 +86,8 @@ build/gxdb_cli inspect sample.gxdb
 
 ## Status
 
-Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks). QEMU and
-bare-metal proof are deferred to the phase that provides a native
-`IDatabaseFile` backend over the guideXOS VFS / block device.
+Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2266
+checks). SQL3 proves crash-atomic transactions on the hosted backend, including
+a full commit crash matrix and a 250-lifecycle transaction/recovery stress
+suite. QEMU and bare-metal proof are deferred to the phase that provides a
+native `IDatabaseFile` backend over the guideXOS VFS / block device.

@@ -320,7 +320,7 @@ void Catalog::serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>&
     }
 }
 
-DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t pageSize,
+DbResult Catalog::load(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize,
                        uint64_t pageCount) {
     _tables.clear();
     _nextTableId = 1;
@@ -330,35 +330,30 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
         return DbResult::error(DbStatus::CorruptPage, "page too small for catalog header");
     }
 
-    BufferSlot* root = nullptr;
-    DbResult result = buffer.pinPage(rootPageId, root);
+    DatabasePage root;
+    DbResult result = pages.readPage(rootPageId, root);
     if (!result.isOk()) {
         return result;
     }
 
-    const std::vector<uint8_t>& payload = root->page.payload;
+    const std::vector<uint8_t>& payload = root.payload;
     if (payload.size() < kCatalogPayloadSize) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "catalog payload too small");
     }
     if (loadLe32(payload.data() + 0) != kCatalogMagic) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "catalog signature mismatch");
     }
     const uint16_t version = loadLe16(payload.data() + 4);
     if (version == kCatalogVersionLegacy) {
         // SQL1 database: empty catalog. nextTableId starts at 1.
-        buffer.unpin(*root);
         return DbResult::ok();
     }
     if (version != kCatalogVersion) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::UnsupportedVersion,
                                "unsupported catalog version " +
                                    std::to_string(static_cast<unsigned>(version)));
     }
     if (payload.size() < kCatalogRootHeaderSize) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "catalog root header truncated");
     }
 
@@ -369,22 +364,18 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
     const uint32_t rootRecordCount = loadLe32(payload.data() + 24);
 
     if (tableCount > kMaxTables) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "table count exceeds policy maximum");
     }
     if (_nextTableId == 0) {
         _nextTableId = 1;
     }
     if (continuationCount > pageCount) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "continuation count exceeds page count");
     }
     if (continuationCount == 0 && firstContinuation != 0) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "continuation pointer without continuations");
     }
     if (rootRecordCount > tableCount) {
-        buffer.unpin(*root);
         return DbResult::error(DbStatus::CorruptPage, "root record count exceeds table count");
     }
 
@@ -394,13 +385,10 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
         TableRecord rec;
         result = parseTableRecord(payload.data(), payload.size(), offset, rec);
         if (!result.isOk()) {
-            buffer.unpin(*root);
             return result;
         }
         _tables.push_back(rec);
     }
-
-    buffer.unpin(*root);
 
     // Follow the continuation chain.
     std::vector<bool> visited(pageCount, false);
@@ -415,28 +403,24 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
         visited[expectedNext] = true;
         _continuationPageIds.push_back(expectedNext);
 
-        BufferSlot* cont = nullptr;
-        result = buffer.pinPage(expectedNext, cont);
+        DatabasePage cont;
+        result = pages.readPage(expectedNext, cont);
         if (!result.isOk()) {
             return result;
         }
-        const std::vector<uint8_t>& cpayload = cont->page.payload;
+        const std::vector<uint8_t>& cpayload = cont.payload;
         if (cpayload.size() < kCatalogContHeaderSize) {
-            buffer.unpin(*cont);
             return DbResult::error(DbStatus::CorruptPage, "catalog continuation header truncated");
         }
         if (loadLe32(cpayload.data() + 0) != kCatalogMagic) {
-            buffer.unpin(*cont);
             return DbResult::error(DbStatus::CorruptPage, "catalog continuation signature mismatch");
         }
         if (loadLe16(cpayload.data() + 4) != kCatalogVersion) {
-            buffer.unpin(*cont);
             return DbResult::error(DbStatus::CorruptPage, "catalog continuation version mismatch");
         }
         const uint64_t next = loadLe64(cpayload.data() + 8);
         const uint32_t recordCount = loadLe32(cpayload.data() + 16);
         if (recordCount > kMaxTables) {
-            buffer.unpin(*cont);
             return DbResult::error(DbStatus::CorruptPage, "continuation record count too large");
         }
 
@@ -445,13 +429,11 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
             TableRecord rec;
             result = parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec);
             if (!result.isOk()) {
-                buffer.unpin(*cont);
                 return result;
             }
             _tables.push_back(rec);
         }
         expectedNext = next;
-        buffer.unpin(*cont);
     }
 
     if (expectedNext != 0) {
@@ -476,8 +458,7 @@ DbResult Catalog::load(BufferManager& buffer, uint64_t rootPageId, uint32_t page
     return DbResult::ok();
 }
 
-DbResult Catalog::save(BufferManager& buffer, DatabaseFile& file, uint64_t rootPageId,
-                       uint32_t pageSize) {
+DbResult Catalog::save(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize) {
     const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
     const uint32_t rootCap = capacity - kCatalogRootHeaderSize;
     const uint32_t contCap = capacity - kCatalogContHeaderSize;
@@ -556,7 +537,7 @@ DbResult Catalog::save(BufferManager& buffer, DatabaseFile& file, uint64_t rootP
             contIds.push_back(_continuationPageIds[i - 1]);
         } else {
             uint64_t newId = 0;
-            DbResult result = file.allocatePage(PageType::Catalog, newId);
+            DbResult result = pages.allocatePage(PageType::Catalog, newId);
             if (!result.isOk()) {
                 return result;
             }
@@ -585,30 +566,36 @@ DbResult Catalog::save(BufferManager& buffer, DatabaseFile& file, uint64_t rootP
 
     // Write the root page.
     {
-        BufferSlot* slot = nullptr;
-        DbResult result = buffer.pinPage(rootPageId, slot);
+        DatabasePage rootPage;
+        DbResult result = pages.readPage(rootPageId, rootPage);
         if (!result.isOk()) {
             return result;
         }
-        slot->page.payload = pagePayloads[0];
-        slot->page.payloadSize = static_cast<uint32_t>(pagePayloads[0].size());
-        slot->page.type = PageType::Catalog;
-        buffer.markDirty(*slot);
-        buffer.unpin(*slot);
+        rootPage.pageId = rootPageId;
+        rootPage.payload = pagePayloads[0];
+        rootPage.payloadSize = static_cast<uint32_t>(pagePayloads[0].size());
+        rootPage.type = PageType::Catalog;
+        result = pages.writePage(rootPage);
+        if (!result.isOk()) {
+            return result;
+        }
     }
 
     // Write continuation pages.
     for (uint32_t i = 0; i < contIds.size(); ++i) {
-        BufferSlot* slot = nullptr;
-        DbResult result = buffer.pinPage(contIds[i], slot);
+        DatabasePage contPage;
+        DbResult result = pages.readPage(contIds[i], contPage);
         if (!result.isOk()) {
             return result;
         }
-        slot->page.payload = pagePayloads[i + 1];
-        slot->page.payloadSize = static_cast<uint32_t>(pagePayloads[i + 1].size());
-        slot->page.type = PageType::Catalog;
-        buffer.markDirty(*slot);
-        buffer.unpin(*slot);
+        contPage.pageId = contIds[i];
+        contPage.payload = pagePayloads[i + 1];
+        contPage.payloadSize = static_cast<uint32_t>(pagePayloads[i + 1].size());
+        contPage.type = PageType::Catalog;
+        result = pages.writePage(contPage);
+        if (!result.isOk()) {
+            return result;
+        }
     }
 
     _continuationPageIds = contIds;

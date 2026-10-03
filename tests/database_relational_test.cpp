@@ -1534,11 +1534,15 @@ int main() {
     std::printf("temp dir: %s\n", dir.c_str());
 
     // Remove stale files from any previous crashed run so unique names do not
-    // collide (the case counter resets each run).
+    // collide (the case counter resets each run). Sidecar WALs from a previous
+    // run must also go: they carry the old database identity and would be
+    // correctly rejected as foreign against a freshly created database.
     std::string cmd = "del /q \"" + dir + "\\*.gxdb\" >nul 2>nul";
     if (std::system(cmd.c_str()) == 0) {
         // best effort
     }
+    cmd = "del /q \"" + dir + "\\*.gxwal\" >nul 2>nul";
+    std::system(cmd.c_str());
 
     testCreateAndReopen();
     testDuplicateHandling();

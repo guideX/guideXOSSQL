@@ -12,6 +12,30 @@
 namespace gxos {
 namespace db {
 
+// Observed state of the sidecar write-ahead log (read-only description).
+enum class WalState : int {
+    Absent = 0,        // no .gxwal file
+    Clean,             // valid header, no transaction records
+    Committed,         // at least one fully committed transaction needs redo
+    Incomplete,        // valid records but the last transaction has no COMMIT
+    Corrupt,           // header/record integrity failure
+    Foreign,           // WAL identity does not match this database
+    UnsupportedVersion // WAL format version not understood
+};
+
+inline const char* walStateName(WalState state) {
+    switch (state) {
+    case WalState::Absent: return "Absent";
+    case WalState::Clean: return "Clean";
+    case WalState::Committed: return "Committed";
+    case WalState::Incomplete: return "Incomplete";
+    case WalState::Corrupt: return "Corrupt";
+    case WalState::Foreign: return "Foreign";
+    case WalState::UnsupportedVersion: return "UnsupportedVersion";
+    }
+    return "Unknown";
+}
+
 // Per-table relational diagnostics (read-only).
 struct TableDiagnostics {
     uint32_t tableId;
@@ -45,6 +69,17 @@ struct DatabaseDiagnostics {
     uint32_t bufferDirty;
     std::vector<TableDiagnostics> tables;
 
+    // SQL3 transaction / write-ahead-log diagnostics (read-only).
+    bool transactionActive;
+    uint64_t transactionId;
+    uint32_t transactionModifiedPages;
+    bool walPresent;
+    WalState walState;
+    uint64_t walBytes;
+    bool recoveryRequired;
+    std::string lastRecoveryResult;
+    uint64_t pagesRedone;
+
     DatabaseDiagnostics()
         : open(false),
           readOnly(false),
@@ -59,7 +94,15 @@ struct DatabaseDiagnostics {
           catalogPageCount(0),
           bufferCapacity(0),
           bufferResident(0),
-          bufferDirty(0) {}
+          bufferDirty(0),
+          transactionActive(false),
+          transactionId(0),
+          transactionModifiedPages(0),
+          walPresent(false),
+          walState(WalState::Absent),
+          walBytes(0),
+          recoveryRequired(false),
+          pagesRedone(0) {}
 
     void reset() {
         *this = DatabaseDiagnostics();

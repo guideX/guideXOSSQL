@@ -27,7 +27,18 @@ enum class DbStatus : int {
     NotOpen,
     AlreadyExists,
     ReadOnly,
-    Internal
+    Internal,
+    // ---- Phase SQL3: transactions and write-ahead logging ----------------
+    TransactionAlreadyActive,
+    NoActiveTransaction,
+    TransactionTooLarge,
+    WalCorrupt,
+    WalUnsupportedVersion,
+    WalDatabaseMismatch,
+    RecoveryRequired,
+    RecoveryFailed,
+    CommitFailed,
+    RollbackFailed
 };
 
 inline const char* dbStatusName(DbStatus status) {
@@ -46,6 +57,16 @@ inline const char* dbStatusName(DbStatus status) {
     case DbStatus::AlreadyExists: return "AlreadyExists";
     case DbStatus::ReadOnly: return "ReadOnly";
     case DbStatus::Internal: return "Internal";
+    case DbStatus::TransactionAlreadyActive: return "TransactionAlreadyActive";
+    case DbStatus::NoActiveTransaction: return "NoActiveTransaction";
+    case DbStatus::TransactionTooLarge: return "TransactionTooLarge";
+    case DbStatus::WalCorrupt: return "WalCorrupt";
+    case DbStatus::WalUnsupportedVersion: return "WalUnsupportedVersion";
+    case DbStatus::WalDatabaseMismatch: return "WalDatabaseMismatch";
+    case DbStatus::RecoveryRequired: return "RecoveryRequired";
+    case DbStatus::RecoveryFailed: return "RecoveryFailed";
+    case DbStatus::CommitFailed: return "CommitFailed";
+    case DbStatus::RollbackFailed: return "RollbackFailed";
     }
     return "Unknown";
 }

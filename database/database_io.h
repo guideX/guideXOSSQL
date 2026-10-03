@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 #include "database_result.h"
@@ -51,6 +52,23 @@ public:
     virtual const std::string& path() const = 0;
 };
 
+// Factory for database/WAL files. The engine never constructs a concrete file
+// directly, which keeps the storage backend independent (hosted stdio today,
+// native guideXOS VFS later) and allows hosted crash injection.
+class IDatabaseFileSystem {
+public:
+    virtual ~IDatabaseFileSystem() {}
+
+    // Creates an unopened file object. The caller then calls open().
+    virtual std::unique_ptr<IDatabaseFile> createFile() = 0;
+
+    virtual bool exists(const std::string& path) = 0;
+
+    // Removes a file if present. Returns true when the file is absent
+    // afterwards.
+    virtual bool remove(const std::string& path) = 0;
+};
+
 // stdio-backed implementation used by hosted tests and the hosted server.
 class HostDatabaseFile : public IDatabaseFile {
 public:
@@ -82,6 +100,16 @@ private:
 
 // Returns true if a regular file exists at `path`.
 bool hostFileExists(const std::string& path);
+
+// Hosted file-system provider (stdio). Returns a process-wide instance.
+class HostFileSystem : public IDatabaseFileSystem {
+public:
+    std::unique_ptr<IDatabaseFile> createFile() override;
+    bool exists(const std::string& path) override;
+    bool remove(const std::string& path) override;
+};
+
+IDatabaseFileSystem& defaultFileSystem();
 
 } // namespace db
 } // namespace gxos

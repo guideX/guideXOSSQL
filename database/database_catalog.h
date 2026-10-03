@@ -24,8 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "database_buffer.h"
-#include "database_file.h"
+#include "database_pagestore.h"
 #include "database_result.h"
 #include "database_schema.h"
 
@@ -51,14 +50,13 @@ public:
     Catalog();
 
     // Loads the catalog from the root page and its continuation chain.
-    DbResult load(BufferManager& buffer, uint64_t rootPageId, uint32_t pageSize,
+    DbResult load(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize,
                   uint64_t pageCount);
 
     // Rewrites the whole catalog (root + continuations) from the in-memory
     // records. Reuses existing continuation pages where possible and allocates
     // new ones when the catalog grows.
-    DbResult save(BufferManager& buffer, DatabaseFile& file, uint64_t rootPageId,
-                  uint32_t pageSize);
+    DbResult save(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize);
 
     const TableRecord* findTable(const std::string& name) const;
     const TableRecord* findTable(uint32_t tableId) const;
