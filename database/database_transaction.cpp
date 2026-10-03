@@ -181,6 +181,24 @@ DbResult Transaction::commit() {
     return DbResult::ok();
 }
 
+void Transaction::beginStatement(TransactionSavepoint& out) {
+    out.pages = _pages;
+    out.order = _order;
+    out.catalog = _db.catalog();
+    out.nextPageId = _nextPageId;
+    out.catalogChanged = _catalogChanged;
+}
+
+void Transaction::rollbackStatement(const TransactionSavepoint& savepoint) {
+    _pages = savepoint.pages;
+    _order = savepoint.order;
+    _db.catalog() = savepoint.catalog;
+    _nextPageId = savepoint.nextPageId;
+    _catalogChanged = savepoint.catalogChanged;
+}
+
+void Transaction::releaseStatement(const TransactionSavepoint&) {}
+
 DbResult Transaction::rollback() {
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");

@@ -44,12 +44,44 @@ const uint32_t kHeapRowAreaEndOffset = 20;
 
 class TableScan;
 
+// An ephemeral, internal row locator: the physical position of a row in the
+// heap chain. It is valid only for the relevant scan/database generation and is
+// never a SQL-visible key. UPDATE/DELETE use locators collected during one scan
+// so every original row is considered exactly once even when a mutation
+// relocates rows.
+struct RowLocator {
+    uint64_t pageId;
+    uint32_t slot;
+
+    RowLocator() : pageId(0), slot(0) {}
+    RowLocator(uint64_t pageIdIn, uint32_t slotIn) : pageId(pageIdIn), slot(slotIn) {}
+};
+
+// A planned row mutation: either a full replacement row or a deletion. The
+// relational layer validates and applies a bounded set of these atomically.
+struct RowMutation {
+    RowLocator locator;
+    bool deleted;
+    std::vector<DbValue> values; // replacement row when !deleted
+
+    RowMutation() : locator(), deleted(false), values() {}
+};
+
 class Table {
 public:
     Table(Database& db, uint32_t tableId);
 
     DbResult insert(const std::vector<DbValue>& values);
     DbResult scanStart(std::unique_ptr<TableScan>& out) const;
+
+    // Applies a bounded set of row replacements/deletions. Each target locator
+    // must have come from a single prior scan. The whole set is applied inside
+    // one transaction context: an implicit transaction when none is active, or
+    // the caller's active transaction otherwise. Returns InvalidArgument on a
+    // stale/duplicate locator or invalid replacement value; the caller is
+    // responsible for statement-level rollback when an explicit transaction is
+    // active.
+    DbResult applyMutations(const std::vector<RowMutation>& mutations);
 
     uint32_t tableId() const { return _tableId; }
     const std::string& name() const;
@@ -63,8 +95,11 @@ private:
     friend class TableScan;
 
     DbResult insertInTransaction(const std::vector<DbValue>& values);
+    DbResult applyMutationsInTransaction(const std::vector<RowMutation>& mutations);
+    DbResult appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
+                                    uint32_t& newPagesOut, uint64_t& firstNewPageOut);
     DbResult ensureLastHeapPage();
-    DbResult updateStats(int64_t rowDelta, bool newPage, uint64_t firstPageId);
+    DbResult updateStats(int64_t rowDelta, uint32_t newPageCount, uint64_t firstPageId);
     void markCatalogDirty();
 
     Database& _db;
@@ -83,6 +118,11 @@ public:
     bool next(std::vector<DbValue>& row);
     DbResult status() const { return _status; }
 
+    // Locator of the row most recently returned by next(). Valid until the next
+    // call to next() or after the underlying data changes.
+    uint64_t currentPageId() const { return _rowPageId; }
+    uint32_t currentSlotIndex() const { return _rowSlot; }
+
 private:
     const Table& _table;
     DbResult _status;
@@ -96,6 +136,8 @@ private:
     uint32_t _capacity;
     bool _started;
     bool _done;
+    uint64_t _rowPageId;
+    uint32_t _rowSlot;
     std::vector<uint64_t> _visited;
 };
 

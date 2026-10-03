@@ -99,6 +99,19 @@ SqlTokenKind keywordKind(const std::string& upper) {
     if (upper == "BLOB") return SqlTokenKind::Blob;
     if (upper == "TRUE") return SqlTokenKind::True;
     if (upper == "FALSE") return SqlTokenKind::False;
+    if (upper == "WHERE") return SqlTokenKind::Where;
+    if (upper == "UPDATE") return SqlTokenKind::Update;
+    if (upper == "SET") return SqlTokenKind::Set;
+    if (upper == "DELETE") return SqlTokenKind::Delete;
+    if (upper == "ORDER") return SqlTokenKind::Order;
+    if (upper == "BY") return SqlTokenKind::By;
+    if (upper == "ASC") return SqlTokenKind::Asc;
+    if (upper == "DESC") return SqlTokenKind::Desc;
+    if (upper == "LIMIT") return SqlTokenKind::Limit;
+    if (upper == "OFFSET") return SqlTokenKind::Offset;
+    if (upper == "AND") return SqlTokenKind::And;
+    if (upper == "OR") return SqlTokenKind::Or;
+    if (upper == "IS") return SqlTokenKind::Is;
     return SqlTokenKind::Identifier;
 }
 
@@ -147,6 +160,37 @@ public:
             } else if (c == '*') {
                 advance();
                 emit(SqlTokenKind::Star, startOffset, startLine, startColumn);
+            } else if (c == '=') {
+                advance();
+                emit(SqlTokenKind::Eq, startOffset, startLine, startColumn);
+            } else if (c == '<') {
+                advance();
+                if (peek(0) == '>') {
+                    advance();
+                    emit(SqlTokenKind::Ne, startOffset, startLine, startColumn);
+                } else if (peek(0) == '=') {
+                    advance();
+                    emit(SqlTokenKind::Le, startOffset, startLine, startColumn);
+                } else {
+                    emit(SqlTokenKind::Lt, startOffset, startLine, startColumn);
+                }
+            } else if (c == '>') {
+                advance();
+                if (peek(0) == '=') {
+                    advance();
+                    emit(SqlTokenKind::Ge, startOffset, startLine, startColumn);
+                } else {
+                    emit(SqlTokenKind::Gt, startOffset, startLine, startColumn);
+                }
+            } else if (c == '!') {
+                if (peek(1) != '=') {
+                    return fail(error, SqlErrorCode::TokenizerError,
+                                "unexpected character '!' (did you mean '!='?)",
+                                startOffset, startLine, startColumn);
+                }
+                advance();
+                advance();
+                emit(SqlTokenKind::Ne, startOffset, startLine, startColumn);
             } else if (c == '\'') {
                 if (!lexString(error, startOffset, startLine, startColumn)) {
                     return false;

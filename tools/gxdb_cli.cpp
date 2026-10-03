@@ -137,6 +137,14 @@ void printStatementResult(const SqlStatementResult& sr) {
             std::printf("OK: inserted %llu row%s\n",
                         static_cast<unsigned long long>(sr.affectedRows),
                         sr.affectedRows == 1 ? "" : "s");
+        } else if (sr.type == SqlStatementType::Update) {
+            std::printf("OK: updated %llu row%s\n",
+                        static_cast<unsigned long long>(sr.affectedRows),
+                        sr.affectedRows == 1 ? "" : "s");
+        } else if (sr.type == SqlStatementType::Delete) {
+            std::printf("OK: deleted %llu row%s\n",
+                        static_cast<unsigned long long>(sr.affectedRows),
+                        sr.affectedRows == 1 ? "" : "s");
         } else {
             std::printf("OK: %s\n", sqlStatementTypeName(sr.type));
         }

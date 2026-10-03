@@ -29,6 +29,7 @@ namespace db {
 
 class Table;
 class Transaction;
+struct RowMutation;
 
 // One output column of a SELECT result.
 struct SqlColumn {
@@ -136,6 +137,15 @@ private:
                        SqlStatementResult& out);
     bool executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
                        SqlStatementResult& out);
+    bool executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
+                       SqlStatementResult& out);
+    bool executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
+                       SqlStatementResult& out);
+    // Applies a mutation plan, wrapping it in the active transaction with a
+    // statement-level savepoint when one exists.
+    bool applyMutationPlan(Table* table, ExecContext& ctx,
+                           const std::vector<RowMutation>& plan,
+                           SqlStatementResult& out, uint32_t line, uint32_t column);
     bool executeBegin(SqlStatementResult& out);
     bool executeCommit(SqlStatementResult& out);
     bool executeRollback(SqlStatementResult& out);

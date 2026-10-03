@@ -1,9 +1,12 @@
 #include "database_sql.h"
 
+#include <algorithm>
 #include <limits>
+#include <utility>
 
 #include "database_format.h"
 #include "database_heap.h"
+#include "database_sql_expr.h"
 #include "database_sql_parser.h"
 #include "database_sql_tokenizer.h"
 #include "database_transaction.h"
@@ -123,6 +126,77 @@ bool coerceLiteral(const SqlLiteralAst& literal, const ColumnDefinition& column,
     return false;
 }
 
+size_t valueBytes(const DbValue& value) {
+    size_t bytes = sizeof(DbValue);
+    if (value.type() == DbType::Text) {
+        bytes += value.textValue().size();
+    } else if (value.type() == DbType::Blob) {
+        bytes += value.blobValue().size();
+    }
+    return bytes;
+}
+
+size_t rowBytes(const std::vector<DbValue>& row) {
+    size_t bytes = 0;
+    for (size_t i = 0; i < row.size(); ++i) {
+        bytes += valueBytes(row[i]);
+    }
+    return bytes;
+}
+
+// Compares two ORDER BY key values. NULL sorts before every non-NULL value;
+// callers reverse the result for DESC so NULL ends up last.
+int compareOrderValues(const DbValue& a, const DbValue& b, DbType type) {
+    const bool aNull = a.isNull();
+    const bool bNull = b.isNull();
+    if (aNull || bNull) {
+        if (aNull && bNull) {
+            return 0;
+        }
+        return aNull ? -1 : 1;
+    }
+    switch (type) {
+    case DbType::Boolean: {
+        const int va = a.booleanValue() ? 1 : 0;
+        const int vb = b.booleanValue() ? 1 : 0;
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    case DbType::Int32: {
+        const int32_t va = a.int32Value();
+        const int32_t vb = b.int32Value();
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    case DbType::Int64: {
+        const int64_t va = a.int64Value();
+        const int64_t vb = b.int64Value();
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    case DbType::Float64: {
+        const double va = a.float64Value();
+        const double vb = b.float64Value();
+        return va < vb ? -1 : (va > vb ? 1 : 0);
+    }
+    case DbType::Text: {
+        const std::string& sa = a.textValue();
+        const std::string& sb = b.textValue();
+        const size_t count = sa.size() < sb.size() ? sa.size() : sb.size();
+        for (size_t i = 0; i < count; ++i) {
+            const unsigned char ca = static_cast<unsigned char>(sa[i]);
+            const unsigned char cb = static_cast<unsigned char>(sb[i]);
+            if (ca != cb) {
+                return ca < cb ? -1 : 1;
+            }
+        }
+        if (sa.size() == sb.size()) {
+            return 0;
+        }
+        return sa.size() < sb.size() ? -1 : 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -194,6 +268,9 @@ SqlErrorCode SqlEngine::codeForStatus(DbStatus status) {
     case DbStatus::CommitFailed:
     case DbStatus::RollbackFailed:
         return SqlErrorCode::TransactionError;
+    case DbStatus::TransactionTooLarge:
+    case DbStatus::NoSpace:
+        return SqlErrorCode::ResourceLimit;
     default:
         return SqlErrorCode::ExecutionError;
     }
@@ -314,6 +391,12 @@ bool SqlEngine::executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
         break;
     case SqlStatementType::Select:
         ok = executeSelect(stmt.select, ctx, out);
+        break;
+    case SqlStatementType::Update:
+        ok = executeUpdate(stmt.update, ctx, out);
+        break;
+    case SqlStatementType::Delete:
+        ok = executeDelete(stmt.deleteStatement, ctx, out);
         break;
     case SqlStatementType::Begin:
         ctx.tables.clear();
@@ -448,6 +531,49 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         }
     }
 
+    // Bind the WHERE predicate against the durable schema before scanning.
+    BoundPredicate predicate;
+    if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                        columns, error)) {
+        out.error = error;
+        return false;
+    }
+
+    // Bind ORDER BY terms to column ordinals before scanning.
+    struct OrderKey {
+        size_t ordinal;
+        DbType type;
+        bool descending;
+    };
+    std::vector<OrderKey> orderKeys;
+    for (size_t i = 0; i < ast.orderBy.size(); ++i) {
+        const SqlOrderTermAst& term = ast.orderBy[i];
+        size_t found = columns.size();
+        for (size_t j = 0; j < columns.size(); ++j) {
+            if (columns[j].name == term.column.name) {
+                found = j;
+                break;
+            }
+        }
+        if (found == columns.size()) {
+            out.error = makeSemantic(
+                "unknown column '" + term.column.name + "' in ORDER BY",
+                term.column.line, term.column.column);
+            return false;
+        }
+        if (columns[found].type == DbType::Blob) {
+            out.error = makeSemantic(
+                "ORDER BY is not supported for Blob column '" + term.column.name + "'",
+                term.column.line, term.column.column);
+            return false;
+        }
+        OrderKey key;
+        key.ordinal = found;
+        key.type = columns[found].type;
+        key.descending = term.descending;
+        orderKeys.push_back(key);
+    }
+
     std::unique_ptr<TableScan> scan;
     DbResult result = table->scanStart(scan);
     if (!result.isOk()) {
@@ -457,26 +583,319 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
 
     out.resultSet.setColumns(resultColumns);
 
+    const uint64_t offset = ast.hasOffset ? ast.offset : 0;
+    const uint64_t limit =
+        ast.hasLimit ? ast.limit : std::numeric_limits<uint64_t>::max();
+
     std::vector<DbValue> row;
     std::vector<DbValue> projected;
-    while (scan->next(row)) {
-        projected.clear();
-        projected.reserve(projection.size());
-        for (size_t i = 0; i < projection.size(); ++i) {
-            projected.push_back(row[projection[i]]);
+
+    if (orderKeys.empty()) {
+        // No ordering: stream, applying OFFSET then LIMIT, and stop scanning
+        // once a bounded LIMIT has been satisfied.
+        uint64_t skipped = 0;
+        uint64_t emitted = 0;
+        while (limit != 0 && scan->next(row)) {
+            if (predicate.evaluate(row) != SqlTruth::True) {
+                continue;
+            }
+            if (skipped < offset) {
+                ++skipped;
+                continue;
+            }
+            projected.clear();
+            projected.reserve(projection.size());
+            for (size_t i = 0; i < projection.size(); ++i) {
+                projected.push_back(row[projection[i]]);
+            }
+            if (!out.resultSet.addRow(projected)) {
+                out.error = makeSemantic(
+                    "result set exceeds the SQL5 materialization limit", ast.line,
+                    ast.column);
+                out.error.code = SqlErrorCode::ResourceLimit;
+                return false;
+            }
+            ++emitted;
+            if (emitted >= limit) {
+                break;
+            }
         }
-        if (!out.resultSet.addRow(projected)) {
+    } else {
+        // ORDER BY: materialize the bounded qualifying set, sort, then apply
+        // OFFSET/LIMIT.
+        struct Materialized {
+            std::vector<DbValue> projected;
+            std::vector<DbValue> keys;
+        };
+        std::vector<Materialized> rows;
+        size_t bytes = 0;
+        while (scan->next(row)) {
+            if (predicate.evaluate(row) != SqlTruth::True) {
+                continue;
+            }
+            if (rows.size() >= kSqlMaxSortRows) {
+                out.error = makeSemantic(
+                    "ORDER BY working set exceeds the SQL5 row limit", ast.line,
+                    ast.column);
+                out.error.code = SqlErrorCode::ResourceLimit;
+                return false;
+            }
+            Materialized item;
+            item.projected.reserve(projection.size());
+            for (size_t i = 0; i < projection.size(); ++i) {
+                item.projected.push_back(row[projection[i]]);
+            }
+            item.keys.reserve(orderKeys.size());
+            for (size_t i = 0; i < orderKeys.size(); ++i) {
+                item.keys.push_back(row[orderKeys[i].ordinal]);
+            }
+            bytes += rowBytes(item.projected) + rowBytes(item.keys);
+            if (bytes > kSqlMaxSortBytes) {
+                out.error = makeSemantic(
+                    "ORDER BY working set exceeds the SQL5 byte limit", ast.line,
+                    ast.column);
+                out.error.code = SqlErrorCode::ResourceLimit;
+                return false;
+            }
+            rows.push_back(std::move(item));
+        }
+
+        std::stable_sort(
+            rows.begin(), rows.end(),
+            [&orderKeys](const Materialized& a, const Materialized& b) {
+                for (size_t i = 0; i < orderKeys.size(); ++i) {
+                    int cmp = compareOrderValues(a.keys[i], b.keys[i], orderKeys[i].type);
+                    if (orderKeys[i].descending) {
+                        cmp = -cmp;
+                    }
+                    if (cmp != 0) {
+                        return cmp < 0;
+                    }
+                }
+                return false;
+            });
+
+        const uint64_t start =
+            offset < static_cast<uint64_t>(rows.size()) ? offset
+                                                        : static_cast<uint64_t>(rows.size());
+        uint64_t end = static_cast<uint64_t>(rows.size());
+        if (limit != std::numeric_limits<uint64_t>::max()) {
+            const uint64_t remaining = end - start;
+            if (limit < remaining) {
+                end = start + limit;
+            }
+        }
+        for (uint64_t i = start; i < end; ++i) {
+            if (!out.resultSet.addRow(rows[static_cast<size_t>(i)].projected)) {
+                out.error = makeSemantic(
+                    "result set exceeds the SQL5 materialization limit", ast.line,
+                    ast.column);
+                out.error.code = SqlErrorCode::ResourceLimit;
+                return false;
+            }
+        }
+    }
+
+    if (!scan->status().isOk()) {
+        out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
+        return false;
+    }
+    return true;
+}
+
+bool SqlEngine::applyMutationPlan(Table* table, ExecContext& ctx,
+                                  const std::vector<RowMutation>& plan,
+                                  SqlStatementResult& out, uint32_t line,
+                                  uint32_t column) {
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        _tx->beginStatement(savepoint);
+    }
+
+    DbResult result = table->applyMutations(plan);
+    if (!result.isOk()) {
+        if (explicitTransaction) {
+            _tx->rollbackStatement(savepoint);
+            // Cached Table objects may reference pages that no longer exist
+            // after the overlay was restored.
+            ctx.tables.clear();
+        }
+        out.error = errorFromResult(result, line, column);
+        return false;
+    }
+
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
+    }
+    return true;
+}
+
+bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
+                              SqlStatementResult& out) {
+    SqlError error;
+    Table* table =
+        openTableCached(ast.table.name, ctx, error, ast.table.line, ast.table.column);
+    if (table == nullptr) {
+        out.error = error;
+        return false;
+    }
+    const std::vector<ColumnDefinition>& columns = table->columns();
+
+    // Statement-level semantic validation before any row is touched.
+    std::vector<size_t> assignmentOrdinals;
+    std::vector<DbValue> assignmentValues;
+    for (size_t i = 0; i < ast.assignments.size(); ++i) {
+        const SqlAssignmentAst& assignment = ast.assignments[i];
+        size_t found = columns.size();
+        for (size_t j = 0; j < columns.size(); ++j) {
+            if (columns[j].name == assignment.column.name) {
+                found = j;
+                break;
+            }
+        }
+        if (found == columns.size()) {
             out.error = makeSemantic(
-                "result set exceeds the SQL4 materialization limit",
-                ast.line, ast.column);
+                "unknown column '" + assignment.column.name + "' in UPDATE",
+                assignment.column.line, assignment.column.column);
+            return false;
+        }
+        for (size_t k = 0; k < assignmentOrdinals.size(); ++k) {
+            if (assignmentOrdinals[k] == found) {
+                out.error = makeSemantic(
+                    "column '" + assignment.column.name +
+                        "' is assigned more than once",
+                    assignment.column.line, assignment.column.column);
+                return false;
+            }
+        }
+        std::vector<DbValue> coerced;
+        if (!coerceLiteral(assignment.value, columns[found], coerced, error)) {
+            out.error = error;
+            return false;
+        }
+        assignmentOrdinals.push_back(found);
+        assignmentValues.push_back(coerced[0]);
+    }
+
+    BoundPredicate predicate;
+    if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                        columns, error)) {
+        out.error = error;
+        return false;
+    }
+
+    std::unique_ptr<TableScan> scan;
+    DbResult result = table->scanStart(scan);
+    if (!result.isOk()) {
+        out.error = errorFromResult(result, ast.table.line, ast.table.column);
+        return false;
+    }
+
+    std::vector<RowMutation> plan;
+    size_t planBytes = 0;
+    std::vector<DbValue> row;
+    while (scan->next(row)) {
+        if (predicate.evaluate(row) != SqlTruth::True) {
+            continue;
+        }
+        if (plan.size() >= kSqlMaxMutationTargets) {
+            out.error = makeSemantic(
+                "UPDATE target set exceeds the SQL5 row limit", ast.line, ast.column);
             out.error.code = SqlErrorCode::ResourceLimit;
             return false;
         }
+        RowMutation mutation;
+        mutation.locator =
+            RowLocator(scan->currentPageId(), scan->currentSlotIndex());
+        mutation.deleted = false;
+        mutation.values = row;
+        for (size_t i = 0; i < assignmentOrdinals.size(); ++i) {
+            mutation.values[assignmentOrdinals[i]] = assignmentValues[i];
+        }
+        planBytes += rowBytes(mutation.values);
+        if (planBytes > kSqlMaxMutationBytes) {
+            out.error = makeSemantic(
+                "UPDATE plan exceeds the SQL5 byte limit", ast.line, ast.column);
+            out.error.code = SqlErrorCode::ResourceLimit;
+            return false;
+        }
+        plan.push_back(std::move(mutation));
     }
     if (!scan->status().isOk()) {
         out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
         return false;
     }
+
+    out.objectName = ast.table.name;
+    if (plan.empty()) {
+        out.affectedRows = 0;
+        return true;
+    }
+    if (!applyMutationPlan(table, ctx, plan, out, ast.table.line, ast.table.column)) {
+        return false;
+    }
+    out.affectedRows = plan.size();
+    return true;
+}
+
+bool SqlEngine::executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
+                              SqlStatementResult& out) {
+    SqlError error;
+    Table* table =
+        openTableCached(ast.table.name, ctx, error, ast.table.line, ast.table.column);
+    if (table == nullptr) {
+        out.error = error;
+        return false;
+    }
+    const std::vector<ColumnDefinition>& columns = table->columns();
+
+    BoundPredicate predicate;
+    if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                        columns, error)) {
+        out.error = error;
+        return false;
+    }
+
+    std::unique_ptr<TableScan> scan;
+    DbResult result = table->scanStart(scan);
+    if (!result.isOk()) {
+        out.error = errorFromResult(result, ast.table.line, ast.table.column);
+        return false;
+    }
+
+    std::vector<RowMutation> plan;
+    std::vector<DbValue> row;
+    while (scan->next(row)) {
+        if (predicate.evaluate(row) != SqlTruth::True) {
+            continue;
+        }
+        if (plan.size() >= kSqlMaxMutationTargets) {
+            out.error = makeSemantic(
+                "DELETE target set exceeds the SQL5 row limit", ast.line, ast.column);
+            out.error.code = SqlErrorCode::ResourceLimit;
+            return false;
+        }
+        RowMutation mutation;
+        mutation.locator =
+            RowLocator(scan->currentPageId(), scan->currentSlotIndex());
+        mutation.deleted = true;
+        plan.push_back(mutation);
+    }
+    if (!scan->status().isOk()) {
+        out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
+        return false;
+    }
+
+    out.objectName = ast.table.name;
+    if (plan.empty()) {
+        out.affectedRows = 0;
+        return true;
+    }
+    if (!applyMutationPlan(table, ctx, plan, out, ast.table.line, ast.table.column)) {
+        return false;
+    }
+    out.affectedRows = plan.size();
     return true;
 }
 

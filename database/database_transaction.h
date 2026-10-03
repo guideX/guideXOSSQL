@@ -43,6 +43,21 @@ class Table;
 // transactions if needed.
 const uint32_t kMaxTransactionPages = 4096;
 
+// An internal statement-level savepoint: a complete snapshot of the
+// transaction-private overlay and catalog. SQL5 uses it to make a single
+// UPDATE/DELETE statement atomic inside an already-active explicit
+// transaction, without exposing SAVEPOINT syntax. It is not a durable concept.
+struct TransactionSavepoint {
+    std::map<uint64_t, DatabasePage> pages;
+    std::vector<uint64_t> order;
+    Catalog catalog;
+    uint64_t nextPageId;
+    bool catalogChanged;
+
+    TransactionSavepoint()
+        : pages(), order(), catalog(), nextPageId(0), catalogChanged(false) {}
+};
+
 class Transaction : public PageAccess {
 public:
     Transaction(Database& db, uint64_t id, uint64_t basePageCount);
@@ -63,6 +78,13 @@ public:
 
     DbResult commit();
     DbResult rollback();
+
+    // Statement-level atomicity inside an active transaction (SQL5). Snapshot
+    // the overlay + catalog before a mutation statement, restore it if the
+    // statement fails, or release it once the statement succeeds.
+    void beginStatement(TransactionSavepoint& out);
+    void rollbackStatement(const TransactionSavepoint& savepoint);
+    void releaseStatement(const TransactionSavepoint& savepoint);
 
     uint64_t id() const { return _id; }
     uint32_t modifiedPageCount() const { return static_cast<uint32_t>(_pages.size()); }

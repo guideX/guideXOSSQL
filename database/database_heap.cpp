@@ -1,6 +1,10 @@
 #include "database_heap.h"
 
+#include <algorithm>
 #include <cstring>
+#include <map>
+#include <set>
+#include <utility>
 
 #include "database_endian.h"
 #include "database_format.h"
@@ -199,6 +203,62 @@ DbResult encodeRow(const std::vector<ColumnDefinition>& columns,
     return DbResult::ok();
 }
 
+DbResult validateRowValues(const std::vector<ColumnDefinition>& cols,
+                           const std::vector<DbValue>& values) {
+    if (values.size() != cols.size()) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "value count does not match column count");
+    }
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (values[i].isNull()) {
+            if (!cols[i].nullable) {
+                return DbResult::error(DbStatus::InvalidArgument,
+                                       "NULL assigned to NOT NULL column");
+            }
+            continue;
+        }
+        if (values[i].type() != cols[i].type) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "value type does not match column type");
+        }
+        if (cols[i].type == DbType::Text && values[i].textValue().size() > kMaxTextBytes) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "text value exceeds maximum length");
+        }
+        if (cols[i].type == DbType::Blob && values[i].blobValue().size() > kMaxBlobBytes) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "blob value exceeds maximum length");
+        }
+    }
+    return DbResult::ok();
+}
+
+// Rewrites `page` so it holds exactly `rows` in order, preserving the header's
+// next-page link. The caller must have checked that the rows fit.
+DbResult packHeapPage(DatabasePage& page,
+                      const std::vector<std::vector<uint8_t> >& rows, uint64_t nextPageId,
+                      uint32_t capacity) {
+    page.payload.assign(capacity, 0);
+    uint32_t offset = kHeapHeaderSize;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const uint32_t length = static_cast<uint32_t>(rows[i].size());
+        const uint32_t slotOffset = capacity - 8u * (static_cast<uint32_t>(i) + 1u);
+        if (offset > slotOffset || length > slotOffset - offset) {
+            return DbResult::error(DbStatus::NoSpace, "heap page rows do not fit");
+        }
+        if (length > 0) {
+            std::memcpy(page.payload.data() + offset, rows[i].data(), length);
+        }
+        storeLe32(page.payload.data() + slotOffset, offset);
+        storeLe32(page.payload.data() + slotOffset + 4, length);
+        offset += length;
+    }
+    writeHeapHeader(page.payload, nextPageId, static_cast<uint32_t>(rows.size()), offset);
+    page.type = PageType::Data;
+    page.payloadSize = capacity;
+    return DbResult::ok();
+}
+
 DbResult decodeRow(const uint8_t* bytes, size_t length,
                    const std::vector<ColumnDefinition>& columns,
                    std::vector<DbValue>& out) {
@@ -346,14 +406,19 @@ void Table::markCatalogDirty() {
     _db.markCatalogDirty();
 }
 
-DbResult Table::updateStats(int64_t rowDelta, bool newPage, uint64_t firstPageId) {
+DbResult Table::updateStats(int64_t rowDelta, uint32_t newPageCount, uint64_t firstPageId) {
     Catalog::TableRecord* rec = _db.catalog().findTableMutable(_tableId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "table record vanished from catalog");
     }
-    rec->rowCount += static_cast<uint64_t>(rowDelta);
-    if (newPage) {
-        rec->heapPageCount += 1;
+    if (rowDelta < 0) {
+        const uint64_t decrease = static_cast<uint64_t>(-rowDelta);
+        rec->rowCount = (decrease > rec->rowCount) ? 0 : (rec->rowCount - decrease);
+    } else {
+        rec->rowCount += static_cast<uint64_t>(rowDelta);
+    }
+    if (newPageCount != 0) {
+        rec->heapPageCount += newPageCount;
         if (rec->firstHeapPageId == 0) {
             rec->firstHeapPageId = firstPageId;
         }
@@ -441,28 +506,9 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
     }
     const std::vector<ColumnDefinition>& cols = rec->columns;
 
-    if (values.size() != cols.size()) {
-        return DbResult::error(DbStatus::InvalidArgument, "value count does not match column count");
-    }
-    for (size_t i = 0; i < cols.size(); ++i) {
-        if (values[i].isNull()) {
-            if (!cols[i].nullable) {
-                return DbResult::error(DbStatus::InvalidArgument,
-                                       "NULL assigned to NOT NULL column");
-            }
-            continue;
-        }
-        if (values[i].type() != cols[i].type) {
-            return DbResult::error(DbStatus::InvalidArgument, "value type does not match column type");
-        }
-        if (cols[i].type == DbType::Text &&
-            values[i].textValue().size() > kMaxTextBytes) {
-            return DbResult::error(DbStatus::InvalidArgument, "text value exceeds maximum length");
-        }
-        if (cols[i].type == DbType::Blob &&
-            values[i].blobValue().size() > kMaxBlobBytes) {
-            return DbResult::error(DbStatus::InvalidArgument, "blob value exceeds maximum length");
-        }
+    DbResult validation = validateRowValues(cols, values);
+    if (!validation.isOk()) {
+        return validation;
     }
 
     std::vector<uint8_t> rowBytes;
@@ -471,20 +517,32 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
         return result;
     }
 
-    const uint32_t pageSize = _db.pages().pageSize();
-    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
-    const uint32_t rowLength = static_cast<uint32_t>(rowBytes.size());
-    if (rowLength + 8u > capacity) {
-        return DbResult::error(DbStatus::InvalidArgument, "encoded row exceeds heap page capacity");
-    }
-
-    result = ensureLastHeapPage();
+    uint32_t newPages = 0;
+    uint64_t firstNewPage = 0;
+    result = appendEncodedRowToTail(rowBytes, newPages, firstNewPage);
     if (!result.isOk()) {
         return result;
     }
 
-    bool newPage = false;
-    uint64_t firstPageId = 0;
+    DbResult statsResult = updateStats(1, newPages, firstNewPage);
+    _db.refreshBufferDiagnostics();
+    return statsResult;
+}
+
+DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
+                                       uint32_t& newPagesOut, uint64_t& firstNewPageOut) {
+    const uint32_t pageSize = _db.pages().pageSize();
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    const uint32_t rowLength = static_cast<uint32_t>(rowBytes.size());
+    if (rowLength + 8u > capacity) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "encoded row exceeds heap page capacity");
+    }
+
+    DbResult result = ensureLastHeapPage();
+    if (!result.isOk()) {
+        return result;
+    }
 
     if (_lastHeapPageId != 0) {
         DatabasePage page;
@@ -501,7 +559,6 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
             return result;
         }
         if (info.rowAreaEnd + rowLength <= capacity - 8u * (info.slotCount + 1)) {
-            // Append the row and its slot.
             std::vector<uint8_t>& payload = page.payload;
             std::memcpy(payload.data() + info.rowAreaEnd, rowBytes.data(), rowBytes.size());
             const uint32_t slotOffset = capacity - 8u * (info.slotCount + 1);
@@ -509,17 +566,11 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
             storeLe32(payload.data() + slotOffset + 4, rowLength);
             storeLe32(payload.data() + kHeapSlotCountOffset, info.slotCount + 1);
             storeLe32(payload.data() + kHeapRowAreaEndOffset, info.rowAreaEnd + rowLength);
-            result = _db.pages().writePage(page);
-            if (!result.isOk()) {
-                return result;
-            }
-            DbResult statsResult = updateStats(1, false, 0);
-            _db.refreshBufferDiagnostics();
-            return statsResult;
+            return _db.pages().writePage(page);
         }
     }
 
-    // Allocate a new heap page.
+    // Allocate a new heap page and link it into the chain.
     uint64_t newPageId = 0;
     result = _db.pages().allocatePage(PageType::Data, newPageId);
     if (!result.isOk()) {
@@ -544,15 +595,13 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
         storeLe32(payload.data() + slotOffset, kHeapHeaderSize);
         storeLe32(payload.data() + slotOffset + 4, rowLength);
         storeLe32(payload.data() + kHeapSlotCountOffset, 1u);
-        storeLe32(payload.data() + kHeapRowAreaEndOffset,
-                  kHeapHeaderSize + rowLength);
+        storeLe32(payload.data() + kHeapRowAreaEndOffset, kHeapHeaderSize + rowLength);
     }
     result = _db.pages().writePage(newPageImage);
     if (!result.isOk()) {
         return result;
     }
 
-    // Link the new page into the chain.
     if (_lastHeapPageId != 0) {
         DatabasePage oldPage;
         result = _db.pages().readPage(_lastHeapPageId, oldPage);
@@ -564,13 +613,233 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
         if (!result.isOk()) {
             return result;
         }
-    } else {
-        firstPageId = newPageId;
     }
 
+    if (newPagesOut == 0) {
+        firstNewPageOut = newPageId;
+    }
+    ++newPagesOut;
     _lastHeapPageId = newPageId;
-    newPage = true;
-    DbResult statsResult = updateStats(1, newPage, firstPageId);
+    return DbResult::ok();
+}
+
+DbResult Table::applyMutations(const std::vector<RowMutation>& mutations) {
+    if (_db.isReadOnly()) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    if (mutations.empty()) {
+        return DbResult::ok();
+    }
+    if (_db.activeTransaction() != nullptr) {
+        return applyMutationsInTransaction(mutations);
+    }
+    std::unique_ptr<Transaction> tx;
+    DbResult begin = _db.beginTransaction(tx);
+    if (!begin.isOk()) {
+        return begin;
+    }
+    DbResult result = applyMutationsInTransaction(mutations);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    return tx->commit();
+}
+
+DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& mutations) {
+    const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::Internal, "table record not found");
+    }
+    const std::vector<ColumnDefinition>& cols = rec->columns;
+    const uint32_t pageSize = _db.pages().pageSize();
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+
+    struct Entry {
+        uint32_t slot;
+        bool deleted;
+        std::vector<uint8_t> encoded;
+    };
+    std::map<uint64_t, std::vector<Entry> > byPage;
+    std::set<std::pair<uint64_t, uint32_t> > seen;
+    int64_t rowDelta = 0;
+
+    for (size_t i = 0; i < mutations.size(); ++i) {
+        const RowMutation& mutation = mutations[i];
+        if (!seen
+                 .insert(std::make_pair(mutation.locator.pageId, mutation.locator.slot))
+                 .second) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "duplicate row locator in mutation plan");
+        }
+        Entry entry;
+        entry.slot = mutation.locator.slot;
+        entry.deleted = mutation.deleted;
+        if (mutation.deleted) {
+            rowDelta -= 1;
+        } else {
+            DbResult validation = validateRowValues(cols, mutation.values);
+            if (!validation.isOk()) {
+                return validation;
+            }
+            DbResult encoded = encodeRow(cols, mutation.values, entry.encoded);
+            if (!encoded.isOk()) {
+                return encoded;
+            }
+            if (entry.encoded.size() + 8u > capacity) {
+                return DbResult::error(DbStatus::InvalidArgument,
+                                       "replacement row exceeds heap page capacity");
+            }
+        }
+        byPage[mutation.locator.pageId].push_back(entry);
+    }
+
+    // Walk the heap chain once to establish physical order, so relocated rows
+    // preserve the relative order of the pages they came from.
+    std::vector<uint64_t> chain;
+    {
+        uint64_t current = rec->firstHeapPageId;
+        const uint64_t pageCount = _db.pages().pageCount();
+        std::set<uint64_t> visited;
+        while (current != 0) {
+            if (current >= pageCount) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "heap page id outside allocated range");
+            }
+            if (!visited.insert(current).second) {
+                return DbResult::error(DbStatus::CorruptPage, "heap page chain cycle");
+            }
+            chain.push_back(current);
+            DatabasePage page;
+            DbResult result = _db.pages().readPage(current, page);
+            if (!result.isOk()) {
+                return result;
+            }
+            if (page.type != PageType::Data) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "heap page has wrong page type");
+            }
+            HeapPageInfo info;
+            result = readHeapPage(page, pageSize, info);
+            if (!result.isOk()) {
+                return result;
+            }
+            current = info.nextPageId;
+        }
+    }
+
+    std::vector<std::vector<uint8_t> > relocations;
+    std::set<uint64_t> processed;
+
+    for (size_t ci = 0; ci < chain.size(); ++ci) {
+        const uint64_t pageId = chain[ci];
+        std::map<uint64_t, std::vector<Entry> >::iterator it = byPage.find(pageId);
+        if (it == byPage.end()) {
+            continue;
+        }
+        std::vector<Entry>& entries = it->second;
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.slot < b.slot; });
+
+        DatabasePage page;
+        DbResult result = _db.pages().readPage(pageId, page);
+        if (!result.isOk()) {
+            return result;
+        }
+        if (page.type != PageType::Data) {
+            return DbResult::error(DbStatus::CorruptPage, "heap page has wrong page type");
+        }
+        HeapPageInfo info;
+        result = readHeapPage(page, pageSize, info);
+        if (!result.isOk()) {
+            return result;
+        }
+
+        std::vector<std::vector<uint8_t> > finalRows;
+        size_t entryIndex = 0;
+        for (uint32_t slot = 0; slot < info.slotCount; ++slot) {
+            if (entryIndex < entries.size() && entries[entryIndex].slot < slot) {
+                return DbResult::error(DbStatus::InvalidArgument,
+                                       "mutation locator slot out of range");
+            }
+            const Entry* entry = nullptr;
+            if (entryIndex < entries.size() && entries[entryIndex].slot == slot) {
+                entry = &entries[entryIndex];
+                ++entryIndex;
+            }
+            if (entry != nullptr && entry->deleted) {
+                continue;
+            }
+            if (entry != nullptr) {
+                finalRows.push_back(entry->encoded);
+            } else {
+                uint32_t offset = 0;
+                uint32_t length = 0;
+                if (!readSlot(page.payload, slot, capacity, offset, length)) {
+                    return DbResult::error(DbStatus::CorruptPage, "invalid heap slot");
+                }
+                if (offset < kHeapHeaderSize || length < 8u ||
+                    offset + length > info.rowAreaEnd) {
+                    return DbResult::error(DbStatus::CorruptPage,
+                                           "heap slot row out of range");
+                }
+                finalRows.push_back(std::vector<uint8_t>(
+                    page.payload.begin() + offset, page.payload.begin() + offset + length));
+            }
+        }
+        if (entryIndex < entries.size()) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "mutation locator slot out of range");
+        }
+
+        // Keep the prefix that still fits the page; relocate the remainder to
+        // the tail. Relocation is how a variable-width UPDATE can grow a row.
+        uint32_t used = kHeapHeaderSize;
+        size_t keep = 0;
+        for (; keep < finalRows.size(); ++keep) {
+            const uint32_t need = 8u + static_cast<uint32_t>(finalRows[keep].size());
+            if (used + need > capacity) {
+                break;
+            }
+            used += need;
+        }
+        std::vector<std::vector<uint8_t> > kept;
+        kept.reserve(keep);
+        for (size_t i = 0; i < keep; ++i) {
+            kept.push_back(finalRows[i]);
+        }
+        for (size_t i = keep; i < finalRows.size(); ++i) {
+            relocations.push_back(finalRows[i]);
+        }
+
+        result = packHeapPage(page, kept, info.nextPageId, capacity);
+        if (!result.isOk()) {
+            return result;
+        }
+        result = _db.pages().writePage(page);
+        if (!result.isOk()) {
+            return result;
+        }
+        processed.insert(pageId);
+    }
+
+    if (processed.size() != byPage.size()) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "mutation locator does not match a heap page");
+    }
+
+    // Append all relocated rows only after every affected page has been
+    // rewritten, so a relocated row can never be rewritten twice.
+    uint32_t newPages = 0;
+    uint64_t firstNewPage = 0;
+    for (size_t i = 0; i < relocations.size(); ++i) {
+        DbResult result = appendEncodedRowToTail(relocations[i], newPages, firstNewPage);
+        if (!result.isOk()) {
+            return result;
+        }
+    }
+
+    DbResult statsResult = updateStats(rowDelta, newPages, firstNewPage);
     _db.refreshBufferDiagnostics();
     return statsResult;
 }
@@ -585,7 +854,7 @@ TableScan::TableScan(const Table& table)
       _currentPageId(0), _nextPageId(0), _slotIndex(0), _slotCount(0), _rowAreaEnd(0),
       _pageSize(table._db.pages().pageSize()),
       _capacity(DatabasePage::payloadCapacity(table._db.pages().pageSize())),
-      _started(false), _done(false) {}
+      _started(false), _done(false), _rowPageId(0), _rowSlot(0) {}
 
 bool TableScan::next(std::vector<DbValue>& row) {
     if (!_status.isOk() || _done) {
@@ -670,6 +939,8 @@ bool TableScan::next(std::vector<DbValue>& row) {
                 _status = result;
                 return false;
             }
+            _rowPageId = _currentPageId;
+            _rowSlot = _slotIndex - 1;
             row = values;
             return true;
         }

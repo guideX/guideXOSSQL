@@ -8,6 +8,8 @@ const char* sqlStatementTypeName(SqlStatementType type) {
     case SqlStatementType::CreateTable: return "CREATE TABLE";
     case SqlStatementType::Insert: return "INSERT";
     case SqlStatementType::Select: return "SELECT";
+    case SqlStatementType::Update: return "UPDATE";
+    case SqlStatementType::Delete: return "DELETE";
     case SqlStatementType::Begin: return "BEGIN";
     case SqlStatementType::Commit: return "COMMIT";
     case SqlStatementType::Rollback: return "ROLLBACK";
@@ -16,8 +18,36 @@ const char* sqlStatementTypeName(SqlStatementType type) {
     return "UNKNOWN";
 }
 
+const char* sqlCompareOpName(SqlCompareOp op) {
+    switch (op) {
+    case SqlCompareOp::Eq: return "=";
+    case SqlCompareOp::Ne: return "<>";
+    case SqlCompareOp::Lt: return "<";
+    case SqlCompareOp::Le: return "<=";
+    case SqlCompareOp::Gt: return ">";
+    case SqlCompareOp::Ge: return ">=";
+    }
+    return "?";
+}
+
+namespace {
+
+bool comparisonToken(SqlTokenKind kind, SqlCompareOp& out) {
+    switch (kind) {
+    case SqlTokenKind::Eq: out = SqlCompareOp::Eq; return true;
+    case SqlTokenKind::Ne: out = SqlCompareOp::Ne; return true;
+    case SqlTokenKind::Lt: out = SqlCompareOp::Lt; return true;
+    case SqlTokenKind::Le: out = SqlCompareOp::Le; return true;
+    case SqlTokenKind::Gt: out = SqlCompareOp::Gt; return true;
+    case SqlTokenKind::Ge: out = SqlCompareOp::Ge; return true;
+    default: return false;
+    }
+}
+
+} // namespace
+
 SqlParser::SqlParser(const std::vector<SqlToken>& tokens)
-    : _tokens(tokens), _index(0) {}
+    : _tokens(tokens), _index(0), _depth(0) {}
 
 const SqlToken& SqlParser::peek(size_t lookahead) const {
     const size_t at = _index + lookahead;
@@ -79,6 +109,8 @@ bool SqlParser::next(SqlStatementAst& out, SqlError& error, bool& done) {
         done = true;
         return true;
     }
+    // Reset the target so callers may safely reuse one AST object.
+    out = SqlStatementAst();
     if (!parseStatement(out, error)) {
         return false;
     }
@@ -108,6 +140,12 @@ bool SqlParser::parseStatement(SqlStatementAst& out, SqlError& error) {
     case SqlTokenKind::Select:
         out.type = SqlStatementType::Select;
         return parseSelect(out, error);
+    case SqlTokenKind::Update:
+        out.type = SqlStatementType::Update;
+        return parseUpdate(out, error);
+    case SqlTokenKind::Delete:
+        out.type = SqlStatementType::Delete;
+        return parseDelete(out, error);
     case SqlTokenKind::Begin:
         advance();
         out.type = SqlStatementType::Begin;
@@ -149,7 +187,7 @@ bool SqlParser::parseCreateTable(SqlStatementAst& out, SqlError& error) {
     while (match(SqlTokenKind::Comma)) {
         if (out.createTable.columns.size() >= kSqlMaxColumnsPerCreate) {
             error = makeError(SqlErrorCode::ResourceLimit,
-                              "column count exceeds the SQL4 maximum", peek());
+                              "column count exceeds the SQL maximum", peek());
             return false;
         }
         if (!parseColumnDef(column, error)) {
@@ -177,8 +215,7 @@ bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
     advance();
     if (check(SqlTokenKind::LeftParen)) {
         error = makeError(SqlErrorCode::Unsupported,
-                          "type length or precision declarations are not supported in "
-                          "SQL4",
+                          "type length or precision declarations are not supported",
                           peek());
         return false;
     }
@@ -216,7 +253,7 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
     while (match(SqlTokenKind::Comma)) {
         if (out.insert.values.size() >= kSqlMaxValuesPerInsert) {
             error = makeError(SqlErrorCode::ResourceLimit,
-                              "value count exceeds the SQL4 maximum", peek());
+                              "value count exceeds the SQL maximum", peek());
             return false;
         }
         if (!parseLiteral(literal, error)) {
@@ -243,7 +280,7 @@ bool SqlParser::parseSelect(SqlStatementAst& out, SqlError& error) {
         while (match(SqlTokenKind::Comma)) {
             if (out.select.columns.size() >= kSqlMaxSelectColumns) {
                 error = makeError(SqlErrorCode::ResourceLimit,
-                                  "projection exceeds the SQL4 maximum", peek());
+                                  "projection exceeds the SQL maximum", peek());
                 return false;
             }
             if (!parseIdentifier(identifier, error, "column name")) {
@@ -257,6 +294,154 @@ bool SqlParser::parseSelect(SqlStatementAst& out, SqlError& error) {
     }
     if (!parseIdentifier(out.select.table, error, "table name")) {
         return false;
+    }
+    if (!parseWhereClause(out.select.where, error)) {
+        return false;
+    }
+    if (match(SqlTokenKind::Order)) {
+        if (!expect(SqlTokenKind::By, error, "BY after ORDER")) {
+            return false;
+        }
+        if (!parseOrderBy(out.select.orderBy, error)) {
+            return false;
+        }
+    }
+    if (!parseLimitOffset(out.select, error)) {
+        return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseUpdate(SqlStatementAst& out, SqlError& error) {
+    advance(); // UPDATE
+    if (!parseIdentifier(out.update.table, error, "table name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::Set, error, "SET after table name")) {
+        return false;
+    }
+    if (!parseAssignments(out.update.assignments, error)) {
+        return false;
+    }
+    if (!parseWhereClause(out.update.where, error)) {
+        return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseDelete(SqlStatementAst& out, SqlError& error) {
+    advance(); // DELETE
+    if (!expect(SqlTokenKind::From, error, "FROM after DELETE")) {
+        return false;
+    }
+    if (!parseIdentifier(out.deleteStatement.table, error, "table name")) {
+        return false;
+    }
+    if (!parseWhereClause(out.deleteStatement.where, error)) {
+        return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseAssignments(std::vector<SqlAssignmentAst>& out,
+                                 SqlError& error) {
+    SqlAssignmentAst assignment;
+    if (!parseIdentifier(assignment.column, error, "column name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::Eq, error, "'=' after column name")) {
+        return false;
+    }
+    if (!parseLiteral(assignment.value, error)) {
+        return false;
+    }
+    out.push_back(assignment);
+    while (match(SqlTokenKind::Comma)) {
+        if (out.size() >= kSqlMaxUpdateAssignments) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "assignment count exceeds the SQL5 maximum", peek());
+            return false;
+        }
+        SqlAssignmentAst next;
+        if (!parseIdentifier(next.column, error, "column name")) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::Eq, error, "'=' after column name")) {
+            return false;
+        }
+        if (!parseLiteral(next.value, error)) {
+            return false;
+        }
+        out.push_back(next);
+    }
+    return true;
+}
+
+bool SqlParser::parseOrderBy(std::vector<SqlOrderTermAst>& out, SqlError& error) {
+    SqlOrderTermAst term;
+    if (!parseIdentifier(term.column, error, "column name")) {
+        return false;
+    }
+    if (match(SqlTokenKind::Asc)) {
+        term.descending = false;
+    } else if (match(SqlTokenKind::Desc)) {
+        term.descending = true;
+    }
+    out.push_back(term);
+    while (match(SqlTokenKind::Comma)) {
+        if (out.size() >= kSqlMaxOrderByColumns) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "ORDER BY column count exceeds the SQL5 maximum", peek());
+            return false;
+        }
+        SqlOrderTermAst next;
+        if (!parseIdentifier(next.column, error, "column name")) {
+            return false;
+        }
+        if (match(SqlTokenKind::Asc)) {
+            next.descending = false;
+        } else if (match(SqlTokenKind::Desc)) {
+            next.descending = true;
+        }
+        out.push_back(next);
+    }
+    return true;
+}
+
+bool SqlParser::parseLimitOffset(SqlSelectAst& out, SqlError& error) {
+    if (match(SqlTokenKind::Limit)) {
+        if (!check(SqlTokenKind::IntegerLiteral)) {
+            std::string message = "expected a nonnegative integer after LIMIT, found ";
+            message += sqlTokenKindName(peek().kind);
+            error = makeError(SqlErrorCode::SyntaxError, message, peek());
+            return false;
+        }
+        const int64_t value = peek().int64Value;
+        if (value < 0) {
+            error = makeError(SqlErrorCode::SyntaxError,
+                              "LIMIT must be a nonnegative integer", peek());
+            return false;
+        }
+        out.hasLimit = true;
+        out.limit = static_cast<uint64_t>(value);
+        advance();
+    }
+    if (match(SqlTokenKind::Offset)) {
+        if (!check(SqlTokenKind::IntegerLiteral)) {
+            std::string message = "expected a nonnegative integer after OFFSET, found ";
+            message += sqlTokenKindName(peek().kind);
+            error = makeError(SqlErrorCode::SyntaxError, message, peek());
+            return false;
+        }
+        const int64_t value = peek().int64Value;
+        if (value < 0) {
+            error = makeError(SqlErrorCode::SyntaxError,
+                              "OFFSET must be a nonnegative integer", peek());
+            return false;
+        }
+        out.hasOffset = true;
+        out.offset = static_cast<uint64_t>(value);
+        advance();
     }
     return true;
 }
@@ -324,6 +509,221 @@ bool SqlParser::parseIdentifier(SqlIdentifier& out, SqlError& error,
     out.line = token.line;
     out.column = token.column;
     advance();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// SQL5 predicate expressions.
+
+int32_t SqlParser::allocExpr(SqlPredicateAst& arena, const SqlToken& token,
+                             SqlError& error) {
+    if (arena.nodes.size() >= kSqlMaxExprNodes) {
+        error = makeError(SqlErrorCode::ResourceLimit,
+                          "expression exceeds the SQL5 node limit", token);
+        return -1;
+    }
+    SqlExprNode node;
+    node.line = token.line;
+    node.column = token.column;
+    arena.nodes.push_back(node);
+    return static_cast<int32_t>(arena.nodes.size() - 1);
+}
+
+bool SqlParser::parseOrExpr(SqlPredicateAst& arena, int32_t& out, SqlError& error) {
+    int32_t left = -1;
+    if (!parseAndExpr(arena, left, error)) {
+        return false;
+    }
+    while (check(SqlTokenKind::Or)) {
+        const SqlToken& token = peek();
+        advance();
+        int32_t right = -1;
+        if (!parseAndExpr(arena, right, error)) {
+            return false;
+        }
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::Or;
+        arena.nodes[index].left = left;
+        arena.nodes[index].right = right;
+        left = index;
+    }
+    out = left;
+    return true;
+}
+
+bool SqlParser::parseAndExpr(SqlPredicateAst& arena, int32_t& out, SqlError& error) {
+    int32_t left = -1;
+    if (!parseNotExpr(arena, left, error)) {
+        return false;
+    }
+    while (check(SqlTokenKind::And)) {
+        const SqlToken& token = peek();
+        advance();
+        int32_t right = -1;
+        if (!parseNotExpr(arena, right, error)) {
+            return false;
+        }
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::And;
+        arena.nodes[index].left = left;
+        arena.nodes[index].right = right;
+        left = index;
+    }
+    out = left;
+    return true;
+}
+
+bool SqlParser::parseNotExpr(SqlPredicateAst& arena, int32_t& out, SqlError& error) {
+    if (check(SqlTokenKind::Not)) {
+        const SqlToken token = peek();
+        if (_depth >= kSqlMaxNestingDepth) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "expression nesting exceeds the SQL5 maximum", token);
+            return false;
+        }
+        advance();
+        ++_depth;
+        int32_t operand = -1;
+        const bool ok = parseNotExpr(arena, operand, error);
+        --_depth;
+        if (!ok) {
+            return false;
+        }
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::Not;
+        arena.nodes[index].left = operand;
+        out = index;
+        return true;
+    }
+    return parseComparison(arena, out, error);
+}
+
+bool SqlParser::parseComparison(SqlPredicateAst& arena, int32_t& out,
+                                SqlError& error) {
+    int32_t left = -1;
+    if (!parsePrimary(arena, left, error)) {
+        return false;
+    }
+
+    SqlCompareOp op = SqlCompareOp::Eq;
+    if (comparisonToken(peek().kind, op)) {
+        const SqlToken token = peek();
+        advance();
+        int32_t right = -1;
+        if (!parsePrimary(arena, right, error)) {
+            return false;
+        }
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::Compare;
+        arena.nodes[index].compareOp = op;
+        arena.nodes[index].left = left;
+        arena.nodes[index].right = right;
+        out = index;
+        return true;
+    }
+
+    if (check(SqlTokenKind::Is)) {
+        const SqlToken token = peek();
+        advance();
+        bool negated = false;
+        if (match(SqlTokenKind::Not)) {
+            negated = true;
+        }
+        if (!expect(SqlTokenKind::Null, error, "NULL after IS")) {
+            return false;
+        }
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::IsNull;
+        arena.nodes[index].negated = negated;
+        arena.nodes[index].left = left;
+        out = index;
+        return true;
+    }
+
+    out = left;
+    return true;
+}
+
+bool SqlParser::parsePrimary(SqlPredicateAst& arena, int32_t& out, SqlError& error) {
+    const SqlToken& token = peek();
+
+    if (token.kind == SqlTokenKind::LeftParen) {
+        if (_depth >= kSqlMaxNestingDepth) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "expression nesting exceeds the SQL5 maximum", token);
+            return false;
+        }
+        advance();
+        ++_depth;
+        int32_t inner = -1;
+        const bool ok = parseOrExpr(arena, inner, error);
+        --_depth;
+        if (!ok) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::RightParen, error, "')' after expression")) {
+            return false;
+        }
+        out = inner;
+        return true;
+    }
+
+    if (token.kind == SqlTokenKind::Identifier) {
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::ColumnRef;
+        arena.nodes[index].identifier.name = token.text;
+        arena.nodes[index].identifier.line = token.line;
+        arena.nodes[index].identifier.column = token.column;
+        advance();
+        out = index;
+        return true;
+    }
+
+    SqlLiteralAst literal;
+    if (!parseLiteral(literal, error)) {
+        return false;
+    }
+    const int32_t index = allocExpr(arena, token, error);
+    if (index < 0) {
+        return false;
+    }
+    arena.nodes[index].kind = SqlExprKind::Literal;
+    arena.nodes[index].literal = literal;
+    out = index;
+    return true;
+}
+
+bool SqlParser::parseWhereClause(SqlPredicateAst& out, SqlError& error) {
+    out.nodes.clear();
+    out.root = -1;
+    out.present = false;
+    if (!match(SqlTokenKind::Where)) {
+        return true;
+    }
+    out.present = true;
+    int32_t root = -1;
+    if (!parseOrExpr(out, root, error)) {
+        return false;
+    }
+    out.root = root;
     return true;
 }
 

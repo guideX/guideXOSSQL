@@ -18,11 +18,18 @@ Native relational database subsystem for guideXOS. This repository contains:
   relational engine. Supports `CREATE TABLE`, `INSERT ... VALUES`, `SELECT`,
   `BEGIN`/`COMMIT`/`ROLLBACK`, multi-statement input, typed literals, NULL,
   string escaping and BLOB literals. No `.gxdb`/`.gxwal` format change.
+- **Phase SQL5: Predicates and Data Manipulation** — a bounded expression AST
+  with SQL three-valued logic, `WHERE`, `ORDER BY`/`ASC`/`DESC`,
+  `LIMIT`/`OFFSET`, `UPDATE ... SET ... WHERE`, and `DELETE ... WHERE`. Rows are
+  located through internal ephemeral locators and mutated through generic
+  transaction-aware relational primitives with statement-level atomicity. Still
+  a full-scan, index-free engine; no `.gxdb`/`.gxwal` format change.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
 - SQL3 WAL/transaction design: [`docs/SQL3_WAL_TRANSACTIONS.md`](docs/SQL3_WAL_TRANSACTIONS.md)
 - SQL4 language reference: [`docs/SQL4_LANGUAGE.md`](docs/SQL4_LANGUAGE.md)
+- SQL5 predicates/mutation/ordering: [`docs/SQL5_PREDICATES_MUTATION_ORDERING.md`](docs/SQL5_PREDICATES_MUTATION_ORDERING.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
@@ -93,20 +100,39 @@ The same SQL text works through the library (`SqlEngine`) and the CLI:
 CREATE TABLE Users (
     Id INT64 NOT NULL,
     Name TEXT NOT NULL,
-    Enabled BOOLEAN NOT NULL
+    Enabled BOOLEAN NOT NULL,
+    Note TEXT NULL
 );
 
-INSERT INTO Users VALUES (1, 'Alice', TRUE);
-INSERT INTO Users VALUES (2, 'Bob', FALSE);
+BEGIN;
+INSERT INTO Users VALUES (1, 'Alice', TRUE, NULL);
+INSERT INTO Users VALUES (2, 'Bob', TRUE, 'temporary');
+INSERT INTO Users VALUES (3, 'Carol', FALSE, NULL);
+INSERT INTO Users VALUES (4, 'Dave', TRUE, 'keep');
+COMMIT;
 
-SELECT Id, Name, Enabled FROM Users;
+-- Find enabled users, deterministically ordered and bounded.
+SELECT Id, Name
+FROM Users
+WHERE Enabled = TRUE
+ORDER BY Name ASC
+LIMIT 10 OFFSET 0;
+
+-- Mutate: disable Bob, then remove every disabled user.
+UPDATE Users SET Enabled = FALSE WHERE Name = 'Bob';
+DELETE FROM Users WHERE Enabled = FALSE;
 ```
 
 ```sh
-build/gxdb_cli sql app.gxdb "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, Enabled BOOLEAN NOT NULL);"
-build/gxdb_cli sql app.gxdb "INSERT INTO Users VALUES (1, 'Alice', TRUE);"
-build/gxdb_cli sql app.gxdb "SELECT Id, Name, Enabled FROM Users;"
+build/gxdb_cli sql app.gxdb "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, Enabled BOOLEAN NOT NULL, Note TEXT NULL);"
+build/gxdb_cli sql app.gxdb "INSERT INTO Users VALUES (1, 'Alice', TRUE, NULL);"
+build/gxdb_cli sql app.gxdb "SELECT Id, Name FROM Users WHERE Enabled = TRUE ORDER BY Name ASC LIMIT 10;"
+build/gxdb_cli sql app.gxdb "UPDATE Users SET Enabled = FALSE WHERE Name = 'Alice';"
+build/gxdb_cli sql app.gxdb "DELETE FROM Users WHERE Enabled = FALSE;"
 ```
+
+`UPDATE` and `DELETE` print their affected-row count in the CLI. Without a
+`WHERE`, every row is targeted; the table schema always survives a `DELETE`.
 
 The `.gxdb` can be closed and reopened; the same `SELECT` returns the same
 logical rows.
@@ -137,9 +163,11 @@ build/gxdb_cli shell sample.gxdb
 ## Status
 
 Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
-SQL4: 429 checks). SQL3 proves crash-atomic transactions on the hosted backend,
-including a full commit crash matrix and a 250-lifecycle transaction/recovery
-stress suite. SQL4 proves a bounded SQL language over that engine, including a
-SQL-driven crash matrix, a multi-page dataset and a deterministic 1000-row
-dataset. QEMU and bare-metal proof are deferred to the phase that provides a
+SQL4: 429 checks, SQL5: 1775 checks). SQL3 proves crash-atomic transactions on
+the hosted backend, including a full commit crash matrix and a 250-lifecycle
+transaction/recovery stress suite. SQL4 proves a bounded SQL language over that
+engine. SQL5 proves predicates with three-valued logic, deterministic ordering
+and LIMIT/OFFSET, plus UPDATE/DELETE with statement-level atomicity, variable
+width row relocation, multi-page compaction and SQL-driven UPDATE/DELETE crash
+matrices. QEMU and bare-metal proof are deferred to the phase that provides a
 native `IDatabaseFile` backend over the guideXOS VFS / block device.

@@ -59,6 +59,19 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::Blob: return "BLOB";
     case SqlTokenKind::True: return "TRUE";
     case SqlTokenKind::False: return "FALSE";
+    case SqlTokenKind::Where: return "WHERE";
+    case SqlTokenKind::Update: return "UPDATE";
+    case SqlTokenKind::Set: return "SET";
+    case SqlTokenKind::Delete: return "DELETE";
+    case SqlTokenKind::Order: return "ORDER";
+    case SqlTokenKind::By: return "BY";
+    case SqlTokenKind::Asc: return "ASC";
+    case SqlTokenKind::Desc: return "DESC";
+    case SqlTokenKind::Limit: return "LIMIT";
+    case SqlTokenKind::Offset: return "OFFSET";
+    case SqlTokenKind::And: return "AND";
+    case SqlTokenKind::Or: return "OR";
+    case SqlTokenKind::Is: return "IS";
     case SqlTokenKind::Identifier: return "identifier";
     case SqlTokenKind::IntegerLiteral: return "integer literal";
     case SqlTokenKind::FloatLiteral: return "float literal";
@@ -69,13 +82,19 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::RightParen: return "')'";
     case SqlTokenKind::Semicolon: return "';'";
     case SqlTokenKind::Star: return "'*'";
+    case SqlTokenKind::Eq: return "'='";
+    case SqlTokenKind::Ne: return "'<>'";
+    case SqlTokenKind::Lt: return "'<'";
+    case SqlTokenKind::Le: return "'<='";
+    case SqlTokenKind::Gt: return "'>'";
+    case SqlTokenKind::Ge: return "'>='";
     case SqlTokenKind::EndOfInput: return "end of input";
     }
     return "token";
 }
 
 bool sqlTokenIsKeyword(SqlTokenKind kind) {
-    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::False;
+    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::Is;
 }
 
 bool sqlTokenIsTypeKeyword(SqlTokenKind kind) {

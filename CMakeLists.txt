@@ -23,6 +23,7 @@ add_library(gxos_database STATIC
     database/database_sql_token.cpp
     database/database_sql_tokenizer.cpp
     database/database_sql_parser.cpp
+    database/database_sql_expr.cpp
     database/database_sql.cpp
 )
 target_include_directories(gxos_database PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/database")

@@ -54,15 +54,40 @@ const size_t kSqlMaxSelectColumns = 64u;
 // Maximum number of statements accepted in one input string.
 const size_t kSqlMaxStatements = 4096u;
 
-// Maximum parser nesting depth (SQL4 has no expressions, but the bound exists
-// so future grammar extensions cannot exhaust the stack).
+// Maximum parser nesting depth (parenthesized expressions and NOT chains).
 const size_t kSqlMaxNestingDepth = 32u;
+
+// Maximum number of expression AST nodes in one predicate (SQL5 section 6).
+// Depth alone is not enough: a flat 1 MiB query could otherwise allocate an
+// unbounded number of nodes.
+const size_t kSqlMaxExprNodes = 4096u;
+
+// Maximum ORDER BY terms in one SELECT.
+const size_t kSqlMaxOrderByColumns = 64u;
+
+// Maximum assignments in one UPDATE SET list.
+const size_t kSqlMaxUpdateAssignments = 64u;
 
 // Maximum rows materialized for one SELECT result set.
 const size_t kSqlMaxResultRows = 100000u;
 
 // Maximum approximate payload bytes materialized for one SELECT result set.
 const size_t kSqlMaxResultBytes = 64u * 1024u * 1024u;
+
+// Maximum number of rows/locators one UPDATE/DELETE statement may target.
+const size_t kSqlMaxMutationTargets = 100000u;
+
+// Maximum approximate bytes held while planning one UPDATE/DELETE statement
+// (replacement row payloads). Bounds a compact statement that matches a huge
+// number of large rows.
+const size_t kSqlMaxMutationBytes = 64u * 1024u * 1024u;
+
+// Maximum approximate bytes held by the ORDER BY working set. ORDER BY
+// materializes qualifying rows before sorting; this bounds that buffer.
+const size_t kSqlMaxSortBytes = 64u * 1024u * 1024u;
+
+// Maximum qualifying rows materialized for an ORDER BY working set.
+const size_t kSqlMaxSortRows = 100000u;
 
 // ---------------------------------------------------------------------------
 // Error taxonomy (SQL4 section 20).
@@ -131,6 +156,20 @@ enum class SqlTokenKind {
     Blob,
     True,
     False,
+    // SQL5 predicate and mutation keywords.
+    Where,
+    Update,
+    Set,
+    Delete,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Limit,
+    Offset,
+    And,
+    Or,
+    Is,
     // Literals.
     Identifier,
     IntegerLiteral,
@@ -143,6 +182,13 @@ enum class SqlTokenKind {
     RightParen,
     Semicolon,
     Star,
+    // SQL5 comparison operators.
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // End of input.
     EndOfInput
 };

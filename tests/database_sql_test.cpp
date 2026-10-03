@@ -9,6 +9,7 @@
 // driven transaction can be interrupted around the commit durability point and
 // still recover to exactly the pre-state or the post-state.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +37,7 @@
 #include "database_relational.h"
 #include "database_schema.h"
 #include "database_sql.h"
+#include "database_sql_expr.h"
 #include "database_sql_parser.h"
 #include "database_sql_token.h"
 #include "database_sql_tokenizer.h"
@@ -323,6 +325,118 @@ bool verifySequential(const std::string& path, const std::string& table,
         ++index;
     }
     if (index != expectedCount || !scan->status().isOk()) {
+        ok = false;
+    }
+    db->close();
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// SQL5 helpers.
+
+std::unique_ptr<Database> newDbWithPageSize(const std::string& path, uint32_t pageSize) {
+    DatabaseCreateOptions options;
+    options.pageSize = pageSize;
+    std::unique_ptr<Database> db;
+    if (!Database::create(path, options, db).isOk()) {
+        return nullptr;
+    }
+    return db;
+}
+
+bool execOk(SqlEngine& engine, const std::string& sql) {
+    SqlExecutionResult result = engine.execute(sql);
+    return result.ok;
+}
+
+bool execAffected(SqlEngine& engine, const std::string& sql, uint64_t& affected) {
+    SqlExecutionResult result = engine.execute(sql);
+    if (!result.ok || result.statements.empty()) {
+        return false;
+    }
+    affected = result.statements[0].affectedRows;
+    return true;
+}
+
+// Returns the row count of a SELECT, or sets `ok` false on any failure.
+uint64_t execRowCount(SqlEngine& engine, const std::string& sql, bool& ok) {
+    SqlExecutionResult result = engine.execute(sql);
+    ok = result.ok && !result.statements.empty();
+    if (!ok) {
+        return 0;
+    }
+    return result.statements[0].resultSet.rowCount();
+}
+
+// Builds a table Crash (Id INT64 NOT NULL, Tag TEXT NOT NULL, Flag BOOLEAN NOT
+// NULL) with rows 0..count-1, every row carrying the same `tag`. Batches
+// inserts into explicit transactions so a large table never hits the
+// transaction page limit while being built.
+bool buildTagTable(const std::string& path, uint64_t count, const std::string& tag) {
+    std::unique_ptr<Database> db = newDb(path);
+    if (!db) {
+        return false;
+    }
+    SqlEngine engine(*db);
+    if (!execOk(engine, "CREATE TABLE Crash (Id INT64 NOT NULL, Tag TEXT NOT NULL, "
+                        "Flag BOOLEAN NOT NULL);")) {
+        db->close();
+        return false;
+    }
+    uint64_t inserted = 0;
+    while (inserted < count) {
+        std::string script = "BEGIN;\n";
+        for (uint64_t i = 0; i < 250 && inserted < count; ++i, ++inserted) {
+            script += "INSERT INTO Crash VALUES (";
+            script += std::to_string(static_cast<unsigned long long>(inserted));
+            script += ", '";
+            script += tag;
+            script += "', ";
+            script += (inserted % 2 == 0) ? "TRUE" : "FALSE";
+            script += ");\n";
+        }
+        script += "COMMIT;\n";
+        if (!execOk(engine, script)) {
+            db->close();
+            return false;
+        }
+    }
+    DbResult flushed = db->flush();
+    DbResult closed = db->close();
+    return flushed.isOk() && closed.isOk();
+}
+
+// Verifies every row of Crash has Tag == expectedTag, the expected count, and
+// consistent Flag values.
+bool verifyTagTable(const std::string& path, const std::string& expectedTag,
+                    uint64_t expectedCount) {
+    std::unique_ptr<Database> db;
+    if (!Database::open(path, DatabaseOpenOptions(), db).isOk() || !db) {
+        return false;
+    }
+    std::unique_ptr<Table> table;
+    if (!db->openTable("Crash", table).isOk()) {
+        db->close();
+        return false;
+    }
+    if (table->rowCount() != expectedCount) {
+        db->close();
+        return false;
+    }
+    std::unique_ptr<TableScan> scan;
+    table->scanStart(scan);
+    std::vector<DbValue> row;
+    uint64_t seen = 0;
+    bool ok = true;
+    while (scan->next(row)) {
+        if (row.size() != 3 || row[1].textValue() != expectedTag ||
+            row[2].booleanValue() != (static_cast<uint64_t>(row[0].int64Value()) % 2 == 0)) {
+            ok = false;
+            break;
+        }
+        ++seen;
+    }
+    if (seen != expectedCount || !scan->status().isOk()) {
         ok = false;
     }
     db->close();
@@ -1469,11 +1583,1664 @@ void testResultSetMetadata() {
     removeFile(path);
 }
 
+// ---------------------------------------------------------------------------
+// SQL5: tokenizer, parser, precedence (sections 2-6, 48).
+
+std::vector<int64_t> collectIds(const SqlResultSet& rs) {
+    std::vector<int64_t> ids;
+    for (size_t i = 0; i < rs.rowCount(); ++i) {
+        ids.push_back(rs.row(i)[0].int64Value());
+    }
+    return ids;
+}
+
+bool checkIds(SqlEngine& engine, const std::string& sql,
+              const std::vector<int64_t>& expected) {
+    SqlExecutionResult result = engine.execute(sql);
+    if (!result.ok || result.statements.empty()) {
+        return false;
+    }
+    return collectIds(result.statements[0].resultSet) == expected;
+}
+
+void testSql5Tokenizer() {
+    std::printf("SQL5 tokenizer: predicate keywords and operators\n");
+    {
+        std::vector<SqlToken> tokens;
+        CHECK(tokenizeOk("WHERE UPDATE SET DELETE ORDER BY ASC DESC LIMIT OFFSET "
+                         "AND OR NOT IS NULL TRUE FALSE",
+                         tokens));
+        CHECK(tokens.size() == 18);
+        CHECK(tokens[0].kind == SqlTokenKind::Where);
+        CHECK(tokens[1].kind == SqlTokenKind::Update);
+        CHECK(tokens[2].kind == SqlTokenKind::Set);
+        CHECK(tokens[3].kind == SqlTokenKind::Delete);
+        CHECK(tokens[4].kind == SqlTokenKind::Order);
+        CHECK(tokens[5].kind == SqlTokenKind::By);
+        CHECK(tokens[6].kind == SqlTokenKind::Asc);
+        CHECK(tokens[7].kind == SqlTokenKind::Desc);
+        CHECK(tokens[8].kind == SqlTokenKind::Limit);
+        CHECK(tokens[9].kind == SqlTokenKind::Offset);
+        CHECK(tokens[10].kind == SqlTokenKind::And);
+        CHECK(tokens[11].kind == SqlTokenKind::Or);
+        CHECK(tokens[12].kind == SqlTokenKind::Not);
+        CHECK(tokens[13].kind == SqlTokenKind::Is);
+        CHECK(tokens[14].kind == SqlTokenKind::Null);
+        CHECK(tokens[15].kind == SqlTokenKind::True);
+        CHECK(tokens[16].kind == SqlTokenKind::False);
+    }
+    {
+        std::vector<SqlToken> tokens;
+        CHECK(tokenizeOk("= <> != < <= > >=", tokens));
+        CHECK(tokens.size() == 8);
+        CHECK(tokens[0].kind == SqlTokenKind::Eq);
+        CHECK(tokens[1].kind == SqlTokenKind::Ne);
+        CHECK(tokens[2].kind == SqlTokenKind::Ne);
+        CHECK(tokens[3].kind == SqlTokenKind::Lt);
+        CHECK(tokens[4].kind == SqlTokenKind::Le);
+        CHECK(tokens[5].kind == SqlTokenKind::Gt);
+        CHECK(tokens[6].kind == SqlTokenKind::Ge);
+    }
+    CHECK(tokenizeFails("!", SqlErrorCode::TokenizerError));
+    CHECK(tokenizeFails("! =", SqlErrorCode::TokenizerError));
+}
+
+void testSql5Parser() {
+    std::printf("SQL5 parser: predicates, ORDER BY, LIMIT/OFFSET, UPDATE, DELETE\n");
+    {
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("SELECT * FROM Users WHERE Id >= 10 ORDER BY Name ASC, Id "
+                       "DESC LIMIT 25 OFFSET 50;",
+                       statement, error));
+        CHECK(statement.type == SqlStatementType::Select);
+        CHECK(statement.select.where.present);
+        CHECK(statement.select.where.root >= 0);
+        CHECK(statement.select.orderBy.size() == 2);
+        CHECK(statement.select.orderBy[0].column.name == "Name");
+        CHECK(!statement.select.orderBy[0].descending);
+        CHECK(statement.select.orderBy[1].column.name == "Id");
+        CHECK(statement.select.orderBy[1].descending);
+        CHECK(statement.select.hasLimit && statement.select.limit == 25);
+        CHECK(statement.select.hasOffset && statement.select.offset == 50);
+    }
+    {
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("UPDATE Users SET Name = 'Alice Smith', Enabled = TRUE WHERE "
+                       "Id = 1;",
+                       statement, error));
+        CHECK(statement.type == SqlStatementType::Update);
+        CHECK(statement.update.table.name == "Users");
+        CHECK(statement.update.assignments.size() == 2);
+        CHECK(statement.update.assignments[0].column.name == "Name");
+        CHECK(statement.update.assignments[0].value.kind == SqlLiteralKind::String);
+        CHECK(statement.update.assignments[1].column.name == "Enabled");
+        CHECK(statement.update.where.present);
+    }
+    {
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("UPDATE Users SET Enabled = FALSE;", statement, error));
+        CHECK(statement.type == SqlStatementType::Update);
+        CHECK(!statement.update.where.present);
+    }
+    {
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("DELETE FROM Users WHERE Enabled = FALSE;", statement, error));
+        CHECK(statement.type == SqlStatementType::Delete);
+        CHECK(statement.deleteStatement.table.name == "Users");
+        CHECK(statement.deleteStatement.where.present);
+        CHECK(parseOne("DELETE FROM TempRows;", statement, error));
+        CHECK(statement.type == SqlStatementType::Delete);
+        CHECK(!statement.deleteStatement.where.present);
+    }
+    {
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("SELECT * FROM T OFFSET 100;", statement, error));
+        CHECK(!statement.select.hasLimit);
+        CHECK(statement.select.hasOffset && statement.select.offset == 100);
+        CHECK(parseOne("SELECT * FROM T WHERE A IS NOT NULL;", statement, error));
+        CHECK(parseOne("SELECT * FROM T WHERE A IS NULL;", statement, error));
+    }
+}
+
+void testSql5Precedence() {
+    std::printf("SQL5 precedence\n");
+    {
+        // A = 1 OR B = 2 AND C = 3  ==  A = 1 OR (B = 2 AND C = 3)
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("SELECT * FROM T WHERE A = 1 OR B = 2 AND C = 3;", statement,
+                       error));
+        const std::vector<SqlExprNode>& nodes = statement.select.where.nodes;
+        const int32_t root = statement.select.where.root;
+        CHECK(root >= 0 && nodes[root].kind == SqlExprKind::Or);
+        if (root >= 0) {
+            const SqlExprNode& orNode = nodes[static_cast<size_t>(root)];
+            CHECK(orNode.left >= 0 && nodes[orNode.left].kind == SqlExprKind::Compare);
+            CHECK(orNode.right >= 0 && nodes[orNode.right].kind == SqlExprKind::And);
+        }
+    }
+    {
+        // NOT A = 1 AND B = 2  ==  (NOT (A = 1)) AND (B = 2)
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("SELECT * FROM T WHERE NOT A = 1 AND B = 2;", statement, error));
+        const std::vector<SqlExprNode>& nodes = statement.select.where.nodes;
+        const int32_t root = statement.select.where.root;
+        CHECK(root >= 0 && nodes[root].kind == SqlExprKind::And);
+        if (root >= 0) {
+            const SqlExprNode& andNode = nodes[static_cast<size_t>(root)];
+            CHECK(andNode.left >= 0 && nodes[andNode.left].kind == SqlExprKind::Not);
+            CHECK(andNode.right >= 0 && nodes[andNode.right].kind == SqlExprKind::Compare);
+        }
+    }
+    {
+        // Parenthesized grouping overrides precedence.
+        SqlStatementAst statement;
+        SqlError error;
+        CHECK(parseOne("SELECT * FROM T WHERE (A = 1 OR B = 2) AND C = 3;", statement,
+                       error));
+        const std::vector<SqlExprNode>& nodes = statement.select.where.nodes;
+        const int32_t root = statement.select.where.root;
+        CHECK(root >= 0 && nodes[root].kind == SqlExprKind::And);
+        if (root >= 0) {
+            const SqlExprNode& andNode = nodes[static_cast<size_t>(root)];
+            CHECK(andNode.left >= 0 && nodes[andNode.left].kind == SqlExprKind::Or);
+        }
+    }
+}
+
+void testSql5HostileInput() {
+    std::printf("SQL5 hostile and malformed input\n");
+    CHECK(parseFails("SELECT * FROM T WHERE;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T WHERE AND;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T WHERE (;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T WHERE A =;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T WHERE A IS;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T WHERE A IS NOT;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T ORDER;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T ORDER BY;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T ORDER BY A,;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T LIMIT;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T LIMIT -1;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T OFFSET;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("SELECT * FROM T OFFSET -5;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("UPDATE;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("UPDATE T;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("UPDATE T SET;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("UPDATE T SET A;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("UPDATE T SET A =;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("DELETE;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("DELETE T;", SqlErrorCode::SyntaxError));
+    CHECK(parseFails("DELETE FROM;", SqlErrorCode::SyntaxError));
+
+    // Excessive nesting fails with ResourceLimit, not a stack overflow.
+    std::string deep = "SELECT * FROM T WHERE " + std::string(100, '(') + "A = 1" +
+                       std::string(100, ')') + ";";
+    CHECK(parseFails(deep, SqlErrorCode::ResourceLimit));
+
+    // Excessive expression node count is bounded independently of depth.
+    std::string many = "SELECT * FROM T WHERE A = 1";
+    for (int i = 0; i < 3000; ++i) {
+        many += " OR A = 1";
+    }
+    many += ";";
+    CHECK(parseFails(many, SqlErrorCode::ResourceLimit));
+
+    // Massive assignment list and ORDER BY list are bounded.
+    std::string updates = "UPDATE T SET ";
+    for (int i = 0; i < 80; ++i) {
+        if (i != 0) updates += ", ";
+        updates += "A = 1";
+    }
+    updates += ";";
+    CHECK(parseFails(updates, SqlErrorCode::ResourceLimit));
+
+    std::string orders = "SELECT * FROM T ORDER BY ";
+    for (int i = 0; i < 80; ++i) {
+        if (i != 0) orders += ", ";
+        orders += "A";
+    }
+    orders += ";";
+    CHECK(parseFails(orders, SqlErrorCode::ResourceLimit));
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: three-valued logic (sections 8-10, 37).
+
+void testThreeValuedLogic() {
+    std::printf("SQL5 three-valued logic truth tables\n");
+    const SqlTruth T = SqlTruth::True;
+    const SqlTruth F = SqlTruth::False;
+    const SqlTruth U = SqlTruth::Unknown;
+
+    CHECK(sqlTruthAnd(F, U) == F);
+    CHECK(sqlTruthAnd(U, F) == F);
+    CHECK(sqlTruthAnd(T, U) == U);
+    CHECK(sqlTruthAnd(U, T) == U);
+    CHECK(sqlTruthAnd(T, T) == T);
+    CHECK(sqlTruthAnd(F, F) == F);
+    CHECK(sqlTruthAnd(T, F) == F);
+    CHECK(sqlTruthAnd(U, U) == U);
+
+    CHECK(sqlTruthOr(T, U) == T);
+    CHECK(sqlTruthOr(U, T) == T);
+    CHECK(sqlTruthOr(F, U) == U);
+    CHECK(sqlTruthOr(U, F) == U);
+    CHECK(sqlTruthOr(T, F) == T);
+    CHECK(sqlTruthOr(F, F) == F);
+    CHECK(sqlTruthOr(U, U) == U);
+
+    CHECK(sqlTruthNot(U) == U);
+    CHECK(sqlTruthNot(T) == F);
+    CHECK(sqlTruthNot(F) == T);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: SELECT predicates (sections 7, 9, 11, 31, 32, 36).
+
+void testSql5Predicates() {
+    std::printf("SQL5 SELECT WHERE predicates\n");
+    const std::string path = uniquePath("sql5pred");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, "
+                             "Enabled BOOLEAN NOT NULL, Note TEXT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (1, 'Alice', TRUE, NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (2, 'Bob', FALSE, 'x');"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (3, 'Carol', TRUE, 'y');"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (4, 'Dave', TRUE, NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (5, 'Eve', FALSE, NULL);"));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id = 2;", {2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id <> 2;", {1, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id != 2;", {1, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id < 3;", {1, 2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id <= 3;", {1, 2, 3}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id > 3;", {4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Id >= 3;", {3, 4, 5}));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name = 'Alice';", {1}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name <> 'Alice';",
+                       {2, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name < 'C';", {1, 2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name >= 'D';", {4, 5}));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Enabled = TRUE;", {1, 3, 4}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Enabled <> FALSE;",
+                       {1, 3, 4}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Enabled;", {1, 3, 4}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE NOT Enabled;", {2, 5}));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Note IS NULL;", {1, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Note IS NOT NULL;", {2, 3}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Note = NULL;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Note <> NULL;", {}));
+
+        CHECK(checkIds(engine,
+                       "SELECT Id FROM Users WHERE (Enabled = TRUE AND Id >= 3) OR "
+                       "Name = 'Alice';",
+                       {1, 3, 4}));
+        CHECK(checkIds(engine,
+                       "SELECT Id FROM Users WHERE Enabled = TRUE AND (Id < 2 OR Id >= "
+                       "4) AND Note IS NOT NULL;",
+                       {}));
+
+        // Unknown column and invalid comparison semantics fail before scanning.
+        SqlExecutionResult result =
+            engine.execute("SELECT * FROM Users WHERE DoesNotExist = 3;");
+        CHECK(!result.ok);
+        CHECK(result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("SELECT * FROM Users WHERE Enabled < TRUE;");
+        CHECK(!result.ok);
+        CHECK(result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("SELECT * FROM Users WHERE Name = 3;");
+        CHECK(!result.ok);
+        CHECK(result.error.code == SqlErrorCode::SemanticError);
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+void testSql5NullAndBlobPredicates() {
+    std::printf("SQL5 NULL and BLOB predicate semantics\n");
+    const std::string path = uniquePath("sql5null");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Notes (Id INT64 NOT NULL, Body TEXT NULL, "
+                             "Data BLOB NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Notes VALUES (1, NULL, NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Notes VALUES (2, 'body', X'01');"));
+        CHECK(execOk(engine, "INSERT INTO Notes VALUES (3, NULL, X'02');"));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Notes WHERE Body IS NULL;", {1, 3}));
+        CHECK(checkIds(engine, "SELECT Id FROM Notes WHERE Body IS NOT NULL;", {2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Notes WHERE Data = X'01';", {2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Notes WHERE Data <> X'01';", {3}));
+        CHECK(checkIds(engine, "SELECT Id FROM Notes WHERE Data = NULL;", {}));
+
+        SqlExecutionResult result =
+            engine.execute("SELECT * FROM Notes WHERE Data < X'01';");
+        CHECK(!result.ok);
+        CHECK(result.error.code == SqlErrorCode::SemanticError);
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: comparison typing and numeric promotion (section 11).
+
+void testSql5ComparisonTyping() {
+    std::printf("SQL5 comparison typing and promotion\n");
+    const std::string path = uniquePath("sql5types");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Nums (Id INT64 NOT NULL, Small INT32 NOT NULL, "
+                             "Big INT64 NOT NULL, Real FLOAT64 NOT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Nums VALUES (1, 10, 9007199254740992, 1.5);"));
+        CHECK(execOk(engine, "INSERT INTO Nums VALUES (2, 20, 9007199254740993, 2.5);"));
+
+        // Int32 vs Int64 promotion.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Small = 10;", {1}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Small < 15;", {1}));
+        // An out-of-range Int32 literal is a valid Int64 comparison, not an error.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Small = 9999999999;", {}));
+        // Int64 comparisons are exact.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Big = 9007199254740992;", {1}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Big = 9007199254740993;", {2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Big > 9007199254740992;", {2}));
+        // Int64 -> Float64 promotion rounds; 2^53 and 2^53+1 are both 2^53 as
+        // doubles, so both rows match an exact 2^53.0 literal.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Big = 9007199254740992.0;",
+                       {1, 2}));
+        // Float64 ordering.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Real > 2.0;", {2}));
+        // Mixed Int64 vs Float64 column comparison.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE Big = Real;", {}));
+
+        // Boolean literal predicates.
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE TRUE;", {1, 2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE FALSE;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE NULL;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE NULL IS NULL;", {1, 2}));
+        CHECK(checkIds(engine, "SELECT Id FROM Nums WHERE NULL IS NOT NULL;", {}));
+
+        // Assignment type rules.
+        SqlExecutionResult result =
+            engine.execute("UPDATE Nums SET Small = 9999999999 WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Nums SET Big = 1.5 WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        CHECK(execOk(engine, "UPDATE Nums SET Real = 1 WHERE Id = 1;"));
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: ORDER BY (sections 13, 14, 38).
+
+void testSql5OrderBy() {
+    std::printf("SQL5 ORDER BY semantics\n");
+    const std::string path = uniquePath("sql5order");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Ord (Id INT64 NOT NULL, Name TEXT NOT NULL, "
+                             "Score INT32 NULL, Enabled BOOLEAN NOT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (1, 'b', 10, TRUE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (2, 'a', 10, FALSE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (3, 'c', NULL, TRUE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (4, 'a', -5, TRUE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (5, '', 10, FALSE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (6, 'b', NULL, FALSE);"));
+        CHECK(execOk(engine, "INSERT INTO Ord VALUES (7, 'a', 3, TRUE);"));
+
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Id;", {1, 2, 3, 4, 5, 6, 7}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Id ASC;",
+                       {1, 2, 3, 4, 5, 6, 7}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Id DESC;",
+                       {7, 6, 5, 4, 3, 2, 1}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Name ASC;",
+                       {5, 2, 4, 7, 1, 6, 3}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Name ASC, Id DESC;",
+                       {5, 7, 4, 2, 6, 1, 3}));
+        // ASC: NULLs before non-NULL; DESC: NULLs after non-NULL.
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Score ASC;",
+                       {3, 6, 4, 7, 1, 2, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Score DESC;",
+                       {1, 2, 5, 7, 4, 3, 6}));
+        CHECK(checkIds(engine, "SELECT Id FROM Ord ORDER BY Enabled DESC, Name ASC;",
+                       {4, 7, 1, 3, 5, 2, 6}));
+        // ORDER BY a column that is not projected.
+        {
+            SqlExecutionResult r =
+                engine.execute("SELECT Name FROM Ord ORDER BY Id DESC;");
+            CHECK(r.ok);
+            if (r.ok) {
+                const SqlResultSet& rs = r.statements[0].resultSet;
+                CHECK(rs.columnCount() == 1);
+                CHECK(rs.rowCount() == 7);
+                if (rs.rowCount() == 7) {
+                    CHECK_TEXT(rs.row(0)[0], "a"); // Id 7
+                    CHECK_TEXT(rs.row(6)[0], "b"); // Id 1
+                }
+            }
+        }
+        // BLOB ordering is rejected.
+        CHECK(execOk(engine, "CREATE TABLE Blobs (Id INT64 NOT NULL, Data BLOB NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Blobs VALUES (1, X'01');"));
+        SqlExecutionResult result =
+            engine.execute("SELECT Id FROM Blobs ORDER BY Data;");
+        CHECK(!result.ok);
+        CHECK(result.error.code == SqlErrorCode::SemanticError);
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: LIMIT / OFFSET (sections 15, 16, 39).
+
+void testSql5LimitOffset() {
+    std::printf("SQL5 LIMIT/OFFSET semantics\n");
+    const std::string path = uniquePath("sql5limit");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE L (Id INT64 NOT NULL);"));
+        for (int i = 1; i <= 5; ++i) {
+            CHECK(execOk(engine, "INSERT INTO L VALUES (" + std::to_string(i) + ");"));
+        }
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 0;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 1;", {1}));
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 10;", {1, 2, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM L OFFSET 0;", {1, 2, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM L OFFSET 3;", {4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 2 OFFSET 1;", {2, 3}));
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 5 OFFSET 0;", {1, 2, 3, 4, 5}));
+        CHECK(checkIds(engine, "SELECT Id FROM L OFFSET 5;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM L OFFSET 6;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM L LIMIT 2 OFFSET 10;", {}));
+        // WHERE and ORDER BY are applied before LIMIT/OFFSET.
+        CHECK(checkIds(engine, "SELECT Id FROM L WHERE Id > 2 LIMIT 2;", {3, 4}));
+        CHECK(checkIds(engine, "SELECT Id FROM L ORDER BY Id DESC LIMIT 2;", {5, 4}));
+        CHECK(checkIds(engine, "SELECT Id FROM L ORDER BY Id DESC LIMIT 3 OFFSET 2;",
+                       {3, 2, 1}));
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: UPDATE (sections 17, 18, 40).
+
+void testSql5Update() {
+    std::printf("SQL5 UPDATE behavior\n");
+    const std::string path = uniquePath("sql5update");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, "
+                             "Enabled BOOLEAN NOT NULL, Note TEXT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (1, 'Alice', TRUE, NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (2, 'Bob', TRUE, 'b');"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (3, 'Carol', FALSE, NULL);"));
+
+        uint64_t affected = 0;
+        CHECK(execAffected(engine, "UPDATE Users SET Enabled = FALSE WHERE Id = 42;",
+                           affected));
+        CHECK(affected == 0);
+
+        CHECK(execAffected(engine, "UPDATE Users SET Enabled = FALSE WHERE Id = 1;",
+                           affected));
+        CHECK(affected == 1);
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Enabled = FALSE;", {1, 3}));
+
+        // Multiple assigned columns.
+        CHECK(execAffected(engine,
+                           "UPDATE Users SET Name = 'Alice Smith', Note = 'n' WHERE Id "
+                           "= 1;",
+                           affected));
+        CHECK(affected == 1);
+        {
+            SqlExecutionResult r = engine.execute(
+                "SELECT Name, Note FROM Users WHERE Id = 1;");
+            CHECK(r.ok);
+            if (r.ok && r.statements[0].resultSet.rowCount() == 1) {
+                CHECK_TEXT(r.statements[0].resultSet.row(0)[0], "Alice Smith");
+                CHECK_TEXT(r.statements[0].resultSet.row(0)[1], "n");
+            }
+        }
+
+        // Update all rows without WHERE.
+        CHECK(execAffected(engine, "UPDATE Users SET Note = NULL;", affected));
+        CHECK(affected == 3);
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Note IS NOT NULL;", {}));
+
+        // Validation failures.
+        SqlExecutionResult result =
+            engine.execute("UPDATE Users SET Missing = 1 WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Users SET Name = 'x', Name = 'y' WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Users SET Name = NULL WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Users SET Id = 'x' WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Users SET Enabled = 1 WHERE Id = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+        result = engine.execute("UPDATE Users SET Name = 'x' WHERE Missing = 1;");
+        CHECK(!result.ok && result.error.code == SqlErrorCode::SemanticError);
+
+        // Explicit transaction commit and rollback.
+        CHECK(execOk(engine, "BEGIN;"));
+        CHECK(execOk(engine, "UPDATE Users SET Name = 'Tx' WHERE Id = 2;"));
+        {
+            SqlExecutionResult r =
+                engine.execute("SELECT Name FROM Users WHERE Id = 2;");
+            CHECK(r.ok && r.statements[0].resultSet.rowCount() == 1);
+            if (r.ok && r.statements[0].resultSet.rowCount() == 1) {
+                CHECK_TEXT(r.statements[0].resultSet.row(0)[0], "Tx");
+            }
+        }
+        CHECK(execOk(engine, "ROLLBACK;"));
+        CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name = 'Tx';", {}));
+
+        CHECK(execOk(engine, "BEGIN;"));
+        CHECK(execOk(engine, "UPDATE Users SET Name = 'Committed' WHERE Id = 2;"));
+        CHECK(execOk(engine, "COMMIT;"));
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            SqlEngine engine(*reopened);
+            CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name = 'Committed';",
+                           {2}));
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("Users", table), DbStatus::Ok);
+            CHECK(table->rowCount() == 3);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: DELETE (sections 19, 41).
+
+void testSql5Delete() {
+    std::printf("SQL5 DELETE behavior\n");
+    const std::string path = uniquePath("sql5delete");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, "
+                             "Note TEXT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (1, 'Alice', NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (2, 'Bob', 'b');"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (3, 'Carol', NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (4, 'Dave', 'd');"));
+
+        uint64_t affected = 0;
+        CHECK(execAffected(engine, "DELETE FROM Users WHERE Id = 99;", affected));
+        CHECK(affected == 0);
+
+        CHECK(execAffected(engine, "DELETE FROM Users WHERE Note IS NULL;", affected));
+        CHECK(affected == 2);
+        CHECK(checkIds(engine, "SELECT Id FROM Users;", {2, 4}));
+
+        // Explicit rollback restores deleted rows.
+        CHECK(execOk(engine, "BEGIN;"));
+        CHECK(execAffected(engine, "DELETE FROM Users WHERE Id = 2;", affected));
+        CHECK(affected == 1);
+        CHECK(checkIds(engine, "SELECT Id FROM Users;", {4}));
+        CHECK(execOk(engine, "ROLLBACK;"));
+        CHECK(checkIds(engine, "SELECT Id FROM Users;", {2, 4}));
+
+        // Delete all without WHERE, then delete from an already-empty table.
+        CHECK(execOk(engine, "BEGIN;"));
+        CHECK(execAffected(engine, "DELETE FROM Users;", affected));
+        CHECK(affected == 2);
+        CHECK(execOk(engine, "COMMIT;"));
+        CHECK(execAffected(engine, "DELETE FROM Users;", affected));
+        CHECK(affected == 0);
+        CHECK(checkIds(engine, "SELECT Id FROM Users;", {}));
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("Users", table), DbStatus::Ok);
+            CHECK(table->rowCount() == 0);
+            // The schema survives deleting every row.
+            CHECK(table->columnCount() == 3);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: read-your-writes after UPDATE/DELETE (sections 29, 30).
+
+void testSql5ReadYourWrites() {
+    std::printf("SQL5 read-your-writes after UPDATE/DELETE\n");
+    const std::string path = uniquePath("sql5ryw");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL);"));
+        CHECK(execOk(engine, "INSERT INTO Users VALUES (7, 'Original');"));
+
+        SqlExecutionResult result = engine.execute(
+            "BEGIN;\n"
+            "UPDATE Users SET Name = 'Changed' WHERE Id = 7;\n"
+            "SELECT Name FROM Users WHERE Id = 7;\n"
+            "ROLLBACK;\n");
+        CHECK(result.ok);
+        CHECK(result.statements.size() == 4);
+        if (result.statements.size() == 4) {
+            const SqlResultSet& rs = result.statements[2].resultSet;
+            CHECK(rs.rowCount() == 1);
+            if (rs.rowCount() == 1) {
+                CHECK_TEXT(rs.row(0)[0], "Changed");
+            }
+        }
+
+        result = engine.execute(
+            "BEGIN;\n"
+            "DELETE FROM Users WHERE Id = 7;\n"
+            "SELECT * FROM Users WHERE Id = 7;\n"
+            "ROLLBACK;\n");
+        CHECK(result.ok);
+        CHECK(result.statements.size() == 4);
+        if (result.statements.size() == 4) {
+            CHECK(result.statements[2].resultSet.rowCount() == 0);
+        }
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            SqlEngine engine(*reopened);
+            CHECK(checkIds(engine, "SELECT Id FROM Users WHERE Name = 'Original';",
+                           {7}));
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: variable-width UPDATE relocation stress (sections 23, 33).
+
+void testSql5UpdateRelocation() {
+    std::printf("SQL5 variable-width UPDATE relocation\n");
+    const std::string path = uniquePath("sql5reloc");
+
+    std::string big;
+    while (big.size() < 400) {
+        big += "0123456789";
+    }
+
+    {
+        std::unique_ptr<Database> db = newDbWithPageSize(path, 512);
+        CHECK(db != nullptr);
+        if (!db) return;
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Reloc (Id INT64 NOT NULL, Body TEXT NOT NULL);"));
+
+        std::string script = "BEGIN;\n";
+        for (int i = 0; i < 40; ++i) {
+            script += "INSERT INTO Reloc VALUES (";
+            script += std::to_string(i);
+            script += ", 'small";
+            script += std::to_string(i);
+            script += "');\n";
+        }
+        script += "COMMIT;\n";
+        CHECK(execOk(engine, script));
+
+        // Same-page rewrite: a small change that still fits the original page.
+        uint64_t affected = 0;
+        CHECK(execAffected(engine,
+                           "UPDATE Reloc SET Body = 'rewritten' WHERE Id = 5;",
+                           affected));
+        CHECK(affected == 1);
+        CHECK(checkIds(engine, "SELECT Id FROM Reloc WHERE Body = 'rewritten';", {5}));
+
+        // Expand half the rows; each expanded row no longer fits its old page.
+        affected = 0;
+        CHECK(execAffected(engine,
+                           "UPDATE Reloc SET Body = '" + big + "' WHERE Id < 20;",
+                           affected));
+        CHECK(affected == 20);
+
+        // Commit path: exactly one version per row, count unchanged.
+        std::unique_ptr<Table> table;
+        CHECK_STATUS(db->openTable("Reloc", table), DbStatus::Ok);
+        CHECK(table->rowCount() == 40);
+        CHECK(table->heapPageCount() > 1);
+
+        SqlExecutionResult r = engine.execute("SELECT Body FROM Reloc WHERE Id = 5;");
+        CHECK(r.ok && r.statements[0].resultSet.rowCount() == 1);
+        if (r.ok && r.statements[0].resultSet.rowCount() == 1) {
+            CHECK_TEXT(r.statements[0].resultSet.row(0)[0], big);
+        }
+        CHECK(checkIds(engine, "SELECT Id FROM Reloc WHERE Body = 'small39';", {39}));
+        CHECK(checkIds(engine,
+                       "SELECT Id FROM Reloc WHERE Body = '" + big + "' ORDER BY Id;",
+                       {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                        19}));
+
+        // Rollback path: original values restored.
+        CHECK(execOk(engine, "BEGIN;"));
+        CHECK(execAffected(engine,
+                           "UPDATE Reloc SET Body = 'rolled' WHERE Id >= 20;",
+                           affected));
+        CHECK(affected == 20);
+        CHECK(execOk(engine, "ROLLBACK;"));
+        CHECK(checkIds(engine, "SELECT Id FROM Reloc WHERE Body = 'rolled';", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Reloc WHERE Body = 'small39';", {39}));
+
+        CHECK_STATUS(db->close(), DbStatus::Ok);
+    }
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            SqlEngine engine(*reopened);
+            CHECK(checkIds(engine,
+                           "SELECT Id FROM Reloc WHERE Body = '" + big +
+                               "' ORDER BY Id;",
+                           {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                            18, 19}));
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("Reloc", table), DbStatus::Ok);
+            CHECK(table->rowCount() == 40);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: DELETE compaction stress (sections 22, 34).
+
+void testSql5DeleteCompaction() {
+    std::printf("SQL5 multi-page DELETE compaction\n");
+    const std::string path = uniquePath("sql5compact");
+    const int kRows = 200;
+    std::unique_ptr<Database> db = newDbWithPageSize(path, 512);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Del (Id INT64 NOT NULL, Tag TEXT NOT NULL);"));
+        std::string script = "BEGIN;\n";
+        for (int i = 0; i < kRows; ++i) {
+            script += "INSERT INTO Del VALUES (";
+            script += std::to_string(i);
+            script += ", 't";
+            script += std::to_string(i);
+            script += "');\n";
+        }
+        script += "COMMIT;\n";
+        CHECK(execOk(engine, script));
+
+        std::unique_ptr<Table> table;
+        CHECK_STATUS(db->openTable("Del", table), DbStatus::Ok);
+        CHECK(table->heapPageCount() > 2);
+
+        uint64_t affected = 0;
+        CHECK(execAffected(engine, "DELETE FROM Del WHERE Id = 0;", affected));
+        CHECK(affected == 1);
+        CHECK(execAffected(engine, "DELETE FROM Del WHERE Id = 199;", affected));
+        CHECK(affected == 1);
+
+        // Delete every second row.
+        std::string evens = "DELETE FROM Del WHERE ";
+        bool first = true;
+        for (int i = 2; i < kRows - 1; i += 2) {
+            if (!first) evens += " OR ";
+            first = false;
+            evens += "Id = " + std::to_string(i);
+        }
+        evens += ";";
+        CHECK(execAffected(engine, evens, affected));
+        CHECK(affected == 99);
+
+        // Delete a contiguous range spanning multiple pages.
+        CHECK(execAffected(engine, "DELETE FROM Del WHERE Id >= 100 AND Id < 150;",
+                           affected));
+        CHECK(affected == 25);
+        CHECK(checkIds(engine, "SELECT Id FROM Del WHERE Id = 100;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Del WHERE Id = 101;", {}));
+        CHECK(checkIds(engine, "SELECT Id FROM Del WHERE Id = 99;", {99}));
+        CHECK(checkIds(engine, "SELECT Id FROM Del WHERE Id = 151;", {151}));
+
+        // Delete all remaining rows.
+        CHECK(execAffected(engine, "DELETE FROM Del;", affected));
+        CHECK(affected > 0);
+        CHECK(checkIds(engine, "SELECT Id FROM Del;", {}));
+
+        // Empty table remains queryable.
+        CHECK(execAffected(engine, "DELETE FROM Del;", affected));
+        CHECK(affected == 0);
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("Del", table), DbStatus::Ok);
+            CHECK(table->rowCount() == 0);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: statement-failure atomicity inside an explicit transaction
+// (sections 26, 42).
+
+void testSql5StatementAtomicity() {
+    std::printf("SQL5 statement-failure atomicity (explicit transaction)\n");
+    const std::string path = uniquePath("sql5atomic");
+    const uint64_t kRows = 4200;
+    std::string big;
+    while (big.size() < 400) {
+        big += "abcdefghij";
+    }
+    std::string big2;
+    while (big2.size() < 400) {
+        big2 += "ZYXWVUTSRQ";
+    }
+
+    std::unique_ptr<Database> db = newDbWithPageSize(path, 512);
+    CHECK(db != nullptr);
+    if (!db) return;
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE Atomic (Id INT64 NOT NULL, Tag TEXT NOT NULL);"));
+
+        uint64_t inserted = 0;
+        while (inserted < kRows) {
+            std::string script = "BEGIN;\n";
+            for (uint64_t i = 0; i < 250 && inserted < kRows; ++i, ++inserted) {
+                script += "INSERT INTO Atomic VALUES (";
+                script += std::to_string(static_cast<unsigned long long>(inserted));
+                script += ", '" + big + "');\n";
+            }
+            script += "COMMIT;\n";
+            CHECK(execOk(engine, script));
+        }
+
+        std::unique_ptr<Table> table;
+        CHECK_STATUS(db->openTable("Atomic", table), DbStatus::Ok);
+        CHECK(table->heapPageCount() > 4096);
+
+        // Prior transaction work, then a mutation that must fail partway when
+        // it exceeds the transaction page limit.
+        SqlExecutionResult result = engine.execute(
+            "BEGIN;\n"
+            "INSERT INTO Atomic VALUES (999999, 'prior');\n"
+            "UPDATE Atomic SET Tag = '" +
+            big2 + "' WHERE Id >= 0;\n");
+        CHECK(!result.ok);
+        CHECK(result.statements.size() == 3);
+        if (result.statements.size() == 3) {
+            CHECK(result.statements[0].ok);  // BEGIN
+            CHECK(result.statements[1].ok);  // INSERT
+            CHECK(!result.statements[2].ok); // UPDATE
+            CHECK(result.statements[2].error.code == SqlErrorCode::ResourceLimit);
+        }
+        CHECK(engine.inTransaction());
+
+        // The prior INSERT is visible; the partial UPDATE is fully rolled back.
+        {
+            SqlExecutionResult r =
+                engine.execute("SELECT Tag FROM Atomic WHERE Id = 999999;");
+            CHECK(r.ok && r.statements[0].resultSet.rowCount() == 1);
+            if (r.ok && r.statements[0].resultSet.rowCount() == 1) {
+                CHECK_TEXT(r.statements[0].resultSet.row(0)[0], "prior");
+            }
+        }
+        // The UPDATE would have written big2 into many pages before failing;
+        // after the statement rollback no big2 value may survive, every
+        // original value must be intact, and the row count must be exact.
+        {
+            bool ok = false;
+            CHECK(execRowCount(engine, "SELECT Id FROM Atomic WHERE Tag = '" + big2 +
+                                           "';",
+                               ok) == 0);
+            CHECK(ok);
+        }
+        {
+            bool ok = false;
+            CHECK(execRowCount(engine, "SELECT Id FROM Atomic WHERE Tag = '" + big +
+                                           "';",
+                               ok) == kRows);
+            CHECK(ok);
+        }
+        std::unique_ptr<Table> afterFail;
+        CHECK_STATUS(db->openTable("Atomic", afterFail), DbStatus::Ok);
+        CHECK(afterFail->rowCount() == kRows + 1);
+
+        CHECK(execOk(engine, "COMMIT;"));
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("Atomic", table), DbStatus::Ok);
+            CHECK(table->rowCount() == kRows + 1);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: SQL-driven crash/WAL matrices (sections 43-45).
+
+void testSql5CrashUpdate() {
+    std::printf("SQL5 crash/WAL matrix: multi-page UPDATE\n");
+    const std::string path = uniquePath("sql5crashupd");
+    const uint64_t kRows = 120;
+    const std::string baseTag = makeTag(1, 80);
+    std::string newTag = makeTag(2, 200);
+
+    CHECK(buildTagTable(path, kRows, baseTag));
+    CHECK(verifyTagTable(path, baseTag, kRows));
+    const std::vector<uint8_t> baseBytes = readFileBytes(path);
+
+    const std::string txSql = "BEGIN;\nUPDATE Crash SET Tag = '" + newTag +
+                              "' WHERE Id >= 0;\nCOMMIT;\n";
+
+    const std::string measure = uniquePath("sql5crashupdmeasure");
+    writeFileBytes(measure, baseBytes);
+    removeFile(walPath(measure));
+    std::vector<uint64_t> boundaries;
+    const uint64_t commitEnd = measureSqlCommit(measure, txSql, boundaries);
+    removeFile(walPath(measure));
+    removeFile(measure);
+    CHECK(commitEnd > kWalHeaderSize);
+    CHECK(boundaries.size() > 4);
+
+    std::set<uint64_t> points;
+    points.insert(0);
+    for (size_t i = 0; i < boundaries.size(); ++i) {
+        points.insert(boundaries[i]);
+        const uint64_t next =
+            (i + 1 < boundaries.size()) ? boundaries[i + 1] : commitEnd;
+        if (next > boundaries[i]) {
+            points.insert(boundaries[i] + (next - boundaries[i]) / 2);
+        }
+    }
+    points.insert(commitEnd);
+    points.insert(commitEnd + 1);
+
+    int tested = 0;
+    for (std::set<uint64_t>::const_iterator it = points.begin(); it != points.end();
+         ++it) {
+        const uint64_t budget = *it;
+        const std::string work = uniquePath("sql5crashupdwork");
+        writeFileBytes(work, baseBytes);
+        removeFile(walPath(work));
+
+        std::shared_ptr<BudgetState> state(new BudgetState());
+        state->budget = budget;
+        runCrashedSql(work, txSql, state);
+
+        std::unique_ptr<Database> db;
+        DbResult open = Database::open(work, DatabaseOpenOptions(), db);
+        CHECK_STATUS(open, DbStatus::Ok);
+        if (open.isOk() && db) {
+            db->close();
+        }
+
+        const bool committed = budget >= commitEnd;
+        const std::string expected = committed ? newTag : baseTag;
+        if (!verifyTagTable(work, expected, kRows)) {
+            std::printf("  SQL5 UPDATE crash boundary %llu failed\n",
+                        static_cast<unsigned long long>(budget));
+            CHECK(false);
+        } else {
+            CHECK(true);
+        }
+        ++tested;
+        removeFile(walPath(work));
+        removeFile(work);
+    }
+    CHECK(tested > 5);
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+void testSql5CrashDelete() {
+    std::printf("SQL5 crash/WAL matrix: multi-page DELETE\n");
+    const std::string path = uniquePath("sql5crashdel");
+    const uint64_t kRows = 120;
+    const std::string baseTag = makeTag(3, 80);
+
+    CHECK(buildTagTable(path, kRows, baseTag));
+    const std::vector<uint8_t> baseBytes = readFileBytes(path);
+
+    const std::string txSql = "BEGIN;\nDELETE FROM Crash WHERE Id >= 0;\nCOMMIT;\n";
+
+    const std::string measure = uniquePath("sql5crashdelmeasure");
+    writeFileBytes(measure, baseBytes);
+    removeFile(walPath(measure));
+    std::vector<uint64_t> boundaries;
+    const uint64_t commitEnd = measureSqlCommit(measure, txSql, boundaries);
+    removeFile(walPath(measure));
+    removeFile(measure);
+    CHECK(commitEnd > kWalHeaderSize);
+
+    std::set<uint64_t> points;
+    points.insert(0);
+    for (size_t i = 0; i < boundaries.size(); ++i) {
+        points.insert(boundaries[i]);
+        const uint64_t next =
+            (i + 1 < boundaries.size()) ? boundaries[i + 1] : commitEnd;
+        if (next > boundaries[i]) {
+            points.insert(boundaries[i] + (next - boundaries[i]) / 2);
+        }
+    }
+    points.insert(commitEnd);
+    points.insert(commitEnd + 1);
+
+    int tested = 0;
+    for (std::set<uint64_t>::const_iterator it = points.begin(); it != points.end();
+         ++it) {
+        const uint64_t budget = *it;
+        const std::string work = uniquePath("sql5crashdelwork");
+        writeFileBytes(work, baseBytes);
+        removeFile(walPath(work));
+
+        std::shared_ptr<BudgetState> state(new BudgetState());
+        state->budget = budget;
+        runCrashedSql(work, txSql, state);
+
+        std::unique_ptr<Database> db;
+        DbResult open = Database::open(work, DatabaseOpenOptions(), db);
+        CHECK_STATUS(open, DbStatus::Ok);
+        if (open.isOk() && db) {
+            db->close();
+        }
+
+        const bool committed = budget >= commitEnd;
+        const uint64_t expected = committed ? 0 : kRows;
+        if (!verifyTagTable(work, baseTag, expected)) {
+            std::printf("  SQL5 DELETE crash boundary %llu failed\n",
+                        static_cast<unsigned long long>(budget));
+            CHECK(false);
+        } else {
+            CHECK(true);
+        }
+        ++tested;
+        removeFile(walPath(work));
+        removeFile(work);
+    }
+    CHECK(tested > 5);
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+bool verifyCombinedCrashState(const std::string& path, bool post) {
+    std::unique_ptr<Database> db;
+    if (!Database::open(path, DatabaseOpenOptions(), db).isOk() || !db) {
+        return false;
+    }
+    std::unique_ptr<Table> table;
+    if (!db->openTable("Crash", table).isOk()) {
+        db->close();
+        return false;
+    }
+    const uint64_t expected = post ? 60 : 120;
+    if (table->rowCount() != expected) {
+        db->close();
+        return false;
+    }
+    std::unique_ptr<TableScan> scan;
+    table->scanStart(scan);
+    std::vector<DbValue> row;
+    uint64_t seen = 0;
+    bool ok = true;
+    while (scan->next(row)) {
+        const int64_t id = row[0].int64Value();
+        const std::string& tag = row[1].textValue();
+        if (post) {
+            if (id % 2 != 0) {
+                ok = false;
+                break;
+            }
+            const std::string expectedTag = (id < 60) ? "live" : "inactive";
+            if (tag != expectedTag) {
+                ok = false;
+                break;
+            }
+        } else if (tag != "live") {
+            ok = false;
+            break;
+        }
+        ++seen;
+    }
+    if (seen != expected || !scan->status().isOk()) {
+        ok = false;
+    }
+    db->close();
+    return ok;
+}
+
+void testSql5CrashCombined() {
+    std::printf("SQL5 crash/WAL matrix: UPDATE + DELETE transaction\n");
+    const std::string path = uniquePath("sql5crashcombo");
+    const uint64_t kRows = 120;
+    const std::string baseTag = "live";
+
+    CHECK(buildTagTable(path, kRows, baseTag));
+    const std::vector<uint8_t> baseBytes = readFileBytes(path);
+
+    const std::string txSql =
+        "BEGIN;\n"
+        "UPDATE Crash SET Tag = 'inactive' WHERE Id >= 60;\n"
+        "DELETE FROM Crash WHERE Flag = FALSE;\n"
+        "COMMIT;\n";
+
+    const std::string measure = uniquePath("sql5crashcombomeasure");
+    writeFileBytes(measure, baseBytes);
+    removeFile(walPath(measure));
+    std::vector<uint64_t> boundaries;
+    const uint64_t commitEnd = measureSqlCommit(measure, txSql, boundaries);
+    removeFile(walPath(measure));
+    removeFile(measure);
+    CHECK(commitEnd > kWalHeaderSize);
+
+    std::set<uint64_t> points;
+    points.insert(0);
+    for (size_t i = 0; i < boundaries.size(); ++i) {
+        points.insert(boundaries[i]);
+        const uint64_t next =
+            (i + 1 < boundaries.size()) ? boundaries[i + 1] : commitEnd;
+        if (next > boundaries[i]) {
+            points.insert(boundaries[i] + (next - boundaries[i]) / 2);
+        }
+    }
+    points.insert(commitEnd);
+    points.insert(commitEnd + 1);
+
+    int tested = 0;
+    for (std::set<uint64_t>::const_iterator it = points.begin(); it != points.end();
+         ++it) {
+        const uint64_t budget = *it;
+        const std::string work = uniquePath("sql5crashcombowork");
+        writeFileBytes(work, baseBytes);
+        removeFile(walPath(work));
+
+        std::shared_ptr<BudgetState> state(new BudgetState());
+        state->budget = budget;
+        runCrashedSql(work, txSql, state);
+
+        std::unique_ptr<Database> db;
+        DbResult open = Database::open(work, DatabaseOpenOptions(), db);
+        CHECK_STATUS(open, DbStatus::Ok);
+        if (open.isOk() && db) {
+            db->close();
+        }
+
+        const bool committed = budget >= commitEnd;
+        if (!verifyCombinedCrashState(work, committed)) {
+            std::printf("  SQL5 combined crash boundary %llu failed\n",
+                        static_cast<unsigned long long>(budget));
+            CHECK(false);
+        } else {
+            CHECK(true);
+        }
+        ++tested;
+        removeFile(walPath(work));
+        removeFile(work);
+    }
+    CHECK(tested > 5);
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: large deterministic dataset (section 46).
+
+struct AppModelRow {
+    int64_t id;
+    std::string name;
+    bool enabled;
+    bool hasScore;
+    int32_t score;
+    bool alive;
+
+    AppModelRow() : id(0), name(), enabled(false), hasScore(false), score(0), alive(true) {}
+};
+
+bool checkAppResult(const SqlResultSet& rs, const std::vector<AppModelRow>& model) {
+    size_t index = 0;
+    for (size_t i = 0; i < model.size(); ++i) {
+        if (!model[i].alive) {
+            continue;
+        }
+        if (index >= rs.rowCount()) {
+            return false;
+        }
+        const std::vector<DbValue>& row = rs.row(index);
+        if (row[0].int64Value() != model[i].id || row[1].textValue() != model[i].name ||
+            row[2].booleanValue() != model[i].enabled) {
+            return false;
+        }
+        if (model[i].hasScore) {
+            if (row[3].isNull() || row[3].int32Value() != model[i].score) {
+                return false;
+            }
+        } else if (!row[3].isNull()) {
+            return false;
+        }
+        ++index;
+    }
+    return index == rs.rowCount();
+}
+
+void testSql5DeterministicDataset() {
+    std::printf("SQL5 deterministic dataset (2000 rows)\n");
+    const std::string path = uniquePath("sql5det");
+    const int kRows = 2000;
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    std::vector<AppModelRow> model;
+    model.reserve(kRows);
+
+    {
+        SqlEngine engine(*db);
+        CHECK(execOk(engine, "CREATE TABLE App (Id INT64 NOT NULL, Name TEXT NOT NULL, "
+                             "Enabled BOOLEAN NOT NULL, Score INT32 NULL);"));
+
+        uint64_t inserted = 0;
+        while (inserted < static_cast<uint64_t>(kRows)) {
+            std::string script = "BEGIN;\n";
+            for (int i = 0; i < 250 && inserted < static_cast<uint64_t>(kRows);
+                 ++i, ++inserted) {
+                AppModelRow row;
+                row.id = static_cast<int64_t>(inserted);
+                row.name = "n" + std::to_string(static_cast<unsigned long long>(inserted));
+                row.enabled = (inserted % 3 != 0);
+                row.hasScore = (inserted % 5 != 0);
+                row.score = static_cast<int32_t>(inserted);
+                model.push_back(row);
+
+                script += "INSERT INTO App VALUES (";
+                script += std::to_string(static_cast<unsigned long long>(inserted));
+                script += ", '" + row.name + "', ";
+                script += row.enabled ? "TRUE" : "FALSE";
+                script += ", ";
+                script += row.hasScore
+                              ? std::to_string(static_cast<long long>(row.score))
+                              : "NULL";
+                script += ");\n";
+            }
+            script += "COMMIT;\n";
+            CHECK(execOk(engine, script));
+        }
+
+        // ORDER BY + LIMIT/OFFSET.
+        {
+            SqlExecutionResult r = engine.execute(
+                "SELECT Id, Name, Enabled, Score FROM App WHERE Enabled = TRUE ORDER "
+                "BY Name ASC LIMIT 10 OFFSET 5;");
+            CHECK(r.ok);
+            if (r.ok) {
+                const SqlResultSet& rs = r.statements[0].resultSet;
+                std::vector<AppModelRow> expected;
+                for (size_t i = 0; i < model.size(); ++i) {
+                    if (model[i].enabled) expected.push_back(model[i]);
+                }
+                std::stable_sort(expected.begin(), expected.end(),
+                                 [](const AppModelRow& a, const AppModelRow& b) {
+                                     return a.name < b.name;
+                                 });
+                CHECK(rs.rowCount() == 10);
+                bool match = true;
+                for (size_t i = 0; i < rs.rowCount() && i + 5 < expected.size(); ++i) {
+                    if (rs.row(i)[0].int64Value() != expected[i + 5].id) {
+                        match = false;
+                        break;
+                    }
+                }
+                CHECK(match);
+            }
+        }
+
+        // UPDATE a range, then verify affected count and model.
+        uint64_t affected = 0;
+        CHECK(execAffected(engine,
+                           "UPDATE App SET Enabled = FALSE WHERE Id >= 1000 AND Id < "
+                           "1500;",
+                           affected));
+        CHECK(affected == 500);
+        for (int i = 1000; i < 1500; ++i) {
+            model[static_cast<size_t>(i)].enabled = false;
+        }
+
+        // DELETE rows with NULL score.
+        CHECK(execAffected(engine, "DELETE FROM App WHERE Score IS NULL;", affected));
+        uint64_t expectedDeleted = 0;
+        for (size_t i = 0; i < model.size(); ++i) {
+            if (model[i].alive && !model[i].hasScore) {
+                model[i].alive = false;
+                ++expectedDeleted;
+            }
+        }
+        CHECK(affected == expectedDeleted);
+
+        CHECK_STATUS(db->close(), DbStatus::Ok);
+    }
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            SqlEngine engine(*reopened);
+            SqlExecutionResult r =
+                engine.execute("SELECT Id, Name, Enabled, Score FROM App ORDER BY Id;");
+            CHECK(r.ok);
+            if (r.ok) {
+                CHECK(checkAppResult(r.statements[0].resultSet, model));
+            }
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(reopened->openTable("App", table), DbStatus::Ok);
+            uint64_t alive = 0;
+            for (size_t i = 0; i < model.size(); ++i) {
+                if (model[i].alive) ++alive;
+            }
+            CHECK(table->rowCount() == alive);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: repeated transactional workload (section 47).
+
+void testSql5RepeatedWorkload() {
+    std::printf("SQL5 repeated transactional workload (250 lifecycles)\n");
+    const std::string path = uniquePath("sql5repeat");
+    const int kRows = 200;
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    std::vector<std::string> value(static_cast<size_t>(kRows));
+    std::vector<bool> alive(static_cast<size_t>(kRows), true);
+
+    {
+        std::unique_ptr<SqlEngine> engine(new SqlEngine(*db));
+        CHECK(execOk(*engine,
+                     "CREATE TABLE Loop (Id INT64 NOT NULL, Value TEXT NOT NULL, "
+                     "Flag BOOLEAN NOT NULL);"));
+        std::string script = "BEGIN;\n";
+        for (int i = 0; i < kRows; ++i) {
+            value[static_cast<size_t>(i)] = "v" + std::to_string(i);
+            script += "INSERT INTO Loop VALUES (";
+            script += std::to_string(i);
+            script += ", '";
+            script += value[static_cast<size_t>(i)];
+            script += "', ";
+            script += (i % 2 == 0) ? "TRUE" : "FALSE";
+            script += ");\n";
+        }
+        script += "COMMIT;\n";
+        CHECK(execOk(*engine, script));
+
+        uint64_t mismatches = 0;
+        for (int k = 0; k < 250; ++k) {
+            const int id = (k * 7) % kRows;
+            const int mode = k % 4;
+            uint64_t affected = 0;
+            if (mode == 0) {
+                const std::string newValue = "u" + std::to_string(k);
+                CHECK(execOk(*engine, "BEGIN;"));
+                CHECK(execAffected(*engine,
+                                   "UPDATE Loop SET Value = '" + newValue +
+                                       "' WHERE Id = " + std::to_string(id) + ";",
+                                   affected));
+                CHECK(execOk(*engine, "COMMIT;"));
+                if (alive[static_cast<size_t>(id)]) {
+                    if (affected != 1) ++mismatches;
+                    value[static_cast<size_t>(id)] = newValue;
+                } else if (affected != 0) {
+                    ++mismatches;
+                }
+            } else if (mode == 1) {
+                CHECK(execOk(*engine, "BEGIN;"));
+                CHECK(execAffected(*engine,
+                                   "UPDATE Loop SET Value = 'rollback' WHERE Id = " +
+                                       std::to_string(id) + ";",
+                                   affected));
+                CHECK(execOk(*engine, "ROLLBACK;"));
+                if (alive[static_cast<size_t>(id)] && affected != 1) {
+                    ++mismatches;
+                }
+                if (!alive[static_cast<size_t>(id)] && affected != 0) {
+                    ++mismatches;
+                }
+            } else if (mode == 2) {
+                CHECK(execOk(*engine, "BEGIN;"));
+                CHECK(execAffected(*engine,
+                                   "DELETE FROM Loop WHERE Id = " +
+                                       std::to_string(id) + ";",
+                                   affected));
+                CHECK(execOk(*engine, "COMMIT;"));
+                if (alive[static_cast<size_t>(id)]) {
+                    if (affected != 1) ++mismatches;
+                    alive[static_cast<size_t>(id)] = false;
+                } else if (affected != 0) {
+                    ++mismatches;
+                }
+            } else {
+                CHECK(execOk(*engine, "BEGIN;"));
+                CHECK(execAffected(*engine,
+                                   "DELETE FROM Loop WHERE Id = " +
+                                       std::to_string(id) + ";",
+                                   affected));
+                CHECK(execOk(*engine, "ROLLBACK;"));
+                if (alive[static_cast<size_t>(id)] && affected != 1) {
+                    ++mismatches;
+                }
+            }
+
+            // Read-your-writes check for this row.
+            SqlExecutionResult r = engine->execute(
+                "SELECT Value FROM Loop WHERE Id = " + std::to_string(id) + ";");
+            if (!r.ok) {
+                ++mismatches;
+            } else if (alive[static_cast<size_t>(id)]) {
+                if (r.statements[0].resultSet.rowCount() != 1 ||
+                    r.statements[0].resultSet.row(0)[0].textValue() !=
+                        value[static_cast<size_t>(id)]) {
+                    ++mismatches;
+                }
+            } else if (r.statements[0].resultSet.rowCount() != 0) {
+                ++mismatches;
+            }
+
+            if (k % 50 == 49) {
+                engine.reset();
+                CHECK_STATUS(db->close(), DbStatus::Ok);
+                std::unique_ptr<Database> reopened;
+                CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened),
+                             DbStatus::Ok);
+                if (!reopened) {
+                    ++mismatches;
+                    return;
+                }
+                db = std::move(reopened);
+                engine.reset(new SqlEngine(*db));
+            }
+        }
+        CHECK(mismatches == 0);
+        engine.reset();
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
+// ---------------------------------------------------------------------------
+// SQL5: CLI-style example workload (section 56).
+
+void testSql5ExampleWorkload() {
+    std::printf("SQL5 end-to-end example workload\n");
+    const std::string path = uniquePath("sql5example");
+    std::unique_ptr<Database> db = newDb(path);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        SqlExecutionResult result = engine.execute(
+            "CREATE TABLE Users (Id INT64 NOT NULL, Name TEXT NOT NULL, Enabled "
+            "BOOLEAN NOT NULL, Note TEXT NULL);\n"
+            "BEGIN;\n"
+            "INSERT INTO Users VALUES (1, 'Alice', TRUE, NULL);\n"
+            "INSERT INTO Users VALUES (2, 'Bob', TRUE, 'temporary');\n"
+            "INSERT INTO Users VALUES (3, 'Carol', FALSE, NULL);\n"
+            "INSERT INTO Users VALUES (4, 'Dave', TRUE, 'keep');\n"
+            "COMMIT;\n"
+            "SELECT Id, Name FROM Users WHERE Enabled = TRUE ORDER BY Name ASC;\n"
+            "UPDATE Users SET Enabled = FALSE WHERE Name = 'Bob';\n"
+            "DELETE FROM Users WHERE Enabled = FALSE;\n"
+            "SELECT * FROM Users ORDER BY Id LIMIT 10 OFFSET 0;\n");
+        CHECK(result.ok);
+        CHECK(result.statements.size() == 11);
+        if (result.statements.size() == 11) {
+            CHECK(collectIds(result.statements[7].resultSet) ==
+                  std::vector<int64_t>({1, 2, 4})); // SELECT Enabled=TRUE ORDER BY Name
+            CHECK(result.statements[8].affectedRows == 1);  // UPDATE Bob
+            CHECK(result.statements[9].affectedRows == 2);  // DELETE disabled (Bob, Carol)
+            // Final SELECT after delete: Alice and Dave remain.
+            const SqlResultSet& rs = result.statements[10].resultSet;
+            CHECK(rs.rowCount() == 2);
+            if (rs.rowCount() == 2) {
+                CHECK_INT64(rs.row(0)[0], 1);
+                CHECK_TEXT(rs.row(0)[1], "Alice");
+                CHECK_INT64(rs.row(1)[0], 4);
+                CHECK_TEXT(rs.row(1)[1], "Dave");
+            }
+        }
+    }
+
+    CHECK_STATUS(db->close(), DbStatus::Ok);
+
+    {
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), reopened), DbStatus::Ok);
+        if (reopened) {
+            SqlEngine engine(*reopened);
+            CHECK(checkIds(engine, "SELECT Id FROM Users ORDER BY Id;", {1, 4}));
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
+    }
+
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
 } // namespace
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("guideXOS SQL4 SQL language tests\n");
+    std::printf("guideXOS SQL4/SQL5 SQL language tests\n");
     std::string dir = testDir();
     std::printf("temp dir: %s\n", dir.c_str());
 
@@ -1499,6 +3266,30 @@ int main() {
     testMultiPageDataset();
     testDeterministicDataset();
     testSqlCrashIntegration();
+
+    // ---- SQL5 ----------------------------------------------------------
+    testSql5Tokenizer();
+    testSql5Parser();
+    testSql5Precedence();
+    testSql5HostileInput();
+    testThreeValuedLogic();
+    testSql5Predicates();
+    testSql5NullAndBlobPredicates();
+    testSql5ComparisonTyping();
+    testSql5OrderBy();
+    testSql5LimitOffset();
+    testSql5Update();
+    testSql5Delete();
+    testSql5ReadYourWrites();
+    testSql5UpdateRelocation();
+    testSql5DeleteCompaction();
+    testSql5StatementAtomicity();
+    testSql5CrashUpdate();
+    testSql5CrashDelete();
+    testSql5CrashCombined();
+    testSql5DeterministicDataset();
+    testSql5RepeatedWorkload();
+    testSql5ExampleWorkload();
 
     std::printf("\n%d checks passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
