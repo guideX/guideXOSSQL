@@ -117,6 +117,18 @@ SqlTokenKind keywordKind(const std::string& upper) {
     if (upper == "PRIMARY") return SqlTokenKind::Primary;
     if (upper == "KEY") return SqlTokenKind::Key;
     if (upper == "ON") return SqlTokenKind::On;
+    if (upper == "AS") return SqlTokenKind::As;
+    if (upper == "JOIN") return SqlTokenKind::Join;
+    if (upper == "INNER") return SqlTokenKind::Inner;
+    if (upper == "LEFT") return SqlTokenKind::Left;
+    if (upper == "OUTER") return SqlTokenKind::Outer;
+    if (upper == "DISTINCT") return SqlTokenKind::Distinct;
+    if (upper == "COUNT") return SqlTokenKind::Count;
+    if (upper == "SUM") return SqlTokenKind::Sum;
+    if (upper == "AVG") return SqlTokenKind::Avg;
+    if (upper == "MIN") return SqlTokenKind::Min;
+    if (upper == "MAX") return SqlTokenKind::Max;
+    if (upper == "GROUP") return SqlTokenKind::Group;
     return SqlTokenKind::Identifier;
 }
 
@@ -207,6 +219,9 @@ public:
                 if (!lexNumber(error, startOffset, startLine, startColumn)) {
                     return false;
                 }
+            } else if (c == '.') {
+                advance();
+                emit(SqlTokenKind::Dot, startOffset, startLine, startColumn);
             } else if (isWordStart(static_cast<unsigned char>(c))) {
                 if (!lexWord(error, startOffset, startLine, startColumn)) {
                     return false;

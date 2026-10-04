@@ -209,6 +209,30 @@ bool compareValues(SqlCompareOp op, DbType type, const DbValue& a, const DbValue
     return compareOrdered(op, type, a, b);
 }
 
+// SQL5 single-table resolver: matches by column name and ignores any qualifier.
+class ColumnListResolver : public SqlColumnResolver {
+public:
+    explicit ColumnListResolver(const std::vector<ColumnDefinition>& columns)
+        : _columns(columns) {}
+
+    bool resolveColumn(const SqlIdentifier& identifier, size_t& ordinal,
+                       DbType& type, SqlError& error) const override {
+        for (size_t i = 0; i < _columns.size(); ++i) {
+            if (_columns[i].name == identifier.name) {
+                ordinal = i;
+                type = _columns[i].type;
+                return true;
+            }
+        }
+        error = semanticError("unknown column '" + identifier.name + "' in predicate",
+                              identifier.line, identifier.column);
+        return false;
+    }
+
+private:
+    const std::vector<ColumnDefinition>& _columns;
+};
+
 } // namespace
 
 BoundPredicate::BoundPredicate() : _nodes(), _root(-1), _bound(false) {}
@@ -216,6 +240,18 @@ BoundPredicate::BoundPredicate() : _nodes(), _root(-1), _bound(false) {}
 bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
                           const std::vector<ColumnDefinition>& columns,
                           SqlError& error) {
+    ColumnListResolver resolver(columns);
+    return bindInternal(nodes, root, resolver, error);
+}
+
+bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
+                          const SqlColumnResolver& resolver, SqlError& error) {
+    return bindInternal(nodes, root, resolver, error);
+}
+
+bool BoundPredicate::bindInternal(const std::vector<SqlExprNode>& nodes,
+                                  int32_t root, const SqlColumnResolver& resolver,
+                                  SqlError& error) {
     _nodes.clear();
     _root = -1;
     _bound = false;
@@ -227,7 +263,7 @@ bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
     }
 
     int32_t boundRoot = -1;
-    if (!bindNode(nodes, root, columns, boundRoot, error)) {
+    if (!bindNode(nodes, root, resolver, boundRoot, error)) {
         return false;
     }
     if (!isTruthNode(boundRoot)) {
@@ -243,8 +279,8 @@ bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
 }
 
 bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t index,
-                              const std::vector<ColumnDefinition>& columns,
-                              int32_t& outIndex, SqlError& error) {
+                              const SqlColumnResolver& resolver, int32_t& outIndex,
+                              SqlError& error) {
     if (index < 0 || static_cast<size_t>(index) >= nodes.size()) {
         error = semanticError("malformed predicate expression", 0, 0);
         return false;
@@ -253,23 +289,15 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
 
     switch (src.kind) {
     case SqlExprKind::ColumnRef: {
-        size_t found = columns.size();
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].name == src.identifier.name) {
-                found = i;
-                break;
-            }
-        }
-        if (found == columns.size()) {
-            error = semanticError("unknown column '" + src.identifier.name +
-                                      "' in predicate",
-                                  src.identifier.line, src.identifier.column);
+        size_t found = 0;
+        DbType type = DbType::Unknown;
+        if (!resolver.resolveColumn(src.identifier, found, type, error)) {
             return false;
         }
         Node node;
         node.kind = Kind::Column;
         node.ordinal = found;
-        node.type = columns[found].type;
+        node.type = type;
         _nodes.push_back(node);
         outIndex = static_cast<int32_t>(_nodes.size() - 1);
         return true;
@@ -288,8 +316,8 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
     case SqlExprKind::Compare: {
         int32_t left = -1;
         int32_t right = -1;
-        if (!bindNode(nodes, src.left, columns, left, error) ||
-            !bindNode(nodes, src.right, columns, right, error)) {
+        if (!bindNode(nodes, src.left, resolver, left, error) ||
+            !bindNode(nodes, src.right, resolver, right, error)) {
             return false;
         }
         const Node& ln = _nodes[static_cast<size_t>(left)];
@@ -366,8 +394,8 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
     case SqlExprKind::Or: {
         int32_t left = -1;
         int32_t right = -1;
-        if (!bindNode(nodes, src.left, columns, left, error) ||
-            !bindNode(nodes, src.right, columns, right, error)) {
+        if (!bindNode(nodes, src.left, resolver, left, error) ||
+            !bindNode(nodes, src.right, resolver, right, error)) {
             return false;
         }
         if (!isTruthNode(left) || !isTruthNode(right)) {
@@ -386,7 +414,7 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
 
     case SqlExprKind::Not: {
         int32_t operand = -1;
-        if (!bindNode(nodes, src.left, columns, operand, error)) {
+        if (!bindNode(nodes, src.left, resolver, operand, error)) {
             return false;
         }
         if (!isTruthNode(operand)) {
@@ -404,7 +432,7 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
 
     case SqlExprKind::IsNull: {
         int32_t operand = -1;
-        if (!bindNode(nodes, src.left, columns, operand, error)) {
+        if (!bindNode(nodes, src.left, resolver, operand, error)) {
             return false;
         }
         const Node& on = _nodes[static_cast<size_t>(operand)];

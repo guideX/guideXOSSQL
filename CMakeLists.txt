@@ -87,6 +87,16 @@ endif()
 
 add_test(NAME database_index_test COMMAND database_index_test)
 
+add_executable(database_sql7_test tests/database_sql7_test.cpp)
+target_link_libraries(database_sql7_test PRIVATE gxos_database)
+if(MSVC)
+    target_compile_options(database_sql7_test PRIVATE /W4)
+else()
+    target_compile_options(database_sql7_test PRIVATE -Wall -Wextra)
+endif()
+
+add_test(NAME database_sql7_test COMMAND database_sql7_test)
+
 add_executable(gxdb_cli tools/gxdb_cli.cpp)
 target_link_libraries(gxdb_cli PRIVATE gxos_database)
 if(MSVC)

@@ -47,6 +47,18 @@ private:
     bool parseColumnDef(SqlColumnDefAst& out, SqlError& error);
     bool parseLiteral(SqlLiteralAst& out, SqlError& error);
     bool parseIdentifier(SqlIdentifier& out, SqlError& error, const char* what);
+    // Parses `identifier [ '.' identifier ]` into a possibly qualified column
+    // reference.
+    bool parseColumnRef(SqlIdentifier& out, SqlError& error, const char* what);
+
+    // ---- SQL7 SELECT shape ---------------------------------------------
+    bool parseSelectList(SqlSelectAst& out, SqlError& error);
+    bool parseProjectionItem(SqlProjectionItemAst& out, SqlError& error);
+    bool parseAggregate(SqlProjectionItemAst& out, SqlError& error);
+    bool parseProjectionAlias(SqlProjectionItemAst& out, SqlError& error);
+    bool parseTableRef(SqlTableRefAst& out, SqlError& error);
+    bool parseJoinClauses(SqlSelectAst& out, SqlError& error);
+    bool parseGroupBy(std::vector<SqlIdentifier>& out, SqlError& error);
 
     // ---- SQL5 predicate expressions ------------------------------------
     // `orExpr` is the entry point. Precedence (low to high):

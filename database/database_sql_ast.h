@@ -38,13 +38,18 @@ enum class SqlStatementType {
 
 const char* sqlStatementTypeName(SqlStatementType type);
 
-// An identifier plus the source location of its first byte.
+// An identifier plus the source location of its first byte. SQL7 adds an
+// optional qualifier so a column reference can be written `Users.Id` or `u.Id`.
+// `name` is always the column/object name; when `hasQualifier` is set,
+// `qualifier` holds the relation name or alias written before the dot.
 struct SqlIdentifier {
     std::string name;
+    std::string qualifier;
+    bool hasQualifier;
     uint32_t line;
     uint32_t column;
 
-    SqlIdentifier() : line(0), column(0) {}
+    SqlIdentifier() : hasQualifier(false), line(0), column(0) {}
 };
 
 // A literal value in an INSERT ... VALUES list or an expression.
@@ -117,6 +122,65 @@ struct SqlOrderTermAst {
     SqlOrderTermAst() : descending(false) {}
 };
 
+// ---- SQL7 joins, aliases, aggregates and grouping --------------------------
+
+// A relation reference in FROM or after JOIN: a table name plus an optional
+// query-local alias. `hasAlias` selects whether `alias` or `table.name` is the
+// qualifier for that source in the SELECT scope.
+struct SqlTableRefAst {
+    SqlIdentifier table;
+    bool hasAlias;
+    SqlIdentifier alias;
+
+    SqlTableRefAst() : hasAlias(false) {}
+};
+
+enum class SqlJoinType { Inner = 0, Left };
+
+const char* sqlJoinTypeName(SqlJoinType type);
+
+// One `JOIN table_ref ON predicate` clause.
+struct SqlJoinAst {
+    SqlJoinType type;
+    SqlTableRefAst table;
+    SqlPredicateAst on;
+    uint32_t line;
+    uint32_t column;
+
+    SqlJoinAst() : type(SqlJoinType::Inner), line(0), column(0) {}
+};
+
+enum class SqlAggregateKind { Count = 0, Sum, Avg, Min, Max };
+
+const char* sqlAggregateKindName(SqlAggregateKind kind);
+
+// An aggregate call. `star` is true only for COUNT(*); otherwise `column` is the
+// single column argument.
+struct SqlAggregateAst {
+    SqlAggregateKind kind;
+    bool star;
+    SqlIdentifier column;
+
+    SqlAggregateAst() : kind(SqlAggregateKind::Count), star(false) {}
+};
+
+enum class SqlProjectionKind { Star = 0, Column, Aggregate };
+
+// One SELECT projection entry: `*`, a column reference, or an aggregate call,
+// each with an optional output alias.
+struct SqlProjectionItemAst {
+    SqlProjectionKind kind;
+    SqlIdentifier columnRef;    // Column
+    SqlAggregateAst aggregate;  // Aggregate
+    bool hasAlias;
+    SqlIdentifier alias;
+    uint32_t line;
+    uint32_t column;
+
+    SqlProjectionItemAst()
+        : kind(SqlProjectionKind::Column), hasAlias(false), line(0), column(0) {}
+};
+
 struct SqlColumnDefAst {
     SqlIdentifier name;
     DbType type;
@@ -159,10 +223,20 @@ struct SqlInsertAst {
 };
 
 struct SqlSelectAst {
+    bool distinct;
     bool star;
+    // Legacy simple-column view of the projection. Populated for every
+    // SqlProjectionKind::Column item so SQL4/SQL5 callers keep working.
     std::vector<SqlIdentifier> columns;
+    // Authoritative SQL7 projection list.
+    std::vector<SqlProjectionItemAst> projection;
+    // Legacy base-table view of FROM. Populated with the base relation name.
     SqlIdentifier table;
+    // Authoritative base relation reference (table + optional alias).
+    SqlTableRefAst from;
+    std::vector<SqlJoinAst> joins;
     SqlPredicateAst where;
+    std::vector<SqlIdentifier> groupBy;
     std::vector<SqlOrderTermAst> orderBy;
     bool hasLimit;
     uint64_t limit;
@@ -172,8 +246,8 @@ struct SqlSelectAst {
     uint32_t column;
 
     SqlSelectAst()
-        : star(false), hasLimit(false), limit(0), hasOffset(false), offset(0),
-          line(0), column(0) {}
+        : distinct(false), star(false), hasLimit(false), limit(0), hasOffset(false),
+          offset(0), line(0), column(0) {}
 };
 
 struct SqlAssignmentAst {

@@ -77,6 +77,18 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::Primary: return "PRIMARY";
     case SqlTokenKind::Key: return "KEY";
     case SqlTokenKind::On: return "ON";
+    case SqlTokenKind::As: return "AS";
+    case SqlTokenKind::Join: return "JOIN";
+    case SqlTokenKind::Inner: return "INNER";
+    case SqlTokenKind::Left: return "LEFT";
+    case SqlTokenKind::Outer: return "OUTER";
+    case SqlTokenKind::Distinct: return "DISTINCT";
+    case SqlTokenKind::Count: return "COUNT";
+    case SqlTokenKind::Sum: return "SUM";
+    case SqlTokenKind::Avg: return "AVG";
+    case SqlTokenKind::Min: return "MIN";
+    case SqlTokenKind::Max: return "MAX";
+    case SqlTokenKind::Group: return "GROUP";
     case SqlTokenKind::Identifier: return "identifier";
     case SqlTokenKind::IntegerLiteral: return "integer literal";
     case SqlTokenKind::FloatLiteral: return "float literal";
@@ -87,6 +99,7 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::RightParen: return "')'";
     case SqlTokenKind::Semicolon: return "';'";
     case SqlTokenKind::Star: return "'*'";
+    case SqlTokenKind::Dot: return "'.'";
     case SqlTokenKind::Eq: return "'='";
     case SqlTokenKind::Ne: return "'<>'";
     case SqlTokenKind::Lt: return "'<'";
@@ -99,7 +112,7 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
 }
 
 bool sqlTokenIsKeyword(SqlTokenKind kind) {
-    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::On;
+    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::Group;
 }
 
 bool sqlTokenIsTypeKeyword(SqlTokenKind kind) {

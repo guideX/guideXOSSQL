@@ -37,17 +37,34 @@ SqlTruth sqlTruthNot(SqlTruth a);
 
 const char* sqlTruthName(SqlTruth truth);
 
-// A predicate bound to a concrete table schema.
+// Resolves a (possibly qualified) column reference against the visible relation
+// sources of one SELECT scope. SQL5 binds against a single table; SQL7 binds
+// against a joined schema and must additionally detect ambiguous unqualified
+// references and unknown qualifiers. The executor supplies the implementation.
+class SqlColumnResolver {
+public:
+    virtual ~SqlColumnResolver() {}
+    virtual bool resolveColumn(const SqlIdentifier& identifier, size_t& ordinal,
+                               DbType& type, SqlError& error) const = 0;
+};
+
+// A predicate bound to a concrete schema.
 class BoundPredicate {
 public:
     BoundPredicate();
 
-    // Binds the predicate rooted at `root` in `nodes` against `columns`.
-    // Returns false and fills `error` with a SemanticError on any type error,
-    // unknown column or unsupported operator. A predicate with no WHERE clause
-    // binds successfully and always evaluates TRUE.
+    // Binds the predicate rooted at `root` in `nodes` against `columns`
+    // (single-table SQL5 path). Returns false and fills `error` with a
+    // SemanticError on any type error, unknown column or unsupported operator. A
+    // predicate with no WHERE clause binds successfully and always evaluates
+    // TRUE.
     bool bind(const std::vector<SqlExprNode>& nodes, int32_t root,
               const std::vector<ColumnDefinition>& columns, SqlError& error);
+
+    // SQL7: binds against a resolver that may resolve qualified names across
+    // multiple relation sources and report ambiguity.
+    bool bind(const std::vector<SqlExprNode>& nodes, int32_t root,
+              const SqlColumnResolver& resolver, SqlError& error);
 
     bool isBound() const { return _bound; }
 
@@ -89,8 +106,10 @@ private:
               alwaysUnknown(false), negated(false), left(-1), right(-1) {}
     };
 
+    bool bindInternal(const std::vector<SqlExprNode>& nodes, int32_t root,
+                      const SqlColumnResolver& resolver, SqlError& error);
     bool bindNode(const std::vector<SqlExprNode>& nodes, int32_t index,
-                  const std::vector<ColumnDefinition>& columns, int32_t& outIndex,
+                  const SqlColumnResolver& resolver, int32_t& outIndex,
                   SqlError& error);
     bool isTruthNode(int32_t index) const;
 

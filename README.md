@@ -32,6 +32,14 @@ Native relational database subsystem for guideXOS. This repository contains:
   UPDATE / DELETE, survive row relocation and page compaction, and are enforced
   below the SQL layer. Catalog upgraded to a backward-compatible v3; outer
   `.gxdb` format and the WAL format are unchanged.
+- **Phase SQL7: JOINs, Aliases, Aggregates, GROUP BY and DISTINCT** — table
+  aliases and qualified column references, `INNER JOIN` / `JOIN` and
+  `LEFT [OUTER] JOIN`, self-joins and multi-relation chains, `COUNT` / `SUM` /
+  `AVG` / `MIN` / `MAX`, `GROUP BY` and `SELECT DISTINCT`, with correct SQL NULL
+  semantics. A deterministic, statistics-free join planner chooses
+  `NestedLoop` or `IndexNestedLoop`; indexed probes reuse the SQL6 B+ tree APIs
+  and never change the logical result. Strictly a query-layer phase: no `.gxdb`,
+  catalog, B+ tree, heap or WAL format change.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
@@ -39,6 +47,7 @@ Native relational database subsystem for guideXOS. This repository contains:
 - SQL4 language reference: [`docs/SQL4_LANGUAGE.md`](docs/SQL4_LANGUAGE.md)
 - SQL5 predicates/mutation/ordering: [`docs/SQL5_PREDICATES_MUTATION_ORDERING.md`](docs/SQL5_PREDICATES_MUTATION_ORDERING.md)
 - SQL6 B+ tree indexes/constraints: [`docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md`](docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md)
+- SQL7 joins/aggregates/grouping: [`docs/SQL7_JOINS_AGGREGATES.md`](docs/SQL7_JOINS_AGGREGATES.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
@@ -47,7 +56,7 @@ Native relational database subsystem for guideXOS. This repository contains:
 database/   storage engine (format, checksum, I/O, header, page, file, engine,
             buffer, catalog, heap, index, wal, transaction, relational) and the
             SQL language layer (sql_token, sql_tokenizer, sql_parser, sql)
-tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4 + SQL5 + SQL6)
+tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4 + SQL5 + SQL6 + SQL7)
 tools/      gxdb_cli (create / inspect / sql / run / shell)
 docs/       architecture and test reports
 ```
@@ -199,6 +208,59 @@ GXDB_CLI_EXPLAIN=1 build/gxdb_cli sql app.gxdb "SELECT Name FROM Users WHERE Nam
 build/gxdb_cli inspect app.gxdb   # lists every index and its root page
 ```
 
+## JOIN + aggregate example (SQL7)
+
+```sql
+CREATE TABLE Users (
+    Id INT64 PRIMARY KEY,
+    Name TEXT NOT NULL
+);
+
+CREATE TABLE Orders (
+    Id INT64 PRIMARY KEY,
+    UserId INT64 NULL,
+    Amount INT64 NOT NULL
+);
+
+-- A non-unique index lets the join probe candidate orders.
+CREATE INDEX IX_Orders_UserId ON Orders (UserId);
+
+INSERT INTO Users VALUES (1, 'Alice');
+INSERT INTO Users VALUES (2, 'Bob');
+
+INSERT INTO Orders VALUES (10, 1, 100);
+INSERT INTO Orders VALUES (11, 1, 50);
+INSERT INTO Orders VALUES (12, NULL, 999);
+
+-- INNER JOIN: NULL foreign keys never match.
+SELECT u.Name, o.Amount
+FROM Users AS u
+JOIN Orders AS o ON o.UserId = u.Id
+ORDER BY o.Id;
+
+-- LEFT JOIN + aggregate: users with no orders still appear.
+SELECT u.Name, COUNT(o.Id) AS Orders, SUM(o.Amount) AS Total
+FROM Users AS u
+LEFT JOIN Orders AS o ON o.UserId = u.Id
+GROUP BY u.Id, u.Name
+ORDER BY Orders DESC;
+
+-- DISTINCT on projected values.
+SELECT DISTINCT Name FROM Users ORDER BY Name;
+```
+
+```sh
+build/gxdb_cli sql app.gxdb "SELECT u.Name, COUNT(o.Id) AS Orders FROM Users AS u LEFT JOIN Orders AS o ON o.UserId = u.Id GROUP BY u.Id, u.Name ORDER BY Orders DESC;"
+GXDB_CLI_EXPLAIN=1 build/gxdb_cli sql app.gxdb "SELECT u.Name, o.Amount FROM Users AS u JOIN Orders AS o ON o.UserId = u.Id;"
+```
+
+`JOIN` is an `INNER JOIN`; `LEFT [OUTER] JOIN` null-extends unmatched right
+relations. `COUNT(column)` ignores NULLs while `COUNT(*)` counts every joined
+row, so an unmatched LEFT JOIN row contributes `0` to `COUNT(o.Id)` and `1` to
+`COUNT(*)`. Indexed join probes use the SQL6 B+ tree but always evaluate the
+complete `ON` predicate, so they return exactly the same logical rows as a
+nested-loop join.
+
 ## Command-line diagnostics
 
 ```sh
@@ -212,7 +274,7 @@ build/gxdb_cli shell sample.gxdb
 ## Status
 
 Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
-SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks). SQL3 proves
+SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks, SQL7: 1303 checks). SQL3 proves
 crash-atomic transactions on the hosted backend, including a full commit crash
 matrix and a 250-lifecycle transaction/recovery stress suite. SQL4 proves a
 bounded SQL language over that engine. SQL5 proves predicates with three-valued
@@ -224,6 +286,14 @@ PRIMARY KEY / UNIQUE enforcement, transactional CREATE INDEX over existing rows,
 locator remapping under page compaction, indexed-vs-full-scan equivalence,
 multi-index consistency, index corruption safety, CREATE INDEX / INSERT / UPDATE
 / DELETE crash matrices, and a 3000-row deterministic workload plus a
-250-lifecycle indexed transaction stress suite. QEMU and bare-metal proof are
-deferred to the phase that provides a native `IDatabaseFile` backend over the
-guideXOS VFS / block device.
+250-lifecycle indexed transaction stress suite. SQL7 proves multi-relation and
+aggregate query semantics: table aliases and qualified references, ambiguity
+detection, INNER/LEFT/self/multi-table joins, indexed-vs-forced-NestedLoop
+equivalence, COUNT/SUM/AVG/MIN/MAX with NULL and overflow semantics, GROUP BY
+(including NULL grouping), DISTINCT, aggregate ordering, transaction visibility
+through indexed join probes, join-index corruption safety, Float64 edge policy,
+a 1000/3000/8000-row deterministic multi-table workload with an independent
+model, and a 250-lifecycle joined/aggregate transaction workload. SQL7 requires
+no persistent-format change. QEMU and bare-metal proof are deferred to the phase
+that provides a native `IDatabaseFile` backend over the guideXOS VFS / block
+device.

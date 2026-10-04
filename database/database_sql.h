@@ -31,14 +31,38 @@ class Table;
 class Transaction;
 struct RowMutation;
 
-// One output column of a SELECT result.
+// One output column of a SELECT result. SQL7 adds `nullable`: a LEFT JOIN can
+// produce NULL for a physically NOT NULL source column, so query-result
+// nullability is not the same as storage nullability.
 struct SqlColumn {
     std::string name;
     DbType type;
+    bool nullable;
 
-    SqlColumn() : type(DbType::Unknown) {}
+    SqlColumn() : type(DbType::Unknown), nullable(true) {}
     SqlColumn(const std::string& nameIn, DbType typeIn)
-        : name(nameIn), type(typeIn) {}
+        : name(nameIn), type(typeIn), nullable(true) {}
+    SqlColumn(const std::string& nameIn, DbType typeIn, bool nullableIn)
+        : name(nameIn), type(typeIn), nullable(nullableIn) {}
+};
+
+// SQL7 read-only per-join-step diagnostics. This is test/observability metadata,
+// not persistent state and not a SQL-visible statement.
+struct SqlJoinDiagnostics {
+    std::string joinType;      // "INNER JOIN" | "LEFT JOIN"
+    std::string rightTable;    // physical table name of the joined source
+    std::string rightAlias;    // query-local qualifier of the joined source
+    std::string accessPath;    // "NestedLoop" | "IndexNestedLoop"
+    std::string indexName;     // chosen index, when any
+    uint64_t leftRowsProcessed;
+    uint64_t indexProbes;
+    uint64_t candidatesFetched;
+    uint64_t matchesEmitted;
+    uint64_t nullExtendedRows;
+
+    SqlJoinDiagnostics()
+        : leftRowsProcessed(0), indexProbes(0), candidatesFetched(0),
+          matchesEmitted(0), nullExtendedRows(0) {}
 };
 
 // A materialized SELECT result. SQL4 materializes results with explicit bounds
@@ -96,6 +120,10 @@ struct SqlStatementResult {
     std::string accessIndexName; // chosen index, when any
     uint64_t candidateRowsVisited;
 
+    // SQL7 per-join-step diagnostics (read-only; empty for single-relation
+    // SELECTs).
+    std::vector<SqlJoinDiagnostics> joins;
+
     SqlStatementResult();
 };
 
@@ -129,6 +157,11 @@ public:
     uint64_t transactionId() const;
 
     Database& database() { return _db; }
+
+    // Test/diagnostic hook: forces every JOIN step onto the NestedLoop fallback
+    // so indexed and non-indexed plans can be compared for exact logical
+    // equivalence. It is not a SQL-visible option and never changes semantics.
+    void setForceNestedLoop(bool force) { _forceNestedLoop = force; }
 
 private:
     struct ExecContext {
@@ -165,6 +198,7 @@ private:
 
     Database& _db;
     std::unique_ptr<Transaction> _tx;
+    bool _forceNestedLoop;
 };
 
 } // namespace db

@@ -148,6 +148,25 @@ void printStatementResult(const SqlStatementResult& sr) {
                 }
                 std::printf(" (candidates: %llu)\n",
                             static_cast<unsigned long long>(sr.candidateRowsVisited));
+                for (size_t j = 0; j < sr.joins.size(); ++j) {
+                    const SqlJoinDiagnostics& d = sr.joins[j];
+                    std::printf("Join %llu: %s %s AS %s\n",
+                                static_cast<unsigned long long>(j + 1),
+                                d.joinType.c_str(), d.rightTable.c_str(),
+                                d.rightAlias.c_str());
+                    std::printf("  Access path: %s", d.accessPath.c_str());
+                    if (!d.indexName.empty()) {
+                        std::printf(" %s", d.indexName.c_str());
+                    }
+                    std::printf("\n");
+                    std::printf("  left rows: %llu, probes: %llu, candidates: %llu, "
+                                "matches: %llu, null-extended: %llu\n",
+                                static_cast<unsigned long long>(d.leftRowsProcessed),
+                                static_cast<unsigned long long>(d.indexProbes),
+                                static_cast<unsigned long long>(d.candidatesFetched),
+                                static_cast<unsigned long long>(d.matchesEmitted),
+                                static_cast<unsigned long long>(d.nullExtendedRows));
+                }
             }
             printResultSet(sr.resultSet);
         } else if (sr.type == SqlStatementType::CreateTable) {

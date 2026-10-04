@@ -90,6 +90,38 @@ const size_t kSqlMaxSortBytes = 64u * 1024u * 1024u;
 const size_t kSqlMaxSortRows = 100000u;
 
 // ---------------------------------------------------------------------------
+// SQL7 query-shape and working-set limits (sections 15, 45, 46, 76).
+//
+// SQL7 may materialize bounded intermediate rows/groups, but a compact query
+// must never create an unbounded in-memory working set. These caps are enforced
+// by the joined/aggregate executor and reported as ResourceLimit.
+// ---------------------------------------------------------------------------
+
+// Maximum number of relation sources in one SELECT (FROM plus every JOIN).
+const size_t kSqlMaxJoinSources = 16u;
+
+// Maximum number of GROUP BY terms in one SELECT.
+const size_t kSqlMaxGroupByColumns = 64u;
+
+// Maximum joined/intermediate rows materialized between join steps.
+const size_t kSqlMaxJoinedRows = 100000u;
+
+// Maximum approximate joined/intermediate payload bytes.
+const size_t kSqlMaxJoinedBytes = 64u * 1024u * 1024u;
+
+// Maximum number of distinct groups in one GROUP BY.
+const size_t kSqlMaxGroupCount = 100000u;
+
+// Maximum approximate bytes held by group keys plus aggregate state.
+const size_t kSqlMaxGroupBytes = 64u * 1024u * 1024u;
+
+// Maximum number of surviving DISTINCT output rows.
+const size_t kSqlMaxDistinctRows = 100000u;
+
+// Maximum approximate bytes held by the DISTINCT working set.
+const size_t kSqlMaxDistinctBytes = 64u * 1024u * 1024u;
+
+// ---------------------------------------------------------------------------
 // Error taxonomy (SQL4 section 20).
 // ---------------------------------------------------------------------------
 
@@ -176,6 +208,19 @@ enum class SqlTokenKind {
     Primary,
     Key,
     On,
+    // SQL7 join, alias, aggregate and grouping keywords.
+    As,
+    Join,
+    Inner,
+    Left,
+    Outer,
+    Distinct,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Group,
     // Literals.
     Identifier,
     IntegerLiteral,
@@ -188,6 +233,7 @@ enum class SqlTokenKind {
     RightParen,
     Semicolon,
     Star,
+    Dot,
     // SQL5 comparison operators.
     Eq,
     Ne,

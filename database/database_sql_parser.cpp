@@ -19,6 +19,25 @@ const char* sqlStatementTypeName(SqlStatementType type) {
     return "UNKNOWN";
 }
 
+const char* sqlJoinTypeName(SqlJoinType type) {
+    switch (type) {
+    case SqlJoinType::Inner: return "INNER JOIN";
+    case SqlJoinType::Left: return "LEFT JOIN";
+    }
+    return "JOIN";
+}
+
+const char* sqlAggregateKindName(SqlAggregateKind kind) {
+    switch (kind) {
+    case SqlAggregateKind::Count: return "COUNT";
+    case SqlAggregateKind::Sum: return "SUM";
+    case SqlAggregateKind::Avg: return "AVG";
+    case SqlAggregateKind::Min: return "MIN";
+    case SqlAggregateKind::Max: return "MAX";
+    }
+    return "AGGREGATE";
+}
+
 const char* sqlCompareOpName(SqlCompareOp op) {
     switch (op) {
     case SqlCompareOp::Eq: return "=";
@@ -32,6 +51,22 @@ const char* sqlCompareOpName(SqlCompareOp op) {
 }
 
 namespace {
+
+// Words that are not SQL7 keywords but must never be swallowed as a bare table
+// alias, so unsupported join forms (RIGHT/FULL/CROSS JOIN) are rejected instead
+// of being reinterpreted as `FROM A AS RIGHT JOIN B`.
+bool isReservedAliasWord(const std::string& text) {
+    if (text.size() != 4 && text.size() != 5) {
+        return false;
+    }
+    std::string upper;
+    upper.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        upper.push_back((c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c);
+    }
+    return upper == "RIGHT" || upper == "FULL" || upper == "CROSS";
+}
 
 bool comparisonToken(SqlTokenKind kind, SqlCompareOp& out) {
     switch (kind) {
@@ -342,34 +377,33 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
 
 bool SqlParser::parseSelect(SqlStatementAst& out, SqlError& error) {
     advance(); // SELECT
-    if (match(SqlTokenKind::Star)) {
-        out.select.star = true;
-    } else {
-        SqlIdentifier identifier;
-        if (!parseIdentifier(identifier, error, "column name or '*'")) {
-            return false;
-        }
-        out.select.columns.push_back(identifier);
-        while (match(SqlTokenKind::Comma)) {
-            if (out.select.columns.size() >= kSqlMaxSelectColumns) {
-                error = makeError(SqlErrorCode::ResourceLimit,
-                                  "projection exceeds the SQL maximum", peek());
-                return false;
-            }
-            if (!parseIdentifier(identifier, error, "column name")) {
-                return false;
-            }
-            out.select.columns.push_back(identifier);
-        }
+    if (match(SqlTokenKind::Distinct)) {
+        out.select.distinct = true;
+    }
+    if (!parseSelectList(out.select, error)) {
+        return false;
     }
     if (!expect(SqlTokenKind::From, error, "FROM after projection")) {
         return false;
     }
-    if (!parseIdentifier(out.select.table, error, "table name")) {
+    if (!parseTableRef(out.select.from, error)) {
+        return false;
+    }
+    // The legacy base-table view mirrors the FROM relation name.
+    out.select.table = out.select.from.table;
+    if (!parseJoinClauses(out.select, error)) {
         return false;
     }
     if (!parseWhereClause(out.select.where, error)) {
         return false;
+    }
+    if (match(SqlTokenKind::Group)) {
+        if (!expect(SqlTokenKind::By, error, "BY after GROUP")) {
+            return false;
+        }
+        if (!parseGroupBy(out.select.groupBy, error)) {
+            return false;
+        }
     }
     if (match(SqlTokenKind::Order)) {
         if (!expect(SqlTokenKind::By, error, "BY after ORDER")) {
@@ -381,6 +415,196 @@ bool SqlParser::parseSelect(SqlStatementAst& out, SqlError& error) {
     }
     if (!parseLimitOffset(out.select, error)) {
         return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseSelectList(SqlSelectAst& out, SqlError& error) {
+    if (match(SqlTokenKind::Star)) {
+        out.star = true;
+        return true;
+    }
+    for (;;) {
+        if (out.projection.size() >= kSqlMaxSelectColumns) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "projection exceeds the SQL maximum", peek());
+            return false;
+        }
+        SqlProjectionItemAst item;
+        if (!parseProjectionItem(item, error)) {
+            return false;
+        }
+        if (item.kind == SqlProjectionKind::Column) {
+            out.columns.push_back(item.columnRef);
+        }
+        out.projection.push_back(item);
+        if (!match(SqlTokenKind::Comma)) {
+            break;
+        }
+    }
+    return true;
+}
+
+bool SqlParser::parseProjectionItem(SqlProjectionItemAst& out, SqlError& error) {
+    const SqlToken& token = peek();
+    out.line = token.line;
+    out.column = token.column;
+    switch (token.kind) {
+    case SqlTokenKind::Count:
+    case SqlTokenKind::Sum:
+    case SqlTokenKind::Avg:
+    case SqlTokenKind::Min:
+    case SqlTokenKind::Max:
+        return parseAggregate(out, error);
+    default:
+        break;
+    }
+    out.kind = SqlProjectionKind::Column;
+    if (!parseColumnRef(out.columnRef, error, "column name or '*'")) {
+        return false;
+    }
+    return parseProjectionAlias(out, error);
+}
+
+bool SqlParser::parseAggregate(SqlProjectionItemAst& out, SqlError& error) {
+    const SqlToken& token = peek();
+    out.line = token.line;
+    out.column = token.column;
+    switch (token.kind) {
+    case SqlTokenKind::Count: out.aggregate.kind = SqlAggregateKind::Count; break;
+    case SqlTokenKind::Sum: out.aggregate.kind = SqlAggregateKind::Sum; break;
+    case SqlTokenKind::Avg: out.aggregate.kind = SqlAggregateKind::Avg; break;
+    case SqlTokenKind::Min: out.aggregate.kind = SqlAggregateKind::Min; break;
+    case SqlTokenKind::Max: out.aggregate.kind = SqlAggregateKind::Max; break;
+    default:
+        error = makeError(SqlErrorCode::SyntaxError,
+                          "expected an aggregate function", token);
+        return false;
+    }
+    advance();
+    if (!expect(SqlTokenKind::LeftParen, error, "'(' after aggregate name")) {
+        return false;
+    }
+    if (out.aggregate.kind == SqlAggregateKind::Count &&
+        match(SqlTokenKind::Star)) {
+        out.aggregate.star = true;
+    } else {
+        if (!parseColumnRef(out.aggregate.column, error, "aggregate column name")) {
+            return false;
+        }
+    }
+    if (!expect(SqlTokenKind::RightParen, error, "')' after aggregate argument")) {
+        return false;
+    }
+    out.kind = SqlProjectionKind::Aggregate;
+    return parseProjectionAlias(out, error);
+}
+
+bool SqlParser::parseProjectionAlias(SqlProjectionItemAst& out, SqlError& error) {
+    if (match(SqlTokenKind::As)) {
+        if (!parseIdentifier(out.alias, error, "projection alias")) {
+            return false;
+        }
+        out.hasAlias = true;
+        return true;
+    }
+    // A bare trailing identifier is a projection alias when one is present.
+    if (check(SqlTokenKind::Identifier)) {
+        if (!parseIdentifier(out.alias, error, "projection alias")) {
+            return false;
+        }
+        out.hasAlias = true;
+    }
+    return true;
+}
+
+bool SqlParser::parseTableRef(SqlTableRefAst& out, SqlError& error) {
+    if (!parseIdentifier(out.table, error, "table name")) {
+        return false;
+    }
+    if (match(SqlTokenKind::As)) {
+        if (!parseIdentifier(out.alias, error, "table alias")) {
+            return false;
+        }
+        out.hasAlias = true;
+        return true;
+    }
+    // `FROM Users u` is unambiguous: only an identifier can follow a table name
+    // where a join, WHERE, GROUP, ORDER, LIMIT, OFFSET or terminator may appear.
+    // Reserved words for unsupported join forms are never taken as aliases.
+    if (check(SqlTokenKind::Identifier) && !isReservedAliasWord(peek().text)) {
+        if (!parseIdentifier(out.alias, error, "table alias")) {
+            return false;
+        }
+        out.hasAlias = true;
+    }
+    return true;
+}
+
+bool SqlParser::parseJoinClauses(SqlSelectAst& out, SqlError& error) {
+    for (;;) {
+        SqlJoinAst join;
+        const SqlToken& token = peek();
+        join.line = token.line;
+        join.column = token.column;
+        if (check(SqlTokenKind::Join)) {
+            advance();
+            join.type = SqlJoinType::Inner;
+        } else if (check(SqlTokenKind::Inner)) {
+            advance();
+            if (!expect(SqlTokenKind::Join, error, "JOIN after INNER")) {
+                return false;
+            }
+            join.type = SqlJoinType::Inner;
+        } else if (check(SqlTokenKind::Left)) {
+            advance();
+            match(SqlTokenKind::Outer);
+            if (!expect(SqlTokenKind::Join, error, "JOIN after LEFT")) {
+                return false;
+            }
+            join.type = SqlJoinType::Left;
+        } else {
+            break;
+        }
+        if (out.joins.size() + 1 >= kSqlMaxJoinSources) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "relation source count exceeds the SQL7 maximum", token);
+            return false;
+        }
+        if (!parseTableRef(join.table, error)) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::On, error, "ON after joined relation")) {
+            return false;
+        }
+        join.on.nodes.clear();
+        join.on.root = -1;
+        join.on.present = true;
+        int32_t root = -1;
+        if (!parseOrExpr(join.on, root, error)) {
+            return false;
+        }
+        join.on.root = root;
+        out.joins.push_back(join);
+    }
+    return true;
+}
+
+bool SqlParser::parseGroupBy(std::vector<SqlIdentifier>& out, SqlError& error) {
+    for (;;) {
+        if (out.size() >= kSqlMaxGroupByColumns) {
+            error = makeError(SqlErrorCode::ResourceLimit,
+                              "GROUP BY term count exceeds the SQL7 maximum", peek());
+            return false;
+        }
+        SqlIdentifier identifier;
+        if (!parseColumnRef(identifier, error, "column name")) {
+            return false;
+        }
+        out.push_back(identifier);
+        if (!match(SqlTokenKind::Comma)) {
+            break;
+        }
     }
     return true;
 }
@@ -452,7 +676,7 @@ bool SqlParser::parseAssignments(std::vector<SqlAssignmentAst>& out,
 
 bool SqlParser::parseOrderBy(std::vector<SqlOrderTermAst>& out, SqlError& error) {
     SqlOrderTermAst term;
-    if (!parseIdentifier(term.column, error, "column name")) {
+    if (!parseColumnRef(term.column, error, "column name")) {
         return false;
     }
     if (match(SqlTokenKind::Asc)) {
@@ -468,7 +692,7 @@ bool SqlParser::parseOrderBy(std::vector<SqlOrderTermAst>& out, SqlError& error)
             return false;
         }
         SqlOrderTermAst next;
-        if (!parseIdentifier(next.column, error, "column name")) {
+        if (!parseColumnRef(next.column, error, "column name")) {
             return false;
         }
         if (match(SqlTokenKind::Asc)) {
@@ -579,9 +803,30 @@ bool SqlParser::parseIdentifier(SqlIdentifier& out, SqlError& error,
     }
     const SqlToken& token = peek();
     out.name = token.text;
+    out.qualifier.clear();
+    out.hasQualifier = false;
     out.line = token.line;
     out.column = token.column;
     advance();
+    return true;
+}
+
+bool SqlParser::parseColumnRef(SqlIdentifier& out, SqlError& error,
+                               const char* what) {
+    if (!parseIdentifier(out, error, what)) {
+        return false;
+    }
+    if (match(SqlTokenKind::Dot)) {
+        SqlIdentifier column;
+        if (!parseIdentifier(column, error, "column name after '.'")) {
+            return false;
+        }
+        out.hasQualifier = true;
+        out.qualifier = out.name;
+        out.name = column.name;
+        out.line = column.line;
+        out.column = column.column;
+    }
     return true;
 }
 
@@ -761,11 +1006,12 @@ bool SqlParser::parsePrimary(SqlPredicateAst& arena, int32_t& out, SqlError& err
         if (index < 0) {
             return false;
         }
+        SqlIdentifier identifier;
+        if (!parseColumnRef(identifier, error, "column name")) {
+            return false;
+        }
         arena.nodes[index].kind = SqlExprKind::ColumnRef;
-        arena.nodes[index].identifier.name = token.text;
-        arena.nodes[index].identifier.line = token.line;
-        arena.nodes[index].identifier.column = token.column;
-        advance();
+        arena.nodes[index].identifier = identifier;
         out = index;
         return true;
     }
