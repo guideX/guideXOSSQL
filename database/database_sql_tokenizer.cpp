@@ -16,12 +16,12 @@ bool isAsciiAlpha(char c) {
 }
 
 bool isWordStart(unsigned char c) {
-    return isAsciiAlpha(static_cast<char>(c)) || c == '_' || c >= 0x80u;
+    return isAsciiAlpha(static_cast<char>(c)) || c == '_' || c == '$' || c >= 0x80u;
 }
 
 bool isWordContinue(unsigned char c) {
     return isAsciiAlpha(static_cast<char>(c)) || isAsciiDigit(static_cast<char>(c)) ||
-           c == '_' || c >= 0x80u;
+           c == '_' || c == '$' || c >= 0x80u;
 }
 
 bool isHexDigit(char c) {
@@ -129,6 +129,13 @@ SqlTokenKind keywordKind(const std::string& upper) {
     if (upper == "MIN") return SqlTokenKind::Min;
     if (upper == "MAX") return SqlTokenKind::Max;
     if (upper == "GROUP") return SqlTokenKind::Group;
+    if (upper == "DEFAULT") return SqlTokenKind::Default;
+    if (upper == "FOREIGN") return SqlTokenKind::Foreign;
+    if (upper == "REFERENCES") return SqlTokenKind::References;
+    if (upper == "DROP") return SqlTokenKind::Drop;
+    if (upper == "ALTER") return SqlTokenKind::Alter;
+    if (upper == "ADD") return SqlTokenKind::Add;
+    if (upper == "COLUMN") return SqlTokenKind::Column;
     return SqlTokenKind::Identifier;
 }
 

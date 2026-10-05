@@ -156,6 +156,12 @@ DbResult DatabaseFile::validateBootstrap(const DatabasePage& root) {
         }
         return DbResult::ok();
     }
+    if (catalogVersion == kCatalogVersionV4) {
+        if (root.payloadSize < kCatalogV4RootHeaderSize) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog v4 root header truncated");
+        }
+        return DbResult::ok();
+    }
     if (catalogVersion != kCatalogVersion) {
         return DbResult::error(DbStatus::UnsupportedVersion,
                                "unsupported catalog version " +

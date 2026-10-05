@@ -1,5 +1,6 @@
 #include "database_relational.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include "database_endian.h"
@@ -14,6 +15,41 @@ namespace db {
 namespace {
 
 const uint32_t kDefaultBufferCapacity = 32;
+
+// Human-readable rendering of a column DEFAULT value for diagnostics.
+std::string describeDbValue(const DbValue& value) {
+    if (value.isNull()) {
+        return "NULL";
+    }
+    switch (value.type()) {
+    case DbType::Boolean:
+        return value.booleanValue() ? "TRUE" : "FALSE";
+    case DbType::Int32:
+        return std::to_string(static_cast<long long>(value.int32Value()));
+    case DbType::Int64:
+        return std::to_string(static_cast<long long>(value.int64Value()));
+    case DbType::Float64: {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%.17g", value.float64Value());
+        return buffer;
+    }
+    case DbType::Text:
+        return "'" + value.textValue() + "'";
+    case DbType::Blob: {
+        const std::vector<uint8_t>& bytes = value.blobValue();
+        std::string out = "X'";
+        static const char* hex = "0123456789ABCDEF";
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            out.push_back(hex[(bytes[i] >> 4) & 0xF]);
+            out.push_back(hex[bytes[i] & 0xF]);
+        }
+        out += "'";
+        return out;
+    }
+    default:
+        return "?";
+    }
+}
 
 } // namespace
 
@@ -466,6 +502,270 @@ DbResult Database::createIndex(const IndexDefinition& def, uint32_t& outIndexId)
     return tx->commit();
 }
 
+DbResult Database::dropIndex(const std::string& name) {
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    const Catalog::IndexRecord* rec = _catalog.findIndex(name);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    if (_activeTx != nullptr) {
+        DbResult result = _catalog.removeIndex(rec->indexId);
+        if (result.isOk()) {
+            markCatalogDirty();
+        }
+        return result;
+    }
+
+    std::unique_ptr<Transaction> tx;
+    DbResult result = beginTransaction(tx);
+    if (!result.isOk()) {
+        return result;
+    }
+    result = _catalog.removeIndex(rec->indexId);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    markCatalogDirty();
+    return tx->commit();
+}
+
+DbResult Database::dropTable(const std::string& name) {
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    const Catalog::TableRecord* rec = _catalog.findTable(name);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such table");
+    }
+    if (_activeTx != nullptr) {
+        DbResult result = _catalog.removeTable(rec->tableId);
+        if (result.isOk()) {
+            markCatalogDirty();
+        }
+        return result;
+    }
+
+    std::unique_ptr<Transaction> tx;
+    DbResult result = beginTransaction(tx);
+    if (!result.isOk()) {
+        return result;
+    }
+    result = _catalog.removeTable(rec->tableId);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    markCatalogDirty();
+    return tx->commit();
+}
+
+DbResult Database::alterTableAddColumn(const std::string& name, const ColumnDefinition& col) {
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    const Catalog::TableRecord* rec = _catalog.findTable(name);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such table");
+    }
+    const uint32_t tableId = rec->tableId;
+
+    // Validate: NOT NULL + no default on a non-empty table is rejected.
+    if (rec->rowCount > 0 && !col.nullable && !col.hasDefault) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "cannot add NOT NULL column without default to non-empty table");
+    }
+
+    if (_activeTx != nullptr) {
+        Table table(*this, tableId);
+        return table.alterAddColumn(col);
+    }
+
+    std::unique_ptr<Transaction> tx;
+    DbResult result = beginTransaction(tx);
+    if (!result.isOk()) {
+        return result;
+    }
+    Table table(*this, tableId);
+    result = table.alterAddColumn(col);
+    if (!result.isOk()) {
+        tx->rollback();
+        return result;
+    }
+    return tx->commit();
+}
+
+DbResult Database::listForeignKeys(std::vector<ForeignKeyInfo>& out) const {
+    out.clear();
+    if (!_open) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    const std::vector<Catalog::ForeignKeyRecord>& fks = _catalog.foreignKeys();
+    out.reserve(fks.size());
+    for (size_t i = 0; i < fks.size(); ++i) {
+        ForeignKeyInfo info;
+        info.foreignKeyId = fks[i].foreignKeyId;
+        info.childTableId = fks[i].childTableId;
+        info.childColumnOrdinal = fks[i].childColumnOrdinal;
+        info.parentTableId = fks[i].parentTableId;
+        info.parentColumnOrdinal = fks[i].parentColumnOrdinal;
+        info.referencedIndexId = fks[i].referencedIndexId;
+        info.supportIndexId = fks[i].supportIndexId;
+        const Catalog::TableRecord* childTable = _catalog.findTable(fks[i].childTableId);
+        if (childTable != nullptr) {
+            info.childTableName = childTable->name;
+            if (fks[i].childColumnOrdinal < childTable->columns.size()) {
+                info.childColumnName = childTable->columns[fks[i].childColumnOrdinal].name;
+            }
+        }
+        const Catalog::TableRecord* parentTable = _catalog.findTable(fks[i].parentTableId);
+        if (parentTable != nullptr) {
+            info.parentTableName = parentTable->name;
+            if (fks[i].parentColumnOrdinal < parentTable->columns.size()) {
+                info.parentColumnName = parentTable->columns[fks[i].parentColumnOrdinal].name;
+            }
+        }
+        out.push_back(info);
+    }
+    return DbResult::ok();
+}
+
+DbResult Database::validateIntegrity(std::string& message) {
+    message.clear();
+    if (!_open) {
+        message = "database is not open";
+        return DbResult::error(DbStatus::NotOpen, message);
+    }
+    const std::vector<Catalog::ForeignKeyRecord>& fks = _catalog.foreignKeys();
+    for (size_t i = 0; i < fks.size(); ++i) {
+        const Catalog::ForeignKeyRecord& fk = fks[i];
+        const Catalog::TableRecord* child = _catalog.findTable(fk.childTableId);
+        if (child == nullptr) {
+            message = "foreign key references unknown child table";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        const Catalog::TableRecord* parent = _catalog.findTable(fk.parentTableId);
+        if (parent == nullptr) {
+            message = "foreign key references unknown parent table";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (fk.childColumnOrdinal >= child->columns.size()) {
+            message = "foreign key child column out of range";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (fk.parentColumnOrdinal >= parent->columns.size()) {
+            message = "foreign key parent column out of range";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (child->columns[fk.childColumnOrdinal].type !=
+            parent->columns[fk.parentColumnOrdinal].type) {
+            message = "foreign key column types do not match";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+
+        const Catalog::IndexRecord* referenced = _catalog.findIndex(fk.referencedIndexId);
+        if (referenced == nullptr) {
+            message = "foreign key references unknown index";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (referenced->tableId != fk.parentTableId ||
+            referenced->columnOrdinal != fk.parentColumnOrdinal ||
+            !indexKindIsUnique(referenced->kind())) {
+            message = "foreign key referenced index is not a UNIQUE/PK index on the parent column";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+
+        const Catalog::IndexRecord* support = _catalog.findIndex(fk.supportIndexId);
+        if (support == nullptr) {
+            message = "foreign key support index missing";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (support->tableId != fk.childTableId ||
+            support->columnOrdinal != fk.childColumnOrdinal) {
+            message = "foreign key support index is not on the child column";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        if (!support->systemOwned() || support->ownerForeignKeyId != fk.foreignKeyId) {
+            message = "foreign key support index ownership mismatch";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+
+        IndexValidation supportValidation;
+        if (!validateIndex(fk.supportIndexId, supportValidation).isOk() ||
+            !supportValidation.ok) {
+            message = "foreign key support index failed structural validation";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+        IndexValidation refValidation;
+        if (!validateIndex(fk.referencedIndexId, refValidation).isOk() ||
+            !refValidation.ok) {
+            message = "foreign key referenced index failed structural validation";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+
+        // Every non-NULL child key must resolve through the referenced index.
+        Table childTable(*this, fk.childTableId);
+        std::unique_ptr<TableScan> scan;
+        DbResult scanResult = childTable.scanStart(scan);
+        if (!scanResult.isOk()) {
+            message = "cannot scan foreign key child table";
+            return scanResult;
+        }
+        const DbType childType = child->columns[fk.childColumnOrdinal].type;
+        std::vector<DbValue> row;
+        while (scan->next(row)) {
+            if (fk.childColumnOrdinal >= row.size()) {
+                message = "child row is missing the foreign key column";
+                return DbResult::error(DbStatus::CorruptPage, message);
+            }
+            const DbValue& value = row[fk.childColumnOrdinal];
+            if (value.isNull()) {
+                continue;
+            }
+            std::vector<uint8_t> key;
+            if (!encodeIndexKey(childType, value, key)) {
+                message = "foreign key child key could not be encoded";
+                return DbResult::error(DbStatus::CorruptPage, message);
+            }
+            std::vector<RowLocator> locators;
+            if (!indexLookup(fk.referencedIndexId, key, locators).isOk()) {
+                message = "foreign key referenced index lookup failed";
+                return DbResult::error(DbStatus::CorruptPage, message);
+            }
+            if (locators.empty()) {
+                message = "dangling foreign key reference";
+                return DbResult::error(DbStatus::CorruptPage, message);
+            }
+        }
+        if (!scan->status().isOk()) {
+            message = "foreign key child scan failed";
+            return scan->status();
+        }
+    }
+
+    // No orphan system-owned support index may exist without its FK record.
+    const std::vector<Catalog::IndexRecord>& indexes = _catalog.indexes();
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (indexes[i].ownerForeignKeyId != 0 &&
+            _catalog.findForeignKey(indexes[i].ownerForeignKeyId) == nullptr) {
+            message = "orphan foreign-key support index";
+            return DbResult::error(DbStatus::CorruptPage, message);
+        }
+    }
+    return DbResult::ok();
+}
+
 DbResult Database::buildIndex(uint32_t indexId) {
     const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
     if (rec == nullptr) {
@@ -753,9 +1053,22 @@ void Database::refreshDiagnostics() {
         TableDiagnostics td;
         td.tableId = tables[i].tableId;
         td.name = tables[i].name;
+        td.schemaVersion = tables[i].schemaVersion;
         td.columnCount = static_cast<uint32_t>(tables[i].columns.size());
         td.heapPageCount = tables[i].heapPageCount;
         td.rowCount = tables[i].rowCount;
+        for (size_t c = 0; c < tables[i].columns.size(); ++c) {
+            const ColumnDefinition& col = tables[i].columns[c];
+            ColumnDiagnostics cd;
+            cd.name = col.name;
+            cd.typeName = dbTypeName(col.type);
+            cd.nullable = col.nullable;
+            cd.hasDefault = col.hasDefault;
+            if (col.hasDefault) {
+                cd.defaultValue = describeDbValue(col.defaultValue);
+            }
+            td.columns.push_back(cd);
+        }
         _diagnostics.tables.push_back(td);
     }
 
@@ -769,6 +1082,8 @@ void Database::refreshDiagnostics() {
         id.tableId = indexes[i].tableId;
         id.unique = indexes[i].unique();
         id.primaryKey = indexes[i].primaryKey();
+        id.systemOwned = indexes[i].systemOwned();
+        id.ownerForeignKeyId = indexes[i].ownerForeignKeyId;
         id.rootPageId = indexes[i].rootPageId;
         id.entryCount = indexes[i].entryCount;
         id.formatVersion = indexes[i].formatVersion;
@@ -780,6 +1095,33 @@ void Database::refreshDiagnostics() {
             }
         }
         _diagnostics.indexes.push_back(id);
+    }
+
+    _diagnostics.foreignKeys.clear();
+    const std::vector<Catalog::ForeignKeyRecord>& fks = _catalog.foreignKeys();
+    _diagnostics.foreignKeyCount = static_cast<uint32_t>(fks.size());
+    for (size_t i = 0; i < fks.size(); ++i) {
+        ForeignKeyDiagnostics fd;
+        fd.foreignKeyId = fks[i].foreignKeyId;
+        fd.childTableId = fks[i].childTableId;
+        fd.parentTableId = fks[i].parentTableId;
+        fd.referencedIndexId = fks[i].referencedIndexId;
+        fd.supportIndexId = fks[i].supportIndexId;
+        const Catalog::TableRecord* child = _catalog.findTable(fks[i].childTableId);
+        if (child != nullptr) {
+            fd.childTableName = child->name;
+            if (fks[i].childColumnOrdinal < child->columns.size()) {
+                fd.childColumnName = child->columns[fks[i].childColumnOrdinal].name;
+            }
+        }
+        const Catalog::TableRecord* parent = _catalog.findTable(fks[i].parentTableId);
+        if (parent != nullptr) {
+            fd.parentTableName = parent->name;
+            if (fks[i].parentColumnOrdinal < parent->columns.size()) {
+                fd.parentColumnName = parent->columns[fks[i].parentColumnOrdinal].name;
+            }
+        }
+        _diagnostics.foreignKeys.push_back(fd);
     }
     if (_file) {
         _diagnostics.state = _file->diagnostics().state;

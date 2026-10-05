@@ -14,6 +14,9 @@ const char* sqlStatementTypeName(SqlStatementType type) {
     case SqlStatementType::Begin: return "BEGIN";
     case SqlStatementType::Commit: return "COMMIT";
     case SqlStatementType::Rollback: return "ROLLBACK";
+    case SqlStatementType::DropIndex: return "DROP INDEX";
+    case SqlStatementType::DropTable: return "DROP TABLE";
+    case SqlStatementType::AlterTableAddColumn: return "ALTER TABLE ADD COLUMN";
     case SqlStatementType::Unknown: return "UNKNOWN";
     }
     return "UNKNOWN";
@@ -200,6 +203,24 @@ bool SqlParser::parseStatement(SqlStatementAst& out, SqlError& error) {
         advance();
         out.type = SqlStatementType::Rollback;
         return true;
+    case SqlTokenKind::Drop: {
+        const SqlTokenKind next = peek(1).kind;
+        if (next == SqlTokenKind::Index) {
+            out.type = SqlStatementType::DropIndex;
+            return parseDropIndex(out, error);
+        }
+        if (next == SqlTokenKind::Table) {
+            out.type = SqlStatementType::DropTable;
+            return parseDropTable(out, error);
+        }
+        std::string message = "expected INDEX or TABLE after DROP, found ";
+        message += sqlTokenKindName(next);
+        error = makeError(SqlErrorCode::SyntaxError, message, peek(1));
+        return false;
+    }
+    case SqlTokenKind::Alter:
+        out.type = SqlStatementType::AlterTableAddColumn;
+        return parseAlterTableAddColumn(out, error);
     default: {
         std::string message = "unexpected ";
         message += sqlTokenKindName(token.kind);
@@ -227,6 +248,9 @@ bool SqlParser::parseCreateTable(SqlStatementAst& out, SqlError& error) {
     }
     out.createTable.columns.push_back(column);
     while (match(SqlTokenKind::Comma)) {
+        if (check(SqlTokenKind::Foreign)) {
+            break;
+        }
         if (out.createTable.columns.size() >= kSqlMaxColumnsPerCreate) {
             error = makeError(SqlErrorCode::ResourceLimit,
                               "column count exceeds the SQL maximum", peek());
@@ -237,6 +261,61 @@ bool SqlParser::parseCreateTable(SqlStatementAst& out, SqlError& error) {
         }
         out.createTable.columns.push_back(column);
     }
+
+    // SQL8: table-level FOREIGN KEY constraints.
+    while (match(SqlTokenKind::Foreign)) {
+        if (!expect(SqlTokenKind::Key, error, "KEY after FOREIGN")) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::LeftParen, error, "'(' after FOREIGN KEY")) {
+            return false;
+        }
+        SqlForeignKeyAst fk;
+        fk.line = peek().line;
+        fk.column = peek().column;
+        if (!parseIdentifier(fk.childColumn, error, "child column name")) {
+            return false;
+        }
+        if (check(SqlTokenKind::Comma)) {
+            error = makeError(SqlErrorCode::Unsupported,
+                              "composite foreign keys are not supported", peek());
+            return false;
+        }
+        if (!expect(SqlTokenKind::RightParen, error, "')' after child column")) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::References, error, "REFERENCES after child column")) {
+            return false;
+        }
+        if (!parseIdentifier(fk.parentTable, error, "parent table name")) {
+            return false;
+        }
+        if (!expect(SqlTokenKind::LeftParen, error, "'(' after parent table name")) {
+            return false;
+        }
+        if (!parseIdentifier(fk.parentColumn, error, "parent column name")) {
+            return false;
+        }
+        if (check(SqlTokenKind::Comma)) {
+            error = makeError(SqlErrorCode::Unsupported,
+                              "composite foreign keys are not supported", peek());
+            return false;
+        }
+        if (!expect(SqlTokenKind::RightParen, error, "')' after parent column")) {
+            return false;
+        }
+        // Reject unsupported referential actions.
+        if (check(SqlTokenKind::On)) {
+            error = makeError(SqlErrorCode::Unsupported,
+                              "ON DELETE/UPDATE referential actions are not supported", peek());
+            return false;
+        }
+        out.createTable.foreignKeys.push_back(fk);
+        if (!match(SqlTokenKind::Comma)) {
+            break;
+        }
+    }
+
     if (!expect(SqlTokenKind::RightParen, error, "')' after column list")) {
         return false;
     }
@@ -246,6 +325,7 @@ bool SqlParser::parseCreateTable(SqlStatementAst& out, SqlError& error) {
 bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
     out.primaryKey = false;
     out.unique = false;
+    out.hasDefault = false;
     if (!parseIdentifier(out.name, error, "column name")) {
         return false;
     }
@@ -296,9 +376,26 @@ bool SqlParser::parseColumnDef(SqlColumnDefAst& out, SqlError& error) {
             out.nullable = false;
         } else if (match(SqlTokenKind::Unique)) {
             out.unique = true;
+        } else if (match(SqlTokenKind::Default)) {
+            if (out.hasDefault) {
+                error = makeError(SqlErrorCode::SemanticError,
+                                  "duplicate DEFAULT constraint", peek());
+                return false;
+            }
+            if (!parseLiteral(out.defaultValue, error)) {
+                return false;
+            }
+            out.hasDefault = true;
         } else {
             break;
         }
+    }
+
+    // SQL8: NOT NULL + DEFAULT NULL is rejected.
+    if (!out.nullable && out.hasDefault && out.defaultValue.kind == SqlLiteralKind::Null) {
+        error = makeError(SqlErrorCode::SemanticError,
+                          "NOT NULL column cannot have DEFAULT NULL", peek());
+        return false;
     }
     return true;
 }
@@ -347,6 +444,33 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
     if (!parseIdentifier(out.insert.table, error, "table name")) {
         return false;
     }
+
+    // SQL8: optional column list. A '(' immediately after the table name can
+    // only be a column list, because the no-column-list form is followed by the
+    // VALUES keyword.
+    if (check(SqlTokenKind::LeftParen)) {
+        advance(); // (
+        out.insert.hasColumnList = true;
+        SqlIdentifier col;
+        if (!parseIdentifier(col, error, "column name")) {
+            return false;
+        }
+        out.insert.columnList.push_back(col);
+        while (match(SqlTokenKind::Comma)) {
+            if (out.insert.columnList.size() >= kSqlMaxColumnsPerCreate) {
+                error = makeError(SqlErrorCode::ResourceLimit,
+                                  "column list count exceeds the SQL maximum", peek());
+                return false;
+            }
+            if (!parseIdentifier(col, error, "column name")) {
+                return false;
+            }
+            out.insert.columnList.push_back(col);
+        }
+        if (!expect(SqlTokenKind::RightParen, error, "')' after column list")) {
+            return false;
+        }
+    }
     if (!expect(SqlTokenKind::Values, error, "VALUES after table name")) {
         return false;
     }
@@ -354,7 +478,7 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
         return false;
     }
     SqlLiteralAst literal;
-    if (!parseLiteral(literal, error)) {
+    if (!parseInsertValue(literal, error)) {
         return false;
     }
     out.insert.values.push_back(literal);
@@ -364,7 +488,7 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
                               "value count exceeds the SQL maximum", peek());
             return false;
         }
-        if (!parseLiteral(literal, error)) {
+        if (!parseInsertValue(literal, error)) {
             return false;
         }
         out.insert.values.push_back(literal);
@@ -373,6 +497,19 @@ bool SqlParser::parseInsert(SqlStatementAst& out, SqlError& error) {
         return false;
     }
     return true;
+}
+
+bool SqlParser::parseInsertValue(SqlLiteralAst& out, SqlError& error) {
+    if (check(SqlTokenKind::Default)) {
+        const SqlToken& token = peek();
+        out.kind = SqlLiteralKind::Null;
+        out.isDefault = true;
+        out.line = token.line;
+        out.column = token.column;
+        advance();
+        return true;
+    }
+    return parseLiteral(out, error);
 }
 
 bool SqlParser::parseSelect(SqlStatementAst& out, SqlError& error) {
@@ -640,6 +777,48 @@ bool SqlParser::parseDelete(SqlStatementAst& out, SqlError& error) {
     return true;
 }
 
+bool SqlParser::parseDropIndex(SqlStatementAst& out, SqlError& error) {
+    advance(); // DROP
+    if (!expect(SqlTokenKind::Index, error, "INDEX after DROP")) {
+        return false;
+    }
+    if (!parseIdentifier(out.dropIndex.index, error, "index name")) {
+        return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseDropTable(SqlStatementAst& out, SqlError& error) {
+    advance(); // DROP
+    if (!expect(SqlTokenKind::Table, error, "TABLE after DROP")) {
+        return false;
+    }
+    if (!parseIdentifier(out.dropTable.table, error, "table name")) {
+        return false;
+    }
+    return true;
+}
+
+bool SqlParser::parseAlterTableAddColumn(SqlStatementAst& out, SqlError& error) {
+    advance(); // ALTER
+    if (!expect(SqlTokenKind::Table, error, "TABLE after ALTER")) {
+        return false;
+    }
+    if (!parseIdentifier(out.alterTableAddColumn.table, error, "table name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::Add, error, "ADD after table name")) {
+        return false;
+    }
+    if (!expect(SqlTokenKind::Column, error, "COLUMN after ADD")) {
+        return false;
+    }
+    if (!parseColumnDef(out.alterTableAddColumn.columnDef, error)) {
+        return false;
+    }
+    return true;
+}
+
 bool SqlParser::parseAssignments(std::vector<SqlAssignmentAst>& out,
                                  SqlError& error) {
     SqlAssignmentAst assignment;
@@ -745,6 +924,7 @@ bool SqlParser::parseLimitOffset(SqlSelectAst& out, SqlError& error) {
 
 bool SqlParser::parseLiteral(SqlLiteralAst& out, SqlError& error) {
     const SqlToken& token = peek();
+    out.isDefault = false;
     out.line = token.line;
     out.column = token.column;
     switch (token.kind) {

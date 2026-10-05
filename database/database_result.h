@@ -38,7 +38,10 @@ enum class DbStatus : int {
     RecoveryRequired,
     RecoveryFailed,
     CommitFailed,
-    RollbackFailed
+    RollbackFailed,
+    // ---- Phase SQL8: foreign keys and schema lifecycle -------------------
+    ForeignKeyViolation,
+    DependencyExists
 };
 
 inline const char* dbStatusName(DbStatus status) {
@@ -67,6 +70,8 @@ inline const char* dbStatusName(DbStatus status) {
     case DbStatus::RecoveryFailed: return "RecoveryFailed";
     case DbStatus::CommitFailed: return "CommitFailed";
     case DbStatus::RollbackFailed: return "RollbackFailed";
+    case DbStatus::ForeignKeyViolation: return "ForeignKeyViolation";
+    case DbStatus::DependencyExists: return "DependencyExists";
     }
     return "Unknown";
 }

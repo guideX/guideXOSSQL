@@ -180,6 +180,10 @@ private:
                        SqlStatementResult& out);
     bool executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
                        SqlStatementResult& out);
+    bool executeDropIndex(const SqlDropIndexAst& ast, SqlStatementResult& out);
+    bool executeDropTable(const SqlDropTableAst& ast, SqlStatementResult& out);
+    bool executeAlterTableAddColumn(const SqlAlterTableAddColumnAst& ast,
+                                    SqlStatementResult& out);
     // Applies a mutation plan, wrapping it in the active transaction with a
     // statement-level savepoint when one exists.
     bool applyMutationPlan(Table* table, ExecContext& ctx,

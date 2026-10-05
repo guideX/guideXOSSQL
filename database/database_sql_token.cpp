@@ -13,6 +13,8 @@ const char* sqlErrorCodeName(SqlErrorCode code) {
     case SqlErrorCode::TransactionError: return "TransactionError";
     case SqlErrorCode::ResourceLimit: return "ResourceLimit";
     case SqlErrorCode::Unsupported: return "Unsupported";
+    case SqlErrorCode::ForeignKeyViolation: return "ForeignKeyViolation";
+    case SqlErrorCode::DependencyError: return "DependencyError";
     }
     return "Unknown";
 }
@@ -89,6 +91,13 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::Min: return "MIN";
     case SqlTokenKind::Max: return "MAX";
     case SqlTokenKind::Group: return "GROUP";
+    case SqlTokenKind::Default: return "DEFAULT";
+    case SqlTokenKind::Foreign: return "FOREIGN";
+    case SqlTokenKind::References: return "REFERENCES";
+    case SqlTokenKind::Drop: return "DROP";
+    case SqlTokenKind::Alter: return "ALTER";
+    case SqlTokenKind::Add: return "ADD";
+    case SqlTokenKind::Column: return "COLUMN";
     case SqlTokenKind::Identifier: return "identifier";
     case SqlTokenKind::IntegerLiteral: return "integer literal";
     case SqlTokenKind::FloatLiteral: return "float literal";
@@ -112,7 +121,7 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
 }
 
 bool sqlTokenIsKeyword(SqlTokenKind kind) {
-    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::Group;
+    return kind >= SqlTokenKind::Create && kind <= SqlTokenKind::Column;
 }
 
 bool sqlTokenIsTypeKeyword(SqlTokenKind kind) {

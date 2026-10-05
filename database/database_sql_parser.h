@@ -44,8 +44,12 @@ private:
     bool parseSelect(SqlStatementAst& out, SqlError& error);
     bool parseUpdate(SqlStatementAst& out, SqlError& error);
     bool parseDelete(SqlStatementAst& out, SqlError& error);
+    bool parseDropIndex(SqlStatementAst& out, SqlError& error);
+    bool parseDropTable(SqlStatementAst& out, SqlError& error);
+    bool parseAlterTableAddColumn(SqlStatementAst& out, SqlError& error);
     bool parseColumnDef(SqlColumnDefAst& out, SqlError& error);
     bool parseLiteral(SqlLiteralAst& out, SqlError& error);
+    bool parseInsertValue(SqlLiteralAst& out, SqlError& error);
     bool parseIdentifier(SqlIdentifier& out, SqlError& error, const char* what);
     // Parses `identifier [ '.' identifier ]` into a possibly qualified column
     // reference.

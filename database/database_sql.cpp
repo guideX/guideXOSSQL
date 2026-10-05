@@ -375,6 +375,10 @@ SqlErrorCode mapStatusToSqlCode(DbStatus status) {
     case DbStatus::TransactionTooLarge:
     case DbStatus::NoSpace:
         return SqlErrorCode::ResourceLimit;
+    case DbStatus::ForeignKeyViolation:
+        return SqlErrorCode::ForeignKeyViolation;
+    case DbStatus::DependencyExists:
+        return SqlErrorCode::DependencyError;
     default:
         return SqlErrorCode::ExecutionError;
     }
@@ -1353,6 +1357,18 @@ bool SqlEngine::executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
         ctx.tables.clear();
         ok = executeRollback(out);
         break;
+    case SqlStatementType::DropIndex:
+        ctx.tables.clear();
+        ok = executeDropIndex(stmt.dropIndex, out);
+        break;
+    case SqlStatementType::DropTable:
+        ctx.tables.clear();
+        ok = executeDropTable(stmt.dropTable, out);
+        break;
+    case SqlStatementType::AlterTableAddColumn:
+        ctx.tables.clear();
+        ok = executeAlterTableAddColumn(stmt.alterTableAddColumn, out);
+        break;
     case SqlStatementType::Unknown:
         out.error = makeSemantic("unsupported statement", stmt.line, stmt.column);
         out.error.code = SqlErrorCode::Unsupported;
@@ -1376,8 +1392,19 @@ bool SqlEngine::executeCreateTable(const SqlCreateTableAst& ast,
     TableDefinition definition;
     definition.name = ast.table.name;
     for (size_t i = 0; i < ast.columns.size(); ++i) {
-        definition.columns.push_back(ColumnDefinition(
-            ast.columns[i].name.name, ast.columns[i].type, ast.columns[i].nullable));
+        ColumnDefinition col(ast.columns[i].name.name, ast.columns[i].type,
+                            ast.columns[i].nullable);
+        if (ast.columns[i].hasDefault) {
+            col.hasDefault = true;
+            SqlError coerceError;
+            std::vector<DbValue> coerced;
+            if (!coerceLiteral(ast.columns[i].defaultValue, col, coerced, coerceError)) {
+                out.error = coerceError;
+                return false;
+            }
+            col.defaultValue = coerced[0];
+        }
+        definition.columns.push_back(col);
         if (ast.columns[i].primaryKey) {
             definition.indexes.push_back(IndexDefinition(
                 std::string(), 0, static_cast<uint32_t>(i), IndexKind::PrimaryKey));
@@ -1387,12 +1414,73 @@ bool SqlEngine::executeCreateTable(const SqlCreateTableAst& ast,
         }
     }
 
+    // SQL8: add foreign key constraints.
+    for (size_t i = 0; i < ast.foreignKeys.size(); ++i) {
+        const SqlForeignKeyAst& fk = ast.foreignKeys[i];
+        // Resolve child column ordinal.
+        uint32_t childOrdinal = static_cast<uint32_t>(definition.columns.size());
+        for (size_t j = 0; j < definition.columns.size(); ++j) {
+            if (definition.columns[j].name == fk.childColumn.name) {
+                childOrdinal = static_cast<uint32_t>(j);
+                break;
+            }
+        }
+        if (childOrdinal == definition.columns.size()) {
+            out.error = makeSemantic("unknown column '" + fk.childColumn.name +
+                                    "' in FOREIGN KEY",
+                                    fk.childColumn.line, fk.childColumn.column);
+            return false;
+        }
+        // Resolve the parent table. A self-reference names the table being
+        // created, which does not exist in the catalog yet.
+        const bool selfReference = (fk.parentTable.name == ast.table.name);
+        const Catalog::TableRecord* parentTable = nullptr;
+        if (!selfReference) {
+            parentTable = _db.catalog().findTable(fk.parentTable.name);
+            if (parentTable == nullptr) {
+                out.error = makeSemantic("unknown table '" + fk.parentTable.name +
+                                        "' in FOREIGN KEY",
+                                        fk.parentTable.line, fk.parentTable.column);
+                return false;
+            }
+        }
+        const std::vector<ColumnDefinition>& parentColumns =
+            selfReference ? definition.columns : parentTable->columns;
+        // Resolve parent column ordinal.
+        uint32_t parentOrdinal = static_cast<uint32_t>(parentColumns.size());
+        for (size_t j = 0; j < parentColumns.size(); ++j) {
+            if (parentColumns[j].name == fk.parentColumn.name) {
+                parentOrdinal = static_cast<uint32_t>(j);
+                break;
+            }
+        }
+        if (parentOrdinal == parentColumns.size()) {
+            out.error = makeSemantic("unknown column '" + fk.parentColumn.name +
+                                    "' in parent table '" + fk.parentTable.name + "'",
+                                    fk.parentColumn.line, fk.parentColumn.column);
+            return false;
+        }
+        // Type compatibility check.
+        if (definition.columns[childOrdinal].type != parentColumns[parentOrdinal].type) {
+            out.error = makeSemantic("foreign key child and parent column types must match",
+                                    fk.line, fk.column);
+            return false;
+        }
+        ForeignKeyDefinition fkDef;
+        fkDef.childTableId = 0; // filled in by createTable
+        fkDef.childColumnOrdinal = childOrdinal;
+        fkDef.parentTableId = selfReference ? 0u : parentTable->tableId;
+        fkDef.parentColumnOrdinal = parentOrdinal;
+        definition.foreignKeys.push_back(fkDef);
+    }
+
     uint32_t tableId = 0;
     DbResult result = _db.createTable(definition, tableId);
     if (!result.isOk()) {
         out.error = errorFromResult(result, ast.table.line, ast.table.column);
         return false;
     }
+
     out.objectName = definition.name;
     out.affectedRows = 0;
     return true;
@@ -1465,24 +1553,106 @@ bool SqlEngine::executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
     }
 
     const std::vector<ColumnDefinition>& columns = table->columns();
-    if (ast.values.size() != columns.size()) {
-        std::string message = "wrong value count for table '";
-        message += ast.table.name;
-        message += "': expected ";
-        message += std::to_string(static_cast<unsigned long long>(columns.size()));
-        message += ", got ";
-        message += std::to_string(static_cast<unsigned long long>(ast.values.size()));
-        out.error = makeSemantic(message, ast.table.line, ast.table.column);
-        return false;
-    }
 
-    std::vector<DbValue> values;
-    values.reserve(columns.size());
-    for (size_t i = 0; i < columns.size(); ++i) {
-        if (!coerceLiteral(ast.values[i], columns[i], values, error)) {
-            out.error = error;
+    // SQL8: resolve column list to ordinals.
+    std::vector<size_t> ordinals;
+    if (ast.hasColumnList) {
+        if (ast.columnList.empty()) {
+            out.error = makeSemantic("empty column list", ast.table.line, ast.table.column);
             return false;
         }
+        if (ast.values.size() != ast.columnList.size()) {
+            std::string message = "value count does not match column list for table '";
+            message += ast.table.name;
+            message += "': expected ";
+            message += std::to_string(static_cast<unsigned long long>(ast.columnList.size()));
+            message += ", got ";
+            message += std::to_string(static_cast<unsigned long long>(ast.values.size()));
+            out.error = makeSemantic(message, ast.table.line, ast.table.column);
+            return false;
+        }
+        ordinals.reserve(ast.columnList.size());
+        for (size_t i = 0; i < ast.columnList.size(); ++i) {
+            size_t found = columns.size();
+            for (size_t j = 0; j < columns.size(); ++j) {
+                if (columns[j].name == ast.columnList[i].name) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found == columns.size()) {
+                out.error = makeSemantic("unknown column '" + ast.columnList[i].name +
+                                        "' in INSERT column list",
+                                        ast.columnList[i].line, ast.columnList[i].column);
+                return false;
+            }
+            for (size_t k = 0; k < ordinals.size(); ++k) {
+                if (ordinals[k] == found) {
+                    out.error = makeSemantic("duplicate column '" + ast.columnList[i].name +
+                                            "' in INSERT column list",
+                                            ast.columnList[i].line, ast.columnList[i].column);
+                    return false;
+                }
+            }
+            ordinals.push_back(found);
+        }
+    } else {
+        if (ast.values.size() != columns.size()) {
+            std::string message = "wrong value count for table '";
+            message += ast.table.name;
+            message += "': expected ";
+            message += std::to_string(static_cast<unsigned long long>(columns.size()));
+            message += ", got ";
+            message += std::to_string(static_cast<unsigned long long>(ast.values.size()));
+            out.error = makeSemantic(message, ast.table.line, ast.table.column);
+            return false;
+        }
+        ordinals.resize(columns.size());
+        for (size_t i = 0; i < columns.size(); ++i) {
+            ordinals[i] = i;
+        }
+    }
+
+    // Build the full value vector, filling omitted columns with DEFAULT or NULL.
+    std::vector<DbValue> values(columns.size(), DbValue::null());
+    std::vector<bool> specified(columns.size(), false);
+    for (size_t i = 0; i < ordinals.size(); ++i) {
+        const size_t ordinal = ordinals[i];
+        specified[ordinal] = true;
+        const SqlLiteralAst& literal = ast.values[i];
+        if (literal.isDefault) {
+            if (columns[ordinal].hasDefault) {
+                values[ordinal] = columns[ordinal].defaultValue;
+            } else {
+                out.error = makeSemantic("column '" + columns[ordinal].name +
+                                        "' has no default value",
+                                        ast.table.line, ast.table.column);
+                return false;
+            }
+        } else {
+            std::vector<DbValue> coerced;
+            if (!coerceLiteral(literal, columns[ordinal], coerced, error)) {
+                out.error = error;
+                return false;
+            }
+            values[ordinal] = coerced[0];
+        }
+    }
+
+    // Fill omitted columns with DEFAULT or NULL.
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (specified[i]) {
+            continue;
+        }
+        if (columns[i].hasDefault) {
+            values[i] = columns[i].defaultValue;
+        } else if (!columns[i].nullable) {
+            out.error = makeSemantic("column '" + columns[i].name +
+                                    "' is NOT NULL and has no default",
+                                    ast.table.line, ast.table.column);
+            return false;
+        }
+        // else: leave as NULL (already set)
     }
 
     DbResult result = table->insert(values);
@@ -2278,6 +2448,104 @@ bool SqlEngine::executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
         return false;
     }
     out.affectedRows = plan.size();
+    return true;
+}
+
+bool SqlEngine::executeDropIndex(const SqlDropIndexAst& ast, SqlStatementResult& out) {
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        _tx->beginStatement(savepoint);
+    }
+    DbResult result = _db.dropIndex(ast.index.name);
+    if (!result.isOk()) {
+        if (explicitTransaction) {
+            _tx->rollbackStatement(savepoint);
+        }
+        out.error = errorFromResult(result, ast.index.line, ast.index.column);
+        return false;
+    }
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
+    }
+    out.objectName = ast.index.name;
+    out.affectedRows = 0;
+    return true;
+}
+
+bool SqlEngine::executeDropTable(const SqlDropTableAst& ast, SqlStatementResult& out) {
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        _tx->beginStatement(savepoint);
+    }
+    DbResult result = _db.dropTable(ast.table.name);
+    if (!result.isOk()) {
+        if (explicitTransaction) {
+            _tx->rollbackStatement(savepoint);
+        }
+        out.error = errorFromResult(result, ast.table.line, ast.table.column);
+        return false;
+    }
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
+    }
+    out.objectName = ast.table.name;
+    out.affectedRows = 0;
+    return true;
+}
+
+bool SqlEngine::executeAlterTableAddColumn(const SqlAlterTableAddColumnAst& ast,
+                                           SqlStatementResult& out) {
+    const Catalog::TableRecord* table = _db.catalog().findTable(ast.table.name);
+    if (table == nullptr) {
+        out.error = makeSemantic("unknown table '" + ast.table.name + "'",
+                                 ast.table.line, ast.table.column);
+        return false;
+    }
+
+    // SQL8: reject PRIMARY KEY, UNIQUE, REFERENCES in ALTER ADD COLUMN.
+    if (ast.columnDef.primaryKey) {
+        out.error = makeSemantic("PRIMARY KEY is not allowed in ALTER TABLE ADD COLUMN",
+                                 ast.columnDef.name.line, ast.columnDef.name.column);
+        return false;
+    }
+    if (ast.columnDef.unique) {
+        out.error = makeSemantic("UNIQUE is not allowed in ALTER TABLE ADD COLUMN",
+                                 ast.columnDef.name.line, ast.columnDef.name.column);
+        return false;
+    }
+
+    ColumnDefinition col(ast.columnDef.name.name, ast.columnDef.type, ast.columnDef.nullable);
+    if (ast.columnDef.hasDefault) {
+        col.hasDefault = true;
+        SqlError coerceError;
+        std::vector<DbValue> coerced;
+        if (!coerceLiteral(ast.columnDef.defaultValue, col, coerced, coerceError)) {
+            out.error = coerceError;
+            return false;
+        }
+        col.defaultValue = coerced[0];
+    }
+
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        _tx->beginStatement(savepoint);
+    }
+    DbResult result = _db.alterTableAddColumn(ast.table.name, col);
+    if (!result.isOk()) {
+        if (explicitTransaction) {
+            _tx->rollbackStatement(savepoint);
+        }
+        out.error = errorFromResult(result, ast.table.line, ast.table.column);
+        return false;
+    }
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
+    }
+    out.objectName = ast.table.name;
+    out.affectedRows = 0;
     return true;
 }
 

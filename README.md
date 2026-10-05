@@ -40,6 +40,14 @@ Native relational database subsystem for guideXOS. This repository contains:
   `NestedLoop` or `IndexNestedLoop`; indexed probes reuse the SQL6 B+ tree APIs
   and never change the logical result. Strictly a query-layer phase: no `.gxdb`,
   catalog, B+ tree, heap or WAL format change.
+- **Phase SQL8: Foreign Keys, DEFAULT, DROP and Scoped ALTER TABLE** — typed
+  column `DEFAULT` literals, `INSERT` column lists and the `DEFAULT` keyword,
+  single-column `FOREIGN KEY ... REFERENCES ...` with RESTRICT / NO ACTION
+  semantics, system-owned FK support indexes, `DROP INDEX`, `DROP TABLE` and
+  `ALTER TABLE ... ADD COLUMN`. Foreign keys are enforced below the SQL layer
+  against the statement's final logical state (including self-references) and
+  see transaction-private rows. Catalog upgraded to a backward-compatible v4;
+  outer `.gxdb`, heap, B+ tree and WAL formats are unchanged.
 
 - SQL1 format and design: [`docs/SQL1_DATABASE_STORAGE.md`](docs/SQL1_DATABASE_STORAGE.md)
 - SQL2 format and design: [`docs/SQL2_RELATIONAL_CATALOG_HEAP.md`](docs/SQL2_RELATIONAL_CATALOG_HEAP.md)
@@ -48,6 +56,7 @@ Native relational database subsystem for guideXOS. This repository contains:
 - SQL5 predicates/mutation/ordering: [`docs/SQL5_PREDICATES_MUTATION_ORDERING.md`](docs/SQL5_PREDICATES_MUTATION_ORDERING.md)
 - SQL6 B+ tree indexes/constraints: [`docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md`](docs/SQL6_BTREE_INDEXES_CONSTRAINTS.md)
 - SQL7 joins/aggregates/grouping: [`docs/SQL7_JOINS_AGGREGATES.md`](docs/SQL7_JOINS_AGGREGATES.md)
+- SQL8 schema lifecycle/integrity: [`docs/SQL8_SCHEMA_INTEGRITY_LIFECYCLE.md`](docs/SQL8_SCHEMA_INTEGRITY_LIFECYCLE.md)
 - Test inventory: [`docs/SQL1_TEST_REPORT.md`](docs/SQL1_TEST_REPORT.md)
 
 ## Layout
@@ -56,7 +65,7 @@ Native relational database subsystem for guideXOS. This repository contains:
 database/   storage engine (format, checksum, I/O, header, page, file, engine,
             buffer, catalog, heap, index, wal, transaction, relational) and the
             SQL language layer (sql_token, sql_tokenizer, sql_parser, sql)
-tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4 + SQL5 + SQL6 + SQL7)
+tests/      hosted test suites (SQL1 + SQL2 + SQL3 + SQL4 + SQL5 + SQL6 + SQL7 + SQL8)
 tools/      gxdb_cli (create / inspect / sql / run / shell)
 docs/       architecture and test reports
 ```
@@ -261,6 +270,68 @@ row, so an unmatched LEFT JOIN row contributes `0` to `COUNT(o.Id)` and `1` to
 complete `ON` predicate, so they return exactly the same logical rows as a
 nested-loop join.
 
+## Parent / child example (SQL8)
+
+```sql
+CREATE TABLE Users (
+    Id INT64 PRIMARY KEY,
+    Name TEXT NOT NULL,
+    Enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE Orders (
+    Id INT64 PRIMARY KEY,
+    UserId INT64 NOT NULL,
+    State TEXT NOT NULL DEFAULT 'new',
+
+    FOREIGN KEY (UserId) REFERENCES Users (Id)
+);
+
+-- Column lists let omitted columns take their declared DEFAULT.
+INSERT INTO Users (Id, Name) VALUES (1, 'Alice');
+INSERT INTO Users (Id) VALUES (2);                 -- Enabled = TRUE
+
+INSERT INTO Orders (Id, UserId) VALUES (100, 1);   -- State = 'new'
+INSERT INTO Orders (Id, UserId, State) VALUES (101, 1, DEFAULT);
+
+-- A non-NULL foreign key must reference an existing parent row.
+INSERT INTO Orders (Id, UserId) VALUES (102, 999);  -- ForeignKeyViolation
+
+-- The parent key is protected while children reference it.
+DELETE FROM Users WHERE Id = 1;                    -- ForeignKeyViolation
+UPDATE Users SET Id = 20 WHERE Id = 1;             -- ForeignKeyViolation
+
+-- Remove the children first, then the parent.
+DELETE FROM Orders WHERE UserId = 1;
+DELETE FROM Users WHERE Id = 1;
+
+-- Evolve and remove schema objects transactionally.
+ALTER TABLE Orders ADD COLUMN Note TEXT DEFAULT 'none';
+DROP INDEX IX_Orders_State;                        -- only user indexes
+DROP TABLE Orders;
+DROP TABLE Users;
+```
+
+```sh
+build/gxdb_cli sql app.gxdb "CREATE TABLE Users (Id INT64 PRIMARY KEY, Name TEXT NOT NULL, Enabled BOOLEAN NOT NULL DEFAULT TRUE);"
+build/gxdb_cli sql app.gxdb "CREATE TABLE Orders (Id INT64 PRIMARY KEY, UserId INT64 NOT NULL, State TEXT NOT NULL DEFAULT 'new', FOREIGN KEY (UserId) REFERENCES Users (Id));"
+build/gxdb_cli sql app.gxdb "INSERT INTO Users (Id, Name) VALUES (1, 'Alice');"
+build/gxdb_cli sql app.gxdb "INSERT INTO Orders (Id, UserId) VALUES (100, 1);"
+build/gxdb_cli sql app.gxdb "INSERT INTO Orders (Id, UserId) VALUES (101, 999);"  # rejected
+build/gxdb_cli inspect app.gxdb   # shows defaults, index ownership and foreign keys
+```
+
+Foreign keys are single-column only and use RESTRICT / NO ACTION semantics:
+there are no cascading actions in SQL8. A nullable child column may hold any
+number of `NULL`s (no parent is required). Self-referential foreign keys are
+supported, and FK checking reasons about the final state of a statement, so
+`DELETE FROM Employees;` succeeds even when rows reference one another. Every
+foreign key owns a private, system-owned B+ tree support index on the child
+column; `DROP INDEX` rejects it along with PRIMARY KEY / UNIQUE indexes. DROP
+TABLE refuses to remove a table that another table's foreign key references.
+`ALTER TABLE ... ADD COLUMN` eagerly rewrites existing rows (backfilling the
+DEFAULT or NULL) and remaps every index locator.
+
 ## Command-line diagnostics
 
 ```sh
@@ -274,7 +345,8 @@ build/gxdb_cli shell sample.gxdb
 ## Status
 
 Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
-SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks, SQL7: 1303 checks). SQL3 proves
+SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks, SQL7: 1307 checks,
+SQL8: 4503 checks). SQL3 proves
 crash-atomic transactions on the hosted backend, including a full commit crash
 matrix and a 250-lifecycle transaction/recovery stress suite. SQL4 proves a
 bounded SQL language over that engine. SQL5 proves predicates with three-valued
@@ -294,6 +366,18 @@ equivalence, COUNT/SUM/AVG/MIN/MAX with NULL and overflow semantics, GROUP BY
 through indexed join probes, join-index corruption safety, Float64 edge policy,
 a 1000/3000/8000-row deterministic multi-table workload with an independent
 model, and a 250-lifecycle joined/aggregate transaction workload. SQL7 requires
-no persistent-format change. QEMU and bare-metal proof are deferred to the phase
+no persistent-format change. SQL8 proves schema lifecycle and relational
+integrity: typed column DEFAULT metadata with reopen persistence, INSERT column
+lists and the DEFAULT keyword, single-column FOREIGN KEYs with exact type
+matching and nullable-NULL semantics, child-INSERT / child-UPDATE enforcement,
+parent DELETE / key-UPDATE RESTRICT, self-referential final-state checking,
+multiple FKs and multiple child tables, transaction-private FK visibility,
+system-owned FK support indexes that DROP INDEX cannot remove, DROP TABLE
+dependency enforcement, ALTER ADD COLUMN eager backfill with full index locator
+remapping, catalog v1/v2/v3 backward compatibility, corruption-safe catalog
+parsing, a deterministic 200/600/1200-row referential workload, a 250-lifecycle
+schema/integrity workload, and CREATE TABLE+FK / parent+child commit / DROP
+INDEX / DROP TABLE / ALTER crash matrices. SQL8 introduces catalog v4 while the
+outer `.gxdb`, heap, B+ tree and WAL formats remain unchanged. QEMU and bare-metal proof are deferred to the phase
 that provides a native `IDatabaseFile` backend over the guideXOS VFS / block
 device.

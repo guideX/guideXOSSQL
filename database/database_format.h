@@ -56,6 +56,7 @@ const uint32_t kCatalogMagic = 0x54435847u; // 'G','X','C','T' little-endian
 const uint16_t kCatalogVersion = 2;         // SQL2: relational catalog (tables)
 const uint16_t kCatalogVersionLegacy = 1;   // SQL1: empty catalog (no tables)
 const uint16_t kCatalogVersionV3 = 3;       // SQL6: tables + indexes/constraints
+const uint16_t kCatalogVersionV4 = 4;       // SQL8: + defaults, foreign keys, ownership
 const uint32_t kCatalogPayloadSize = 16;    // SQL1 minimum payload size
 
 // ---- SQL2 catalog record layout -------------------------------------------
@@ -75,6 +76,33 @@ const uint32_t kCatalogV3RootHeaderSize = 40;
 const uint32_t kCatalogV3ContHeaderSize = kCatalogContHeaderSize;
 const uint8_t kCatalogRecordTable = 1;
 const uint8_t kCatalogRecordIndex = 2;
+
+// ---- SQL8 catalog v4 layout -----------------------------------------------
+// The v4 root header extends the v3 header with foreign-key allocation metadata.
+// The continuation header is byte-identical to v3. v4 records are type-tagged:
+//
+//   u8 recordType (1 = table, 2 = index, 3 = foreign key), then the payload.
+//
+// v4 table records embed column records that now carry DEFAULT metadata:
+//   u32 ordinal, u16 type, u16 nullable, u32 flags, u32 nameLength, name,
+//   u8 hasDefault, [u8 defaultType, u8 defaultNull, default payload].
+//
+// v4 index records carry ownership:
+//   u32 indexId, u32 tableId, u32 columnOrdinal, u64 rootPageId,
+//   u16 flags (bit0 unique, bit1 PK, bit2 system-owned), u16 formatVersion,
+//   u64 entryCount, u32 ownerForeignKeyId, u32 nameLength, name bytes.
+//
+// v4 foreign-key record:
+//   u32 foreignKeyId, u32 childTableId, u32 childColumnOrdinal,
+//   u32 parentTableId, u32 parentColumnOrdinal,
+//   u32 referencedIndexId, u32 supportIndexId, u16 flags, u16 formatVersion.
+const uint32_t kCatalogV4RootHeaderSize = 48;
+const uint32_t kCatalogV4ContHeaderSize = kCatalogContHeaderSize;
+const uint8_t kCatalogRecordForeignKey = 3;
+
+// ---- SQL8 foreign-key limits ----------------------------------------------
+const uint32_t kMaxForeignKeysPerTable = 64;
+const uint32_t kMaxForeignKeys = 2048;
 
 // ---- SQL2 heap page layout ------------------------------------------------
 const uint32_t kHeapMagic = 0x50485847u; // 'G','X','H','P' little-endian

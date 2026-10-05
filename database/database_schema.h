@@ -24,10 +24,14 @@ struct ColumnDefinition {
     DbType type;
     bool nullable;
     uint32_t ordinal; // zero-based position, assigned at creation time
+    bool hasDefault;
+    DbValue defaultValue;
 
-    ColumnDefinition() : type(DbType::Unknown), nullable(false), ordinal(0) {}
+    ColumnDefinition() : type(DbType::Unknown), nullable(false), ordinal(0),
+                        hasDefault(false) {}
     ColumnDefinition(const std::string& nameIn, DbType typeIn, bool nullableIn)
-        : name(nameIn), type(typeIn), nullable(nullableIn), ordinal(0) {}
+        : name(nameIn), type(typeIn), nullable(nullableIn), ordinal(0),
+          hasDefault(false) {}
 };
 
 // ---- SQL6 indexes and constraints -----------------------------------------
@@ -75,24 +79,51 @@ inline bool isIndexableType(DbType type) {
 // constraint-backed index the catalog assigns a reserved, deterministic name
 // and stable index id. `tableId` is zero when the definition is nested in a
 // TableDefinition (the catalog fills it in on creation).
+//
+// SQL8 adds ownership: `ownerForeignKeyId` is non-zero only for FK support
+// indexes (system-owned, not user-droppable). `systemOwned` marks any index
+// the user must not drop directly (PK, UNIQUE, FK support).
 struct IndexDefinition {
     std::string name;
     uint32_t tableId;
     uint32_t columnOrdinal;
     IndexKind kind;
+    uint32_t ownerForeignKeyId; // 0 = not an FK support index
+    bool systemOwned;
 
     IndexDefinition()
-        : tableId(0), columnOrdinal(0), kind(IndexKind::Ordinary) {}
+        : tableId(0), columnOrdinal(0), kind(IndexKind::Ordinary),
+          ownerForeignKeyId(0), systemOwned(false) {}
     IndexDefinition(const std::string& nameIn, uint32_t tableIdIn,
                     uint32_t columnOrdinalIn, IndexKind kindIn)
         : name(nameIn), tableId(tableIdIn), columnOrdinal(columnOrdinalIn),
-          kind(kindIn) {}
+          kind(kindIn), ownerForeignKeyId(0), systemOwned(false) {}
+};
+
+// ---- SQL8 foreign keys -----------------------------------------------------
+//
+// A single-column FOREIGN KEY constraint. The child column references exactly
+// one column in exactly one parent table, which must be backed by a PRIMARY
+// KEY or UNIQUE constraint/index. SQL8 uses RESTRICT/NO ACTION semantics only.
+struct ForeignKeyDefinition {
+    uint32_t foreignKeyId;
+    uint32_t childTableId;
+    uint32_t childColumnOrdinal;
+    uint32_t parentTableId;
+    uint32_t parentColumnOrdinal;
+    uint32_t referencedIndexId; // PK/UNIQUE index on the parent column
+    uint32_t supportIndexId;    // system-owned non-unique index on child column
+
+    ForeignKeyDefinition()
+        : foreignKeyId(0), childTableId(0), childColumnOrdinal(0), parentTableId(0),
+          parentColumnOrdinal(0), referencedIndexId(0), supportIndexId(0) {}
 };
 
 struct TableDefinition {
     std::string name;
     std::vector<ColumnDefinition> columns;
     std::vector<IndexDefinition> indexes; // SQL6 constraints/indexes
+    std::vector<ForeignKeyDefinition> foreignKeys; // SQL8
 
     TableDefinition() {}
     explicit TableDefinition(const std::string& nameIn) : name(nameIn) {}
@@ -131,6 +162,25 @@ struct IndexInfo {
 
     bool unique() const { return indexKindIsUnique(kind); }
     bool primaryKey() const { return kind == IndexKind::PrimaryKey; }
+};
+
+// Discovery record for a foreign key (SQL8).
+struct ForeignKeyInfo {
+    uint32_t foreignKeyId;
+    uint32_t childTableId;
+    std::string childTableName;
+    uint32_t childColumnOrdinal;
+    std::string childColumnName;
+    uint32_t parentTableId;
+    std::string parentTableName;
+    uint32_t parentColumnOrdinal;
+    std::string parentColumnName;
+    uint32_t referencedIndexId;
+    uint32_t supportIndexId;
+
+    ForeignKeyInfo()
+        : foreignKeyId(0), childTableId(0), childColumnOrdinal(0), parentTableId(0),
+          parentColumnOrdinal(0), referencedIndexId(0), supportIndexId(0) {}
 };
 
 } // namespace db

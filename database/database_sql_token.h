@@ -133,7 +133,10 @@ enum class SqlErrorCode {
     ExecutionError,
     TransactionError,
     ResourceLimit,
-    Unsupported
+    Unsupported,
+    // SQL8 schema lifecycle / referential integrity.
+    ForeignKeyViolation,
+    DependencyError
 };
 
 const char* sqlErrorCodeName(SqlErrorCode code);
@@ -221,6 +224,14 @@ enum class SqlTokenKind {
     Min,
     Max,
     Group,
+    // SQL8 schema lifecycle and integrity keywords.
+    Default,
+    Foreign,
+    References,
+    Drop,
+    Alter,
+    Add,
+    Column,
     // Literals.
     Identifier,
     IntegerLiteral,

@@ -100,8 +100,29 @@ public:
     // transaction, so a failure leaves no catalog entry and no index pages.
     DbResult createIndex(const IndexDefinition& def, uint32_t& outIndexId);
 
+    // SQL8: drops a user-created ordinary index. Rejects system-owned and
+    // constraint-backed indexes.
+    DbResult dropIndex(const std::string& name);
+
     DbResult listIndexes(std::vector<IndexInfo>& out) const;
     DbResult describeIndex(const std::string& name, IndexInfo& out) const;
+
+    // ---- SQL8 schema lifecycle --------------------------------------------
+    // Drops a table and all its owned metadata (columns, indexes, FKs).
+    DbResult dropTable(const std::string& name);
+
+    // Appends a column to an existing table. The new column is backfilled
+    // with its DEFAULT (or NULL) for all existing rows.
+    DbResult alterTableAddColumn(const std::string& name, const ColumnDefinition& col);
+
+    // SQL8: lists foreign keys.
+    DbResult listForeignKeys(std::vector<ForeignKeyInfo>& out) const;
+
+    // SQL8: relational integrity validator. Verifies every foreign-key record,
+    // its referenced PK/UNIQUE index and its system-owned support index, and
+    // that every non-NULL child key resolves to a parent row. Does not repair
+    // anything; `message` receives a bounded reason on failure.
+    DbResult validateIntegrity(std::string& message);
 
     // The first index on (tableId, columnOrdinal), or nullptr. Used by the
     // access-path selector.

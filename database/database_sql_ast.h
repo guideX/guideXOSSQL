@@ -33,7 +33,11 @@ enum class SqlStatementType {
     Delete,
     Begin,
     Commit,
-    Rollback
+    Rollback,
+    // SQL8 schema lifecycle.
+    DropIndex,
+    DropTable,
+    AlterTableAddColumn
 };
 
 const char* sqlStatementTypeName(SqlStatementType type);
@@ -62,12 +66,13 @@ struct SqlLiteralAst {
     double float64Value;
     std::string textValue;
     std::vector<uint8_t> blobValue;
+    bool isDefault; // SQL8: true when this is the DEFAULT keyword in VALUES
     uint32_t line;
     uint32_t column;
 
     SqlLiteralAst()
         : kind(SqlLiteralKind::Null), boolValue(false), int64Value(0),
-          float64Value(0.0), line(0), column(0) {}
+          float64Value(0.0), isDefault(false), line(0), column(0) {}
 };
 
 // ---- SQL5 predicate expressions -------------------------------------------
@@ -187,18 +192,61 @@ struct SqlColumnDefAst {
     bool nullable;
     bool primaryKey;
     bool unique;
+    bool hasDefault;
+    SqlLiteralAst defaultValue;
 
     SqlColumnDefAst()
-        : type(DbType::Unknown), nullable(true), primaryKey(false), unique(false) {}
+        : type(DbType::Unknown), nullable(true), primaryKey(false), unique(false),
+          hasDefault(false) {}
+};
+
+// SQL8 table-level FOREIGN KEY constraint.
+struct SqlForeignKeyAst {
+    SqlIdentifier childColumn;
+    SqlIdentifier parentTable;
+    SqlIdentifier parentColumn;
+    uint32_t line;
+    uint32_t column;
+
+    SqlForeignKeyAst() : line(0), column(0) {}
 };
 
 struct SqlCreateTableAst {
     SqlIdentifier table;
     std::vector<SqlColumnDefAst> columns;
+    std::vector<SqlForeignKeyAst> foreignKeys;
     uint32_t line;
     uint32_t column;
 
     SqlCreateTableAst() : line(0), column(0) {}
+};
+
+// SQL8 DROP INDEX.
+struct SqlDropIndexAst {
+    SqlIdentifier index;
+    uint32_t line;
+    uint32_t column;
+
+    SqlDropIndexAst() : line(0), column(0) {}
+};
+
+// SQL8 DROP TABLE.
+struct SqlDropTableAst {
+    SqlIdentifier table;
+    uint32_t line;
+    uint32_t column;
+
+    SqlDropTableAst() : line(0), column(0) {}
+};
+
+// SQL8 ALTER TABLE ADD COLUMN.
+struct SqlAlterTableAddColumnAst {
+    SqlIdentifier table;
+    SqlColumnDefAst columnDef;
+    uint32_t line;
+    uint32_t column;
+
+    SqlAlterTableAddColumnAst() : line(0), column(0) {}
 };
 
 // CREATE [UNIQUE] INDEX name ON table (column)
@@ -216,10 +264,12 @@ struct SqlCreateIndexAst {
 struct SqlInsertAst {
     SqlIdentifier table;
     std::vector<SqlLiteralAst> values;
+    bool hasColumnList;
+    std::vector<SqlIdentifier> columnList;
     uint32_t line;
     uint32_t column;
 
-    SqlInsertAst() : line(0), column(0) {}
+    SqlInsertAst() : hasColumnList(false), line(0), column(0) {}
 };
 
 struct SqlSelectAst {
@@ -286,6 +336,9 @@ struct SqlStatementAst {
     SqlSelectAst select;
     SqlUpdateAst update;
     SqlDeleteAst deleteStatement;
+    SqlDropIndexAst dropIndex;
+    SqlDropTableAst dropTable;
+    SqlAlterTableAddColumnAst alterTableAddColumn;
     uint32_t line;
     uint32_t column;
 

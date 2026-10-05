@@ -43,11 +43,16 @@ std::string makeReservedIndexName(IndexKind kind, uint32_t indexId) {
 
 } // namespace
 
-Catalog::Catalog() : _tables(), _indexes(), _nextTableId(1), _nextIndexId(1),
-                     _version(kCatalogVersion) {}
+Catalog::Catalog() : _tables(), _indexes(), _foreignKeys(), _nextTableId(1),
+                     _nextIndexId(1), _nextForeignKeyId(1), _version(kCatalogVersion) {}
 
 bool Catalog::validateName(const std::string& name, uint32_t maxBytes) const {
     if (name.empty() || name.size() > maxBytes) {
+        return false;
+    }
+    // A leading '$' is reserved for system-generated names (constraint-backed
+    // and foreign-key support indexes). User-defined objects may not use it.
+    if (name[0] == '$') {
         return false;
     }
     return isValidUtf8(reinterpret_cast<const uint8_t*>(name.data()), name.size());
@@ -91,10 +96,68 @@ std::vector<Catalog::IndexRecord> Catalog::indexesForTable(uint32_t tableId) con
     return out;
 }
 
-uint32_t Catalog::recordSizeForDefinition(const TableDefinition& def) const {
+const Catalog::ForeignKeyRecord* Catalog::findForeignKey(uint32_t foreignKeyId) const {
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].foreignKeyId == foreignKeyId) {
+            return &_foreignKeys[i];
+        }
+    }
+    return nullptr;
+}
+
+std::vector<Catalog::ForeignKeyRecord> Catalog::foreignKeysForChildTable(uint32_t tableId) const {
+    std::vector<ForeignKeyRecord> out;
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].childTableId == tableId) {
+            out.push_back(_foreignKeys[i]);
+        }
+    }
+    return out;
+}
+
+std::vector<Catalog::ForeignKeyRecord> Catalog::foreignKeysForParentTable(uint32_t tableId) const {
+    std::vector<ForeignKeyRecord> out;
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].parentTableId == tableId) {
+            out.push_back(_foreignKeys[i]);
+        }
+    }
+    return out;
+}
+
+uint32_t Catalog::recordSizeForDefinition(const TableDefinition& def, bool v4) const {
     uint32_t size = 40 + static_cast<uint32_t>(def.name.size());
     for (size_t i = 0; i < def.columns.size(); ++i) {
         size += 16 + static_cast<uint32_t>(def.columns[i].name.size());
+        if (v4) {
+            size += 1; // hasDefault flag
+            if (def.columns[i].hasDefault) {
+                size += 2; // default type + null flag
+                const DbValue& v = def.columns[i].defaultValue;
+                if (!v.isNull()) {
+                    switch (v.type()) {
+                    case DbType::Boolean:
+                        size += 1;
+                        break;
+                    case DbType::Int32:
+                        size += 4;
+                        break;
+                    case DbType::Int64:
+                    case DbType::Float64:
+                        size += 8;
+                        break;
+                    case DbType::Text:
+                        size += 4 + static_cast<uint32_t>(v.textValue().size());
+                        break;
+                    case DbType::Blob:
+                        size += 4 + static_cast<uint32_t>(v.blobValue().size());
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+        }
     }
     return size;
 }
@@ -118,7 +181,10 @@ DbResult Catalog::addIndex(const IndexDefinition& def, uint32_t pageSize,
         return DbResult::error(DbStatus::InvalidArgument,
                                "column type is not indexable");
     }
-    if (indexOnColumnExists(def.tableId, def.columnOrdinal)) {
+    // SQL8: a system-owned FK support index is allowed to coexist with an
+    // ordinary/user index on the same child column. User indexes remain
+    // one-per-column.
+    if (!def.systemOwned && indexOnColumnExists(def.tableId, def.columnOrdinal)) {
         return DbResult::error(DbStatus::AlreadyExists,
                                "an index already exists on this column");
     }
@@ -168,7 +234,9 @@ DbResult Catalog::addIndex(const IndexDefinition& def, uint32_t pageSize,
     }
 
     _indexes.push_back(rec);
-    _version = kCatalogVersionV3;
+    if (_version != kCatalogVersionV4) {
+        _version = kCatalogVersionV3;
+    }
     outIndexId = rec.indexId;
     return DbResult::ok();
 }
@@ -271,11 +339,20 @@ DbResult Catalog::addTable(const TableDefinition& def, uint32_t pageSize,
     }
 
     // The serialized record must fit in a catalog continuation page.
-    const bool willBeV3 =
-        _version == kCatalogVersionV3 || !_indexes.empty() || !def.indexes.empty();
+    bool hasDefault = false;
+    for (size_t i = 0; i < def.columns.size(); ++i) {
+        if (def.columns[i].hasDefault) {
+            hasDefault = true;
+            break;
+        }
+    }
+    const bool willBeV4 = _version == kCatalogVersionV4 || hasDefault ||
+                          !def.foreignKeys.empty();
+    const bool willBeV3 = willBeV4 || _version == kCatalogVersionV3 ||
+                          !_indexes.empty() || !def.indexes.empty();
     const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
     const uint32_t contCap = capacity - kCatalogContHeaderSize;
-    const uint32_t recordSize = recordSizeForDefinition(def) + (willBeV3 ? 1u : 0u);
+    const uint32_t recordSize = recordSizeForDefinition(def, willBeV4) + (willBeV3 ? 1u : 0u);
     if (recordSize > contCap) {
         return DbResult::error(DbStatus::InvalidArgument,
                                "schema too large for the database page size");
@@ -315,9 +392,273 @@ DbResult Catalog::addTable(const TableDefinition& def, uint32_t pageSize,
             return result;
         }
     }
-    if (willBeV3) {
+    if (willBeV4) {
+        _version = kCatalogVersionV4;
+    } else if (willBeV3) {
         _version = kCatalogVersionV3;
     }
+
+    // SQL8: append foreign-key constraints (and their system-owned support
+    // indexes) as part of the same in-memory creation. On any failure undo the
+    // table, its indexes and any FK records so no partial schema is published.
+    if (!def.foreignKeys.empty()) {
+        const size_t fksBefore = _foreignKeys.size();
+        const uint32_t nextFkBefore = _nextForeignKeyId;
+        const uint16_t versionBefore = _version;
+        for (size_t i = 0; i < def.foreignKeys.size(); ++i) {
+            ForeignKeyDefinition fk = def.foreignKeys[i];
+            fk.childTableId = rec.tableId;
+            if (fk.parentTableId == 0) {
+                fk.parentTableId = rec.tableId; // self-reference
+            }
+            uint32_t fkId = 0;
+            DbResult fkResult = addForeignKey(fk, pageSize, fkId);
+            if (!fkResult.isOk()) {
+                _foreignKeys.resize(fksBefore);
+                _nextForeignKeyId = nextFkBefore;
+                _indexes.resize(indexesBefore);
+                _nextIndexId = nextIndexBefore;
+                _tables.pop_back();
+                --_nextTableId;
+                _version = versionBefore;
+                return fkResult;
+            }
+        }
+    }
+    return DbResult::ok();
+}
+
+DbResult Catalog::addForeignKey(const ForeignKeyDefinition& def, uint32_t pageSize,
+                                uint32_t& outForeignKeyId) {
+    const TableRecord* childTable = findTable(def.childTableId);
+    if (childTable == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "foreign key child table does not exist");
+    }
+    const TableRecord* parentTable = findTable(def.parentTableId);
+    if (parentTable == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "foreign key parent table does not exist");
+    }
+    if (def.childColumnOrdinal >= childTable->columns.size()) {
+        return DbResult::error(DbStatus::InvalidArgument, "foreign key child column does not exist");
+    }
+    if (def.parentColumnOrdinal >= parentTable->columns.size()) {
+        return DbResult::error(DbStatus::InvalidArgument, "foreign key parent column does not exist");
+    }
+    const DbType childType = childTable->columns[def.childColumnOrdinal].type;
+    const DbType parentType = parentTable->columns[def.parentColumnOrdinal].type;
+    if (childType != parentType) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "foreign key child and parent column types must match");
+    }
+    if (!isIndexableType(childType)) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "foreign key column type is not indexable");
+    }
+
+    // The referenced parent column must be backed by a PK or UNIQUE index.
+    const IndexRecord* referenced = nullptr;
+    for (size_t i = 0; i < _indexes.size(); ++i) {
+        if (_indexes[i].tableId == def.parentTableId &&
+            _indexes[i].columnOrdinal == def.parentColumnOrdinal &&
+            indexKindIsUnique(_indexes[i].kind())) {
+            referenced = &_indexes[i];
+            break;
+        }
+    }
+    if (referenced == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "referenced parent column must have a PRIMARY KEY or UNIQUE constraint");
+    }
+    // Capture the id now: adding the support index below may reallocate
+    // `_indexes` and invalidate `referenced`.
+    const uint32_t referencedIndexId = referenced->indexId;
+
+    // Count FKs on the child table.
+    uint32_t fkCount = 0;
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].childTableId == def.childTableId) {
+            ++fkCount;
+        }
+    }
+    if (fkCount >= kMaxForeignKeysPerTable) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "foreign key count per table exceeds policy maximum");
+    }
+    if (_foreignKeys.size() >= kMaxForeignKeys) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "catalog foreign key count exceeds policy maximum");
+    }
+
+    // Create the support index on the child column.
+    IndexDefinition supportDef;
+    supportDef.name = "";
+    supportDef.tableId = def.childTableId;
+    supportDef.columnOrdinal = def.childColumnOrdinal;
+    supportDef.kind = IndexKind::Ordinary;
+    supportDef.systemOwned = true;
+    uint32_t supportIndexId = 0;
+    DbResult result = addIndex(supportDef, pageSize, supportIndexId);
+    if (!result.isOk()) {
+        return result;
+    }
+
+    // Mark the support index as system-owned and record its FK owner.
+    IndexRecord* supportRec = findIndexMutable(supportIndexId);
+    if (supportRec != nullptr) {
+        supportRec->flags |= 0x0004u;
+    }
+
+    ForeignKeyRecord rec;
+    rec.foreignKeyId = _nextForeignKeyId++;
+    rec.childTableId = def.childTableId;
+    rec.childColumnOrdinal = def.childColumnOrdinal;
+    rec.parentTableId = def.parentTableId;
+    rec.parentColumnOrdinal = def.parentColumnOrdinal;
+    rec.referencedIndexId = referencedIndexId;
+    rec.supportIndexId = supportIndexId;
+    rec.flags = 0;
+    rec.formatVersion = 1;
+
+    if (supportRec != nullptr) {
+        supportRec->ownerForeignKeyId = rec.foreignKeyId;
+    }
+
+    _foreignKeys.push_back(rec);
+    _version = kCatalogVersionV4;
+    outForeignKeyId = rec.foreignKeyId;
+    return DbResult::ok();
+}
+
+DbResult Catalog::removeTable(uint32_t tableId) {
+    const TableRecord* table = findTable(tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "table does not exist");
+    }
+
+    // Check for incoming FK dependencies from other tables.
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].parentTableId == tableId &&
+            _foreignKeys[i].childTableId != tableId) {
+            return DbResult::error(DbStatus::DependencyExists,
+                                   "table is referenced by a foreign key from another table");
+        }
+    }
+
+    // Remove FK records where this table is the child (includes self-references).
+    std::vector<ForeignKeyRecord> remainingFks;
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        if (_foreignKeys[i].childTableId != tableId) {
+            remainingFks.push_back(_foreignKeys[i]);
+        }
+    }
+    _foreignKeys.swap(remainingFks);
+
+    // Remove all indexes belonging to this table.
+    std::vector<IndexRecord> remainingIndexes;
+    for (size_t i = 0; i < _indexes.size(); ++i) {
+        if (_indexes[i].tableId != tableId) {
+            remainingIndexes.push_back(_indexes[i]);
+        }
+    }
+    _indexes.swap(remainingIndexes);
+
+    // Remove the table record.
+    std::vector<TableRecord> remainingTables;
+    for (size_t i = 0; i < _tables.size(); ++i) {
+        if (_tables[i].tableId != tableId) {
+            remainingTables.push_back(_tables[i]);
+        }
+    }
+    _tables.swap(remainingTables);
+
+    if (_version == kCatalogVersionV4 && _foreignKeys.empty()) {
+        // Can downgrade to v3 if no FKs remain and no system-owned indexes exist.
+        bool hasSystemOwned = false;
+        for (size_t i = 0; i < _indexes.size(); ++i) {
+            if (_indexes[i].systemOwned()) {
+                hasSystemOwned = true;
+                break;
+            }
+        }
+        if (!hasSystemOwned) {
+            _version = kCatalogVersionV3;
+        }
+    }
+    return DbResult::ok();
+}
+
+DbResult Catalog::removeIndex(uint32_t indexId) {
+    const IndexRecord* rec = findIndex(indexId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "index does not exist");
+    }
+    if (rec->systemOwned() || rec->unique() || rec->primaryKey()) {
+        return DbResult::error(DbStatus::DependencyExists,
+                               "cannot drop a system-owned or constraint-backed index");
+    }
+
+    std::vector<IndexRecord> remaining;
+    for (size_t i = 0; i < _indexes.size(); ++i) {
+        if (_indexes[i].indexId != indexId) {
+            remaining.push_back(_indexes[i]);
+        }
+    }
+    _indexes.swap(remaining);
+    return DbResult::ok();
+}
+
+DbResult Catalog::addColumnToTable(uint32_t tableId, const ColumnDefinition& col,
+                                   uint32_t pageSize) {
+    TableRecord* table = findTableMutable(tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "table does not exist");
+    }
+    if (table->columns.size() >= kMaxColumnsPerTable) {
+        return DbResult::error(DbStatus::NoSpace, "column count exceeds policy maximum");
+    }
+    if (!validateName(col.name, kMaxColumnNameBytes)) {
+        return DbResult::error(DbStatus::InvalidArgument, "invalid column name");
+    }
+    if (!isConcreteDbType(col.type)) {
+        return DbResult::error(DbStatus::InvalidArgument, "unsupported column type");
+    }
+    for (size_t i = 0; i < table->columns.size(); ++i) {
+        if (table->columns[i].name == col.name) {
+            return DbResult::error(DbStatus::AlreadyExists, "duplicate column name");
+        }
+    }
+
+    ColumnDefinition newCol = col;
+    newCol.ordinal = static_cast<uint32_t>(table->columns.size());
+
+    // Validate default: NOT NULL + DEFAULT NULL is rejected.
+    if (!newCol.nullable && newCol.hasDefault && newCol.defaultValue.isNull()) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "NOT NULL column cannot have DEFAULT NULL");
+    }
+    // Validate default type matches column type.
+    if (newCol.hasDefault && !newCol.defaultValue.isNull()) {
+        if (newCol.defaultValue.type() != newCol.type) {
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "default value type does not match column type");
+        }
+    }
+
+    // Check serialized record size.
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    const uint32_t contCap = capacity - kCatalogContHeaderSize;
+    TableRecord temp = *table;
+    temp.columns.push_back(newCol);
+    std::vector<uint8_t> bytes;
+    serializeTableRecord(temp, bytes, true);
+    if (bytes.size() + 1u > contCap) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "schema too large for the database page size");
+    }
+
+    table->columns.push_back(newCol);
+    table->schemaVersion += 1;
+    _version = kCatalogVersionV4;
     return DbResult::ok();
 }
 
@@ -376,7 +717,7 @@ Catalog::IndexRecord* Catalog::findIndexMutable(uint32_t indexId) {
 }
 
 DbResult Catalog::parseColumnRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                                    ColumnDefinition& out) {
+                                    ColumnDefinition& out, bool hasDefaultMetadata) {
     uint32_t ordinal = 0;
     uint16_t type = 0;
     uint16_t nullable = 0;
@@ -422,11 +763,121 @@ DbResult Catalog::parseColumnRecord(const uint8_t* bytes, size_t length, size_t&
     out.nullable = nullable != 0;
     out.name.assign(reinterpret_cast<const char*>(bytes + offset), nameLength);
     offset += nameLength;
+
+    out.hasDefault = false;
+    out.defaultValue = DbValue::null();
+
+    if (hasDefaultMetadata) {
+        uint8_t hasDefault = 0;
+        if (!readField(bytes, length, offset, hasDefault)) {
+            return DbResult::error(DbStatus::CorruptPage, "column record truncated (default flag)");
+        }
+        if (hasDefault > 1) {
+            return DbResult::error(DbStatus::CorruptPage, "invalid default flag");
+        }
+        if (hasDefault) {
+            uint8_t defaultType = 0;
+            uint8_t defaultNull = 0;
+            if (!readField(bytes, length, offset, defaultType) ||
+                !readField(bytes, length, offset, defaultNull)) {
+                return DbResult::error(DbStatus::CorruptPage, "column record truncated (default type)");
+            }
+            if (defaultNull > 1) {
+                return DbResult::error(DbStatus::CorruptPage, "invalid default null flag");
+            }
+            const DbType dt = static_cast<DbType>(defaultType);
+            if (!defaultNull && !isConcreteDbType(dt)) {
+                return DbResult::error(DbStatus::CorruptPage, "invalid default type id");
+            }
+            if (defaultNull) {
+                out.hasDefault = true;
+                out.defaultValue = DbValue::null();
+            } else {
+                switch (dt) {
+                case DbType::Boolean: {
+                    uint8_t v = 0;
+                    if (!readField(bytes, length, offset, v)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (boolean)");
+                    }
+                    if (v > 1) {
+                        return DbResult::error(DbStatus::CorruptPage, "invalid boolean default value");
+                    }
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::boolean(v != 0);
+                    break;
+                }
+                case DbType::Int32: {
+                    uint32_t v = 0;
+                    if (!readField(bytes, length, offset, v)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (int32)");
+                    }
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::int32(static_cast<int32_t>(v));
+                    break;
+                }
+                case DbType::Int64: {
+                    uint64_t v = 0;
+                    if (!readField(bytes, length, offset, v)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (int64)");
+                    }
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::int64(static_cast<int64_t>(v));
+                    break;
+                }
+                case DbType::Float64: {
+                    uint64_t v = 0;
+                    if (!readField(bytes, length, offset, v)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (float64)");
+                    }
+                    double d = 0.0;
+                    std::memcpy(&d, &v, sizeof(d));
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::float64(d);
+                    break;
+                }
+                case DbType::Text: {
+                    uint32_t len = 0;
+                    if (!readField(bytes, length, offset, len)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (text length)");
+                    }
+                    if (len > kMaxTextBytes) {
+                        return DbResult::error(DbStatus::CorruptPage, "default text value exceeds maximum length");
+                    }
+                    if (offset + len > length) {
+                        return DbResult::error(DbStatus::CorruptPage, "default text value extends beyond record");
+                    }
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::text(std::string(reinterpret_cast<const char*>(bytes + offset), len));
+                    offset += len;
+                    break;
+                }
+                case DbType::Blob: {
+                    uint32_t len = 0;
+                    if (!readField(bytes, length, offset, len)) {
+                        return DbResult::error(DbStatus::CorruptPage, "default value truncated (blob length)");
+                    }
+                    if (len > kMaxBlobBytes) {
+                        return DbResult::error(DbStatus::CorruptPage, "default blob value exceeds maximum length");
+                    }
+                    if (offset + len > length) {
+                        return DbResult::error(DbStatus::CorruptPage, "default blob value extends beyond record");
+                    }
+                    out.hasDefault = true;
+                    out.defaultValue = DbValue::blob(bytes + offset, len);
+                    offset += len;
+                    break;
+                }
+                default:
+                    return DbResult::error(DbStatus::CorruptPage, "unsupported default value type");
+                }
+            }
+        }
+    }
     return DbResult::ok();
 }
 
 DbResult Catalog::parseTableRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                                   TableRecord& out) {
+                                   TableRecord& out, bool hasDefaultMetadata) {
     uint32_t tableId = 0;
     uint32_t schemaVersion = 0;
     uint32_t columnCount = 0;
@@ -494,7 +945,7 @@ DbResult Catalog::parseTableRecord(const uint8_t* bytes, size_t length, size_t& 
 
     for (uint32_t i = 0; i < columnCount; ++i) {
         ColumnDefinition col;
-        DbResult result = parseColumnRecord(bytes, length, offset, col);
+        DbResult result = parseColumnRecord(bytes, length, offset, col, hasDefaultMetadata);
         if (!result.isOk()) {
             return result;
         }
@@ -522,7 +973,7 @@ DbResult Catalog::parseTableRecord(const uint8_t* bytes, size_t length, size_t& 
 }
 
 DbResult Catalog::parseIndexRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                                   IndexRecord& out) {
+                                   IndexRecord& out, bool hasOwnershipMetadata) {
     uint32_t indexId = 0;
     uint32_t tableId = 0;
     uint32_t columnOrdinal = 0;
@@ -530,6 +981,7 @@ DbResult Catalog::parseIndexRecord(const uint8_t* bytes, size_t length, size_t& 
     uint16_t flags = 0;
     uint16_t formatVersion = 0;
     uint64_t entryCount = 0;
+    uint32_t ownerForeignKeyId = 0;
     uint32_t nameLength = 0;
 
     if (!readField(bytes, length, offset, indexId) ||
@@ -538,9 +990,16 @@ DbResult Catalog::parseIndexRecord(const uint8_t* bytes, size_t length, size_t& 
         !readField(bytes, length, offset, rootPageId) ||
         !readField(bytes, length, offset, flags) ||
         !readField(bytes, length, offset, formatVersion) ||
-        !readField(bytes, length, offset, entryCount) ||
-        !readField(bytes, length, offset, nameLength)) {
+        !readField(bytes, length, offset, entryCount)) {
         return DbResult::error(DbStatus::CorruptPage, "index record truncated");
+    }
+    if (hasOwnershipMetadata) {
+        if (!readField(bytes, length, offset, ownerForeignKeyId)) {
+            return DbResult::error(DbStatus::CorruptPage, "index record truncated (owner)");
+        }
+    }
+    if (!readField(bytes, length, offset, nameLength)) {
+        return DbResult::error(DbStatus::CorruptPage, "index record truncated (name length)");
     }
     if (indexId == 0) {
         return DbResult::error(DbStatus::CorruptPage, "invalid index id");
@@ -548,7 +1007,8 @@ DbResult Catalog::parseIndexRecord(const uint8_t* bytes, size_t length, size_t& 
     if (tableId == 0) {
         return DbResult::error(DbStatus::CorruptPage, "invalid index table id");
     }
-    if ((flags & ~0x0003u) != 0) {
+    const uint16_t allowedFlags = hasOwnershipMetadata ? 0x0007u : 0x0003u;
+    if ((flags & ~allowedFlags) != 0) {
         return DbResult::error(DbStatus::CorruptPage, "invalid index flags");
     }
     if (formatVersion == 0 || formatVersion > 1) {
@@ -571,13 +1031,14 @@ DbResult Catalog::parseIndexRecord(const uint8_t* bytes, size_t length, size_t& 
     out.flags = flags;
     out.formatVersion = formatVersion;
     out.entryCount = entryCount;
+    out.ownerForeignKeyId = ownerForeignKeyId;
     out.name.assign(reinterpret_cast<const char*>(bytes + offset), nameLength);
     offset += nameLength;
     return DbResult::ok();
 }
 
 void Catalog::serializeColumnRecord(const ColumnDefinition& col,
-                                    std::vector<uint8_t>& out) const {
+                                    std::vector<uint8_t>& out, bool v4) const {
     const size_t base = out.size();
     out.resize(base + 16);
     storeLe32(out.data() + base + 0, col.ordinal);
@@ -586,9 +1047,65 @@ void Catalog::serializeColumnRecord(const ColumnDefinition& col,
     storeLe32(out.data() + base + 8, 0); // flags
     storeLe32(out.data() + base + 12, static_cast<uint32_t>(col.name.size()));
     out.insert(out.end(), col.name.begin(), col.name.end());
+
+    // SQL8: serialize DEFAULT metadata only in the v4 catalog layout.
+    if (!v4) {
+        return;
+    }
+    out.push_back(col.hasDefault ? 1u : 0u);
+    if (col.hasDefault) {
+        // A NULL default is stored with the column's declared type so the
+        // record remains self-describing.
+        const DbType storedType =
+            col.defaultValue.isNull() ? col.type : col.defaultValue.type();
+        out.push_back(static_cast<uint8_t>(storedType));
+        out.push_back(col.defaultValue.isNull() ? 1u : 0u);
+        if (!col.defaultValue.isNull()) {
+            switch (col.defaultValue.type()) {
+            case DbType::Boolean:
+                out.push_back(col.defaultValue.booleanValue() ? 1u : 0u);
+                break;
+            case DbType::Int32: {
+                const int32_t v = col.defaultValue.int32Value();
+                out.resize(out.size() + 4);
+                storeLe32(out.data() + out.size() - 4, static_cast<uint32_t>(v));
+                break;
+            }
+            case DbType::Int64: {
+                const int64_t v = col.defaultValue.int64Value();
+                out.resize(out.size() + 8);
+                storeLe64(out.data() + out.size() - 8, static_cast<uint64_t>(v));
+                break;
+            }
+            case DbType::Float64: {
+                const double v = col.defaultValue.float64Value();
+                out.resize(out.size() + 8);
+                storeLe64(out.data() + out.size() - 8, *reinterpret_cast<const uint64_t*>(&v));
+                break;
+            }
+            case DbType::Text: {
+                const std::string& s = col.defaultValue.textValue();
+                out.resize(out.size() + 4);
+                storeLe32(out.data() + out.size() - 4, static_cast<uint32_t>(s.size()));
+                out.insert(out.end(), s.begin(), s.end());
+                break;
+            }
+            case DbType::Blob: {
+                const std::vector<uint8_t>& b = col.defaultValue.blobValue();
+                out.resize(out.size() + 4);
+                storeLe32(out.data() + out.size() - 4, static_cast<uint32_t>(b.size()));
+                out.insert(out.end(), b.begin(), b.end());
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
 }
 
-void Catalog::serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>& out) const {
+void Catalog::serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>& out,
+                                   bool v4) const {
     const size_t base = out.size();
     out.resize(base + 40);
     storeLe32(out.data() + base + 0, rec.tableId);
@@ -601,14 +1118,15 @@ void Catalog::serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>&
     storeLe32(out.data() + base + 36, static_cast<uint32_t>(rec.name.size()));
     out.insert(out.end(), rec.name.begin(), rec.name.end());
     for (size_t i = 0; i < rec.columns.size(); ++i) {
-        serializeColumnRecord(rec.columns[i], out);
+        serializeColumnRecord(rec.columns[i], out, v4);
     }
 }
 
 void Catalog::serializeIndexRecord(const IndexRecord& rec,
-                                   std::vector<uint8_t>& out) const {
+                                   std::vector<uint8_t>& out, bool v4) const {
     const size_t base = out.size();
-    out.resize(base + 36);
+    const size_t headerSize = v4 ? 40u : 36u;
+    out.resize(base + headerSize);
     storeLe32(out.data() + base + 0, rec.indexId);
     storeLe32(out.data() + base + 4, rec.tableId);
     storeLe32(out.data() + base + 8, rec.columnOrdinal);
@@ -616,16 +1134,85 @@ void Catalog::serializeIndexRecord(const IndexRecord& rec,
     storeLe16(out.data() + base + 20, rec.flags);
     storeLe16(out.data() + base + 22, rec.formatVersion);
     storeLe64(out.data() + base + 24, rec.entryCount);
-    storeLe32(out.data() + base + 32, static_cast<uint32_t>(rec.name.size()));
+    if (v4) {
+        storeLe32(out.data() + base + 32, rec.ownerForeignKeyId);
+    }
+    storeLe32(out.data() + base + (v4 ? 36u : 32u),
+              static_cast<uint32_t>(rec.name.size()));
     out.insert(out.end(), rec.name.begin(), rec.name.end());
+}
+
+void Catalog::serializeForeignKeyRecord(const ForeignKeyRecord& rec,
+                                        std::vector<uint8_t>& out) const {
+    const size_t base = out.size();
+    out.resize(base + 36);
+    storeLe32(out.data() + base + 0, rec.foreignKeyId);
+    storeLe32(out.data() + base + 4, rec.childTableId);
+    storeLe32(out.data() + base + 8, rec.childColumnOrdinal);
+    storeLe32(out.data() + base + 12, rec.parentTableId);
+    storeLe32(out.data() + base + 16, rec.parentColumnOrdinal);
+    storeLe32(out.data() + base + 20, rec.referencedIndexId);
+    storeLe32(out.data() + base + 24, rec.supportIndexId);
+    storeLe16(out.data() + base + 28, rec.flags);
+    storeLe16(out.data() + base + 30, rec.formatVersion);
+    storeLe32(out.data() + base + 32, 0); // reserved
+}
+
+DbResult Catalog::parseForeignKeyRecord(const uint8_t* bytes, size_t length, size_t& offset,
+                                        ForeignKeyRecord& out) {
+    uint32_t foreignKeyId = 0;
+    uint32_t childTableId = 0;
+    uint32_t childColumnOrdinal = 0;
+    uint32_t parentTableId = 0;
+    uint32_t parentColumnOrdinal = 0;
+    uint32_t referencedIndexId = 0;
+    uint32_t supportIndexId = 0;
+    uint16_t flags = 0;
+    uint16_t formatVersion = 0;
+    uint32_t reserved = 0;
+
+    if (!readField(bytes, length, offset, foreignKeyId) ||
+        !readField(bytes, length, offset, childTableId) ||
+        !readField(bytes, length, offset, childColumnOrdinal) ||
+        !readField(bytes, length, offset, parentTableId) ||
+        !readField(bytes, length, offset, parentColumnOrdinal) ||
+        !readField(bytes, length, offset, referencedIndexId) ||
+        !readField(bytes, length, offset, supportIndexId) ||
+        !readField(bytes, length, offset, flags) ||
+        !readField(bytes, length, offset, formatVersion) ||
+        !readField(bytes, length, offset, reserved)) {
+        return DbResult::error(DbStatus::CorruptPage, "foreign key record truncated");
+    }
+    if (foreignKeyId == 0) {
+        return DbResult::error(DbStatus::CorruptPage, "invalid foreign key id");
+    }
+    if (childTableId == 0 || parentTableId == 0) {
+        return DbResult::error(DbStatus::CorruptPage, "invalid foreign key table id");
+    }
+    if (formatVersion == 0 || formatVersion > 1) {
+        return DbResult::error(DbStatus::CorruptPage, "unsupported foreign key format version");
+    }
+
+    out.foreignKeyId = foreignKeyId;
+    out.childTableId = childTableId;
+    out.childColumnOrdinal = childColumnOrdinal;
+    out.parentTableId = parentTableId;
+    out.parentColumnOrdinal = parentColumnOrdinal;
+    out.referencedIndexId = referencedIndexId;
+    out.supportIndexId = supportIndexId;
+    out.flags = flags;
+    out.formatVersion = formatVersion;
+    return DbResult::ok();
 }
 
 DbResult Catalog::load(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize,
                        uint64_t pageCount) {
     _tables.clear();
     _indexes.clear();
+    _foreignKeys.clear();
     _nextTableId = 1;
     _nextIndexId = 1;
+    _nextForeignKeyId = 1;
     _version = kCatalogVersion;
     _continuationPageIds.clear();
 
@@ -657,6 +1244,9 @@ DbResult Catalog::load(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize
     }
     if (version == kCatalogVersionV3) {
         return loadV3(pages, payload, rootPageId, pageSize, pageCount);
+    }
+    if (version == kCatalogVersionV4) {
+        return loadV4(pages, payload, rootPageId, pageSize, pageCount);
     }
     return DbResult::error(DbStatus::UnsupportedVersion,
                            "unsupported catalog version " +
@@ -697,7 +1287,7 @@ DbResult Catalog::loadV2(PageAccess& pages, const std::vector<uint8_t>& payload,
     size_t offset = kCatalogRootHeaderSize;
     for (uint32_t i = 0; i < rootRecordCount; ++i) {
         TableRecord rec;
-        DbResult result = parseTableRecord(payload.data(), payload.size(), offset, rec);
+        DbResult result = parseTableRecord(payload.data(), payload.size(), offset, rec, false);
         if (!result.isOk()) {
             return result;
         }
@@ -741,7 +1331,7 @@ DbResult Catalog::loadV2(PageAccess& pages, const std::vector<uint8_t>& payload,
         size_t coffset = kCatalogContHeaderSize;
         for (uint32_t j = 0; j < recordCount; ++j) {
             TableRecord rec;
-            DbResult result = parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec);
+            DbResult result = parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec, false);
             if (!result.isOk()) {
                 return result;
             }
@@ -819,14 +1409,14 @@ DbResult Catalog::loadV3(PageAccess& pages, const std::vector<uint8_t>& payload,
         const uint8_t type = payload[offset++];
         if (type == kCatalogRecordTable) {
             TableRecord rec;
-            DbResult result = parseTableRecord(payload.data(), payload.size(), offset, rec);
+            DbResult result = parseTableRecord(payload.data(), payload.size(), offset, rec, false);
             if (!result.isOk()) {
                 return result;
             }
             _tables.push_back(rec);
         } else if (type == kCatalogRecordIndex) {
             IndexRecord rec;
-            DbResult result = parseIndexRecord(payload.data(), payload.size(), offset, rec);
+            DbResult result = parseIndexRecord(payload.data(), payload.size(), offset, rec, false);
             if (!result.isOk()) {
                 return result;
             }
@@ -880,7 +1470,7 @@ DbResult Catalog::loadV3(PageAccess& pages, const std::vector<uint8_t>& payload,
             if (type == kCatalogRecordTable) {
                 TableRecord rec;
                 DbResult result =
-                    parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec);
+                    parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec, false);
                 if (!result.isOk()) {
                     return result;
                 }
@@ -888,7 +1478,7 @@ DbResult Catalog::loadV3(PageAccess& pages, const std::vector<uint8_t>& payload,
             } else if (type == kCatalogRecordIndex) {
                 IndexRecord rec;
                 DbResult result =
-                    parseIndexRecord(cpayload.data(), cpayload.size(), coffset, rec);
+                    parseIndexRecord(cpayload.data(), cpayload.size(), coffset, rec, false);
                 if (!result.isOk()) {
                     return result;
                 }
@@ -952,6 +1542,10 @@ DbResult Catalog::loadV3(PageAccess& pages, const std::vector<uint8_t>& payload,
 }
 
 DbResult Catalog::save(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize) {
+    const bool useV4 = _version == kCatalogVersionV4 || !_foreignKeys.empty();
+    if (useV4) {
+        return saveV4(pages, rootPageId, pageSize);
+    }
     const bool useV3 = _version == kCatalogVersionV3 || !_indexes.empty();
     if (useV3) {
         return saveV3(pages, rootPageId, pageSize);
@@ -969,7 +1563,7 @@ DbResult Catalog::saveV2(PageAccess& pages, uint64_t rootPageId, uint32_t pageSi
     records.reserve(_tables.size());
     for (size_t i = 0; i < _tables.size(); ++i) {
         std::vector<uint8_t> bytes;
-        serializeTableRecord(_tables[i], bytes);
+        serializeTableRecord(_tables[i], bytes, false);
         records.push_back(std::move(bytes));
     }
 
@@ -1105,13 +1699,13 @@ DbResult Catalog::saveV3(PageAccess& pages, uint64_t rootPageId, uint32_t pageSi
     for (size_t i = 0; i < _tables.size(); ++i) {
         std::vector<uint8_t> bytes;
         bytes.push_back(kCatalogRecordTable);
-        serializeTableRecord(_tables[i], bytes);
+        serializeTableRecord(_tables[i], bytes, false);
         records.push_back(std::move(bytes));
     }
     for (size_t i = 0; i < _indexes.size(); ++i) {
         std::vector<uint8_t> bytes;
         bytes.push_back(kCatalogRecordIndex);
-        serializeIndexRecord(_indexes[i], bytes);
+        serializeIndexRecord(_indexes[i], bytes, false);
         records.push_back(std::move(bytes));
     }
 
@@ -1237,6 +1831,349 @@ DbResult Catalog::saveV3(PageAccess& pages, uint64_t rootPageId, uint32_t pageSi
 
     _continuationPageIds = contIds;
     _version = kCatalogVersionV3;
+    return DbResult::ok();
+}
+
+DbResult Catalog::loadV4(PageAccess& pages, const std::vector<uint8_t>& payload,
+                         uint64_t rootPageId, uint32_t pageSize, uint64_t pageCount) {
+    (void)rootPageId;
+    (void)pageSize;
+    if (payload.size() < kCatalogV4RootHeaderSize) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog v4 root header truncated");
+    }
+    const uint32_t tableCount = loadLe32(payload.data() + 8);
+    _nextTableId = loadLe32(payload.data() + 12);
+    const uint32_t continuationCount = loadLe32(payload.data() + 16);
+    const uint64_t firstContinuation = loadLe32(payload.data() + 20);
+    const uint32_t rootRecordCount = loadLe32(payload.data() + 24);
+    const uint32_t indexCount = loadLe32(payload.data() + 28);
+    _nextIndexId = loadLe32(payload.data() + 32);
+    const uint32_t foreignKeyCount = loadLe32(payload.data() + 36);
+    _nextForeignKeyId = loadLe32(payload.data() + 40);
+    const uint32_t reserved = loadLe32(payload.data() + 44);
+
+    if (tableCount > kMaxTables) {
+        return DbResult::error(DbStatus::CorruptPage, "table count exceeds policy maximum");
+    }
+    if (indexCount > kMaxIndexes) {
+        return DbResult::error(DbStatus::CorruptPage, "index count exceeds policy maximum");
+    }
+    if (foreignKeyCount > kMaxForeignKeys) {
+        return DbResult::error(DbStatus::CorruptPage, "foreign key count exceeds policy maximum");
+    }
+    if (reserved != 0) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog v4 reserved field is nonzero");
+    }
+    if (_nextTableId == 0) _nextTableId = 1;
+    if (_nextIndexId == 0) _nextIndexId = 1;
+    if (_nextForeignKeyId == 0) _nextForeignKeyId = 1;
+    if (continuationCount > pageCount) {
+        return DbResult::error(DbStatus::CorruptPage, "continuation count exceeds page count");
+    }
+    if (continuationCount == 0 && firstContinuation != 0) {
+        return DbResult::error(DbStatus::CorruptPage, "continuation pointer without continuations");
+    }
+    if (rootRecordCount > tableCount + indexCount + foreignKeyCount) {
+        return DbResult::error(DbStatus::CorruptPage, "root record count exceeds total records");
+    }
+
+    size_t offset = kCatalogV4RootHeaderSize;
+    for (uint32_t i = 0; i < rootRecordCount; ++i) {
+        if (offset >= payload.size()) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog v4 record type truncated");
+        }
+        const uint8_t type = payload[offset++];
+        if (type == kCatalogRecordTable) {
+            TableRecord rec;
+            DbResult result = parseTableRecord(payload.data(), payload.size(), offset, rec, true);
+            if (!result.isOk()) return result;
+            _tables.push_back(rec);
+        } else if (type == kCatalogRecordIndex) {
+            IndexRecord rec;
+            DbResult result = parseIndexRecord(payload.data(), payload.size(), offset, rec, true);
+            if (!result.isOk()) return result;
+            _indexes.push_back(rec);
+        } else if (type == kCatalogRecordForeignKey) {
+            ForeignKeyRecord rec;
+            DbResult result = parseForeignKeyRecord(payload.data(), payload.size(), offset, rec);
+            if (!result.isOk()) return result;
+            _foreignKeys.push_back(rec);
+        } else {
+            return DbResult::error(DbStatus::CorruptPage, "unknown catalog v4 record type");
+        }
+    }
+
+    std::vector<bool> visited(pageCount, false);
+    uint64_t expectedNext = firstContinuation;
+    for (uint32_t i = 0; i < continuationCount; ++i) {
+        if (expectedNext == 0 || expectedNext >= pageCount) {
+            return DbResult::error(DbStatus::CorruptPage, "invalid catalog continuation page");
+        }
+        if (visited[expectedNext]) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog continuation cycle");
+        }
+        visited[expectedNext] = true;
+        _continuationPageIds.push_back(expectedNext);
+
+        DatabasePage cont;
+        DbResult result = pages.readPage(expectedNext, cont);
+        if (!result.isOk()) return result;
+        const std::vector<uint8_t>& cpayload = cont.payload;
+        if (cpayload.size() < kCatalogV4ContHeaderSize) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog v4 continuation header truncated");
+        }
+        if (loadLe32(cpayload.data() + 0) != kCatalogMagic) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog v4 continuation signature mismatch");
+        }
+        if (loadLe16(cpayload.data() + 4) != kCatalogVersionV4) {
+            return DbResult::error(DbStatus::CorruptPage, "catalog v4 continuation version mismatch");
+        }
+        const uint64_t next = loadLe64(cpayload.data() + 8);
+        const uint32_t recordCount = loadLe32(cpayload.data() + 16);
+        if (recordCount > kMaxTables + kMaxIndexes + kMaxForeignKeys) {
+            return DbResult::error(DbStatus::CorruptPage, "continuation record count too large");
+        }
+
+        size_t coffset = kCatalogV4ContHeaderSize;
+        for (uint32_t j = 0; j < recordCount; ++j) {
+            if (coffset >= cpayload.size()) {
+                return DbResult::error(DbStatus::CorruptPage, "catalog v4 record type truncated");
+            }
+            const uint8_t type = cpayload[coffset++];
+            if (type == kCatalogRecordTable) {
+                TableRecord rec;
+                DbResult result = parseTableRecord(cpayload.data(), cpayload.size(), coffset, rec, true);
+                if (!result.isOk()) return result;
+                _tables.push_back(rec);
+            } else if (type == kCatalogRecordIndex) {
+                IndexRecord rec;
+                DbResult result = parseIndexRecord(cpayload.data(), cpayload.size(), coffset, rec, true);
+                if (!result.isOk()) return result;
+                _indexes.push_back(rec);
+            } else if (type == kCatalogRecordForeignKey) {
+                ForeignKeyRecord rec;
+                DbResult result = parseForeignKeyRecord(cpayload.data(), cpayload.size(), coffset, rec);
+                if (!result.isOk()) return result;
+                _foreignKeys.push_back(rec);
+            } else {
+                return DbResult::error(DbStatus::CorruptPage, "unknown catalog v4 record type");
+            }
+        }
+        expectedNext = next;
+    }
+
+    if (expectedNext != 0) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog continuation chain length mismatch");
+    }
+    if (_tables.size() != tableCount) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog v4 table count mismatch");
+    }
+    if (_indexes.size() != indexCount) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog v4 index count mismatch");
+    }
+    if (_foreignKeys.size() != foreignKeyCount) {
+        return DbResult::error(DbStatus::CorruptPage, "catalog v4 foreign key count mismatch");
+    }
+
+    // Cross-record validation.
+    for (size_t i = 0; i < _tables.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (_tables[j].tableId == _tables[i].tableId) {
+                return DbResult::error(DbStatus::CorruptPage, "duplicate table id");
+            }
+            if (_tables[j].name == _tables[i].name) {
+                return DbResult::error(DbStatus::CorruptPage, "duplicate table name");
+            }
+        }
+    }
+    for (size_t i = 0; i < _indexes.size(); ++i) {
+        const IndexRecord& idx = _indexes[i];
+        const TableRecord* table = findTable(idx.tableId);
+        if (table == nullptr) {
+            return DbResult::error(DbStatus::CorruptPage, "index references unknown table");
+        }
+        if (idx.columnOrdinal >= table->columns.size()) {
+            return DbResult::error(DbStatus::CorruptPage, "index references unknown column");
+        }
+        if (!isIndexableType(table->columns[idx.columnOrdinal].type)) {
+            return DbResult::error(DbStatus::CorruptPage, "index column type is not indexable");
+        }
+        if (idx.rootPageId >= pageCount) {
+            return DbResult::error(DbStatus::CorruptPage, "index root page out of range");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (_indexes[j].indexId == idx.indexId) {
+                return DbResult::error(DbStatus::CorruptPage, "duplicate index id");
+            }
+            if (_indexes[j].name == idx.name) {
+                return DbResult::error(DbStatus::CorruptPage, "duplicate index name");
+            }
+        }
+    }
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        const ForeignKeyRecord& fk = _foreignKeys[i];
+        if (findTable(fk.childTableId) == nullptr) {
+            return DbResult::error(DbStatus::CorruptPage, "foreign key references unknown child table");
+        }
+        if (findTable(fk.parentTableId) == nullptr) {
+            return DbResult::error(DbStatus::CorruptPage, "foreign key references unknown parent table");
+        }
+        if (findIndex(fk.referencedIndexId) == nullptr) {
+            return DbResult::error(DbStatus::CorruptPage, "foreign key references unknown index");
+        }
+        if (findIndex(fk.supportIndexId) == nullptr) {
+            return DbResult::error(DbStatus::CorruptPage, "foreign key references unknown support index");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (_foreignKeys[j].foreignKeyId == fk.foreignKeyId) {
+                return DbResult::error(DbStatus::CorruptPage, "duplicate foreign key id");
+            }
+        }
+    }
+    _version = kCatalogVersionV4;
+    return DbResult::ok();
+}
+
+DbResult Catalog::saveV4(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize) {
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    const uint32_t rootCap = capacity - kCatalogV4RootHeaderSize;
+    const uint32_t contCap = capacity - kCatalogV4ContHeaderSize;
+
+    std::vector<std::vector<uint8_t>> records;
+    records.reserve(_tables.size() + _indexes.size() + _foreignKeys.size());
+    for (size_t i = 0; i < _tables.size(); ++i) {
+        std::vector<uint8_t> bytes;
+        bytes.push_back(kCatalogRecordTable);
+        serializeTableRecord(_tables[i], bytes, true);
+        records.push_back(std::move(bytes));
+    }
+    for (size_t i = 0; i < _indexes.size(); ++i) {
+        std::vector<uint8_t> bytes;
+        bytes.push_back(kCatalogRecordIndex);
+        serializeIndexRecord(_indexes[i], bytes, true);
+        records.push_back(std::move(bytes));
+    }
+    for (size_t i = 0; i < _foreignKeys.size(); ++i) {
+        std::vector<uint8_t> bytes;
+        bytes.push_back(kCatalogRecordForeignKey);
+        serializeForeignKeyRecord(_foreignKeys[i], bytes);
+        records.push_back(std::move(bytes));
+    }
+
+    std::vector<std::vector<uint8_t>> pagePayloads;
+    std::vector<uint32_t> pageRecordCounts;
+
+    std::vector<uint8_t> current(rootCap, 0);
+    storeLe32(current.data() + 0, kCatalogMagic);
+    storeLe16(current.data() + 4, kCatalogVersionV4);
+    storeLe16(current.data() + 6, 0);
+    storeLe32(current.data() + 8, 0);
+    storeLe32(current.data() + 12, 0);
+    storeLe32(current.data() + 16, 0);
+    storeLe32(current.data() + 20, 0);
+    storeLe32(current.data() + 24, 0);
+    storeLe32(current.data() + 28, 0);
+    storeLe32(current.data() + 32, 0);
+    storeLe32(current.data() + 36, 0);
+    storeLe32(current.data() + 40, 0);
+    storeLe32(current.data() + 44, 0);
+    size_t currentOffset = kCatalogV4RootHeaderSize;
+    uint32_t currentCap = rootCap;
+    uint32_t currentRecords = 0;
+
+    for (size_t i = 0; i < records.size(); ++i) {
+        const std::vector<uint8_t>& rec = records[i];
+        if (currentOffset + rec.size() <= currentCap) {
+            std::memcpy(current.data() + currentOffset, rec.data(), rec.size());
+            currentOffset += rec.size();
+            ++currentRecords;
+            continue;
+        }
+        pagePayloads.push_back(current);
+        pageRecordCounts.push_back(currentRecords);
+
+        if (rec.size() > contCap - kCatalogV4ContHeaderSize) {
+            return DbResult::error(DbStatus::Internal, "catalog v4 record exceeds page capacity");
+        }
+        current.assign(contCap, 0);
+        storeLe32(current.data() + 0, kCatalogMagic);
+        storeLe16(current.data() + 4, kCatalogVersionV4);
+        storeLe16(current.data() + 6, 0);
+        storeLe64(current.data() + 8, 0);
+        storeLe32(current.data() + 16, 0);
+        storeLe32(current.data() + 20, 0);
+        currentOffset = kCatalogV4ContHeaderSize;
+        currentCap = contCap;
+        currentRecords = 0;
+
+        std::memcpy(current.data() + currentOffset, rec.data(), rec.size());
+        currentOffset += rec.size();
+        ++currentRecords;
+    }
+    pagePayloads.push_back(current);
+    pageRecordCounts.push_back(currentRecords);
+
+    const uint32_t pageTotal = static_cast<uint32_t>(pagePayloads.size());
+
+    std::vector<uint64_t> contIds;
+    contIds.reserve(pageTotal > 0 ? pageTotal - 1 : 0);
+    for (uint32_t i = 1; i < pageTotal; ++i) {
+        if (i - 1 < _continuationPageIds.size()) {
+            contIds.push_back(_continuationPageIds[i - 1]);
+        } else {
+            uint64_t newId = 0;
+            DbResult result = pages.allocatePage(PageType::Catalog, newId);
+            if (!result.isOk()) return result;
+            contIds.push_back(newId);
+        }
+    }
+
+    {
+        std::vector<uint8_t>& rootPayload = pagePayloads[0];
+        storeLe32(rootPayload.data() + 8, static_cast<uint32_t>(_tables.size()));
+        storeLe32(rootPayload.data() + 12, _nextTableId);
+        storeLe32(rootPayload.data() + 16, static_cast<uint32_t>(contIds.size()));
+        storeLe32(rootPayload.data() + 20, contIds.empty() ? 0u : static_cast<uint32_t>(contIds[0]));
+        storeLe32(rootPayload.data() + 24, pageRecordCounts[0]);
+        storeLe32(rootPayload.data() + 28, static_cast<uint32_t>(_indexes.size()));
+        storeLe32(rootPayload.data() + 32, _nextIndexId);
+        storeLe32(rootPayload.data() + 36, static_cast<uint32_t>(_foreignKeys.size()));
+        storeLe32(rootPayload.data() + 40, _nextForeignKeyId);
+    }
+
+    for (uint32_t i = 0; i < contIds.size(); ++i) {
+        std::vector<uint8_t>& cp = pagePayloads[i + 1];
+        const uint64_t next = (i + 1 < contIds.size()) ? contIds[i + 1] : 0;
+        storeLe64(cp.data() + 8, next);
+        storeLe32(cp.data() + 16, pageRecordCounts[i + 1]);
+    }
+
+    {
+        DatabasePage rootPage;
+        DbResult result = pages.readPage(rootPageId, rootPage);
+        if (!result.isOk()) return result;
+        rootPage.pageId = rootPageId;
+        rootPage.payload = pagePayloads[0];
+        rootPage.payloadSize = static_cast<uint32_t>(pagePayloads[0].size());
+        rootPage.type = PageType::Catalog;
+        result = pages.writePage(rootPage);
+        if (!result.isOk()) return result;
+    }
+
+    for (uint32_t i = 0; i < contIds.size(); ++i) {
+        DatabasePage contPage;
+        DbResult result = pages.readPage(contIds[i], contPage);
+        if (!result.isOk()) return result;
+        contPage.pageId = contIds[i];
+        contPage.payload = pagePayloads[i + 1];
+        contPage.payloadSize = static_cast<uint32_t>(pagePayloads[i + 1].size());
+        contPage.type = PageType::Catalog;
+        result = pages.writePage(contPage);
+        if (!result.isOk()) return result;
+    }
+
+    _continuationPageIds = contIds;
+    _version = kCatalogVersionV4;
     return DbResult::ok();
 }
 

@@ -50,21 +50,40 @@ void printDiagnostics(const DatabaseDiagnostics& d, DbStatus status) {
     std::printf("buffer dirty:        %u\n", static_cast<unsigned>(d.bufferDirty));
     for (size_t i = 0; i < d.tables.size(); ++i) {
         const TableDiagnostics& t = d.tables[i];
-        std::printf("  table [%u] \"%s\": %u columns, %u heap pages, %llu rows\n",
+        std::printf("  table [%u] \"%s\": schema v%u, %u columns, %u heap pages, %llu rows\n",
                     static_cast<unsigned>(t.tableId), t.name.c_str(),
+                    static_cast<unsigned>(t.schemaVersion),
                     static_cast<unsigned>(t.columnCount),
                     static_cast<unsigned>(t.heapPageCount),
                     static_cast<unsigned long long>(t.rowCount));
+        for (size_t c = 0; c < t.columns.size(); ++c) {
+            const ColumnDiagnostics& col = t.columns[c];
+            std::printf("    column \"%s\" %s%s%s\n", col.name.c_str(),
+                        col.typeName.c_str(), col.nullable ? " NULL" : " NOT NULL",
+                        col.hasDefault ? (" DEFAULT " + col.defaultValue).c_str() : "");
+        }
     }
     std::printf("index count:         %u\n", static_cast<unsigned>(d.indexCount));
     for (size_t i = 0; i < d.indexes.size(); ++i) {
         const IndexDiagnostics& x = d.indexes[i];
         const char* kind = x.primaryKey ? "PRIMARY KEY" : (x.unique ? "UNIQUE" : "INDEX");
-        std::printf("  index [%u] \"%s\": %s on %s(%s), root %llu, %llu entries\n",
-                    static_cast<unsigned>(x.indexId), x.name.c_str(), kind,
+        const char* owner = x.systemOwned ? " [system-owned]" : "";
+        std::printf("  index [%u] \"%s\": %s%s on %s(%s), root %llu, %llu entries\n",
+                    static_cast<unsigned>(x.indexId), x.name.c_str(), kind, owner,
                     x.tableName.c_str(), x.columnName.c_str(),
                     static_cast<unsigned long long>(x.rootPageId),
                     static_cast<unsigned long long>(x.entryCount));
+    }
+    std::printf("foreign key count:   %u\n",
+                static_cast<unsigned>(d.foreignKeyCount));
+    for (size_t i = 0; i < d.foreignKeys.size(); ++i) {
+        const ForeignKeyDiagnostics& fk = d.foreignKeys[i];
+        std::printf("  fk [%u]: %s(%s) -> %s(%s), ref index %u, support index %u\n",
+                    static_cast<unsigned>(fk.foreignKeyId), fk.childTableName.c_str(),
+                    fk.childColumnName.c_str(), fk.parentTableName.c_str(),
+                    fk.parentColumnName.c_str(),
+                    static_cast<unsigned>(fk.referencedIndexId),
+                    static_cast<unsigned>(fk.supportIndexId));
     }
     if (!d.lastValidationFailure.empty()) {
         std::printf("last validation:     %s\n", d.lastValidationFailure.c_str());

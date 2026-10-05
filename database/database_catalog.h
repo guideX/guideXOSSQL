@@ -64,21 +64,41 @@ public:
         uint32_t tableId;
         uint32_t columnOrdinal;
         uint64_t rootPageId; // 0 means "empty index, no pages allocated yet"
-        uint16_t flags;      // bit0 unique, bit1 primary key
+        uint16_t flags;      // bit0 unique, bit1 primary key, bit2 system-owned
         uint16_t formatVersion;
         uint64_t entryCount;
+        uint32_t ownerForeignKeyId; // 0 = not an FK support index
 
         IndexRecord()
             : indexId(0), tableId(0), columnOrdinal(0), rootPageId(0), flags(0),
-              formatVersion(1), entryCount(0) {}
+              formatVersion(1), entryCount(0), ownerForeignKeyId(0) {}
 
         bool unique() const { return (flags & 0x0001u) != 0; }
         bool primaryKey() const { return (flags & 0x0002u) != 0; }
+        bool systemOwned() const { return (flags & 0x0004u) != 0; }
         IndexKind kind() const {
             if (primaryKey()) return IndexKind::PrimaryKey;
             if (unique()) return IndexKind::Unique;
             return IndexKind::Ordinary;
         }
+    };
+
+    // SQL8 foreign-key record.
+    struct ForeignKeyRecord {
+        uint32_t foreignKeyId;
+        uint32_t childTableId;
+        uint32_t childColumnOrdinal;
+        uint32_t parentTableId;
+        uint32_t parentColumnOrdinal;
+        uint32_t referencedIndexId;
+        uint32_t supportIndexId;
+        uint16_t flags;
+        uint16_t formatVersion;
+
+        ForeignKeyRecord()
+            : foreignKeyId(0), childTableId(0), childColumnOrdinal(0), parentTableId(0),
+              parentColumnOrdinal(0), referencedIndexId(0), supportIndexId(0), flags(0),
+              formatVersion(1) {}
     };
 
     Catalog();
@@ -115,6 +135,29 @@ public:
     std::vector<IndexRecord> indexesForTable(uint32_t tableId) const;
     uint16_t version() const { return _version; }
 
+    // ---- SQL8 foreign keys -----------------------------------------------
+    const ForeignKeyRecord* findForeignKey(uint32_t foreignKeyId) const;
+    const std::vector<ForeignKeyRecord>& foreignKeys() const { return _foreignKeys; }
+    uint32_t foreignKeyCount() const { return static_cast<uint32_t>(_foreignKeys.size()); }
+    uint32_t nextForeignKeyId() const { return _nextForeignKeyId; }
+    std::vector<ForeignKeyRecord> foreignKeysForChildTable(uint32_t tableId) const;
+    std::vector<ForeignKeyRecord> foreignKeysForParentTable(uint32_t tableId) const;
+
+    // Validates and appends a new foreign-key record plus its support index.
+    // Does not touch the disk; call save() to persist.
+    DbResult addForeignKey(const ForeignKeyDefinition& def, uint32_t pageSize,
+                           uint32_t& outForeignKeyId);
+
+    // Removes a table, its indexes, and its FK records (SQL8 DROP TABLE).
+    DbResult removeTable(uint32_t tableId);
+
+    // Removes a user-created ordinary index (SQL8 DROP INDEX).
+    DbResult removeIndex(uint32_t indexId);
+
+    // Appends a column to an existing table (SQL8 ALTER TABLE ADD COLUMN).
+    DbResult addColumnToTable(uint32_t tableId, const ColumnDefinition& col,
+                              uint32_t pageSize);
+
     // Validates and appends a new index record, assigning its id. Fails with
     // AlreadyExists on a duplicate name or a second index on the same column.
     // Does not touch the disk; call save() to persist.
@@ -136,7 +179,7 @@ public:
     DbResult addTable(const TableDefinition& def, uint32_t pageSize, uint32_t& outTableId);
 
     // Serialized size of the table record for `def` (validation not included).
-    uint32_t recordSizeForDefinition(const TableDefinition& def) const;
+    uint32_t recordSizeForDefinition(const TableDefinition& def, bool v4) const;
 
 private:
     struct PageWrite {
@@ -148,26 +191,37 @@ private:
                     uint64_t rootPageId, uint32_t pageSize, uint64_t pageCount);
     DbResult loadV3(PageAccess& pages, const std::vector<uint8_t>& rootPayload,
                     uint64_t rootPageId, uint32_t pageSize, uint64_t pageCount);
+    DbResult loadV4(PageAccess& pages, const std::vector<uint8_t>& rootPayload,
+                    uint64_t rootPageId, uint32_t pageSize, uint64_t pageCount);
     DbResult saveV2(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize);
     DbResult saveV3(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize);
+    DbResult saveV4(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize);
 
     DbResult parseTableRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                              TableRecord& out);
+                              TableRecord& out, bool hasDefaultMetadata);
     DbResult parseIndexRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                              IndexRecord& out);
+                              IndexRecord& out, bool hasOwnershipMetadata);
     DbResult parseColumnRecord(const uint8_t* bytes, size_t length, size_t& offset,
-                               ColumnDefinition& out);
-    void serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>& out) const;
+                               ColumnDefinition& out, bool hasDefaultMetadata);
+    DbResult parseForeignKeyRecord(const uint8_t* bytes, size_t length, size_t& offset,
+                                   ForeignKeyRecord& out);
+    void serializeTableRecord(const TableRecord& rec, std::vector<uint8_t>& out,
+                              bool v4) const;
     void serializeColumnRecord(const ColumnDefinition& col,
-                               std::vector<uint8_t>& out) const;
-    void serializeIndexRecord(const IndexRecord& rec, std::vector<uint8_t>& out) const;
+                               std::vector<uint8_t>& out, bool v4) const;
+    void serializeIndexRecord(const IndexRecord& rec, std::vector<uint8_t>& out,
+                              bool v4) const;
+    void serializeForeignKeyRecord(const ForeignKeyRecord& rec,
+                                   std::vector<uint8_t>& out) const;
     bool validateName(const std::string& name, uint32_t maxBytes) const;
     bool tableNameExists(const std::string& name) const;
 
     std::vector<TableRecord> _tables;
     std::vector<IndexRecord> _indexes;
+    std::vector<ForeignKeyRecord> _foreignKeys;
     uint32_t _nextTableId;
     uint32_t _nextIndexId;
+    uint32_t _nextForeignKeyId;
     uint16_t _version;
     std::vector<uint64_t> _continuationPageIds;
 };

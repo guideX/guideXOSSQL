@@ -569,11 +569,261 @@ DbResult maintainIndexes(Database& db, uint32_t tableId,
     return DbResult::ok();
 }
 
+// Compares two DbValues for equality. Returns 0 if equal.
+int compareValues(const DbValue& a, const DbValue& b) {
+    if (a.isNull() != b.isNull()) {
+        return a.isNull() ? -1 : 1;
+    }
+    if (a.isNull()) {
+        return 0;
+    }
+    if (a.type() != b.type()) {
+        return a.type() < b.type() ? -1 : 1;
+    }
+    switch (a.type()) {
+    case DbType::Boolean:
+        return a.booleanValue() == b.booleanValue() ? 0 : (a.booleanValue() ? 1 : -1);
+    case DbType::Int32:
+        return a.int32Value() == b.int32Value() ? 0 : (a.int32Value() < b.int32Value() ? -1 : 1);
+    case DbType::Int64:
+        return a.int64Value() == b.int64Value() ? 0 : (a.int64Value() < b.int64Value() ? -1 : 1);
+    case DbType::Float64:
+        return a.float64Value() == b.float64Value() ? 0 : (a.float64Value() < b.float64Value() ? -1 : 1);
+    case DbType::Text:
+        return a.textValue().compare(b.textValue());
+    case DbType::Blob:
+        if (a.blobValue().size() != b.blobValue().size()) {
+            return a.blobValue().size() < b.blobValue().size() ? -1 : 1;
+        }
+        return std::memcmp(a.blobValue().data(), b.blobValue().data(), a.blobValue().size());
+    default:
+        return 0;
+    }
+}
+
+// ---- SQL8 foreign-key enforcement -------------------------------------------
+
+// Returns the FK records where `tableId` is the child table.
+std::vector<Catalog::ForeignKeyRecord> childForeignKeys(Database& db, uint32_t tableId) {
+    return db.catalog().foreignKeysForChildTable(tableId);
+}
+
+// Returns the FK records where `tableId` is the parent table.
+std::vector<Catalog::ForeignKeyRecord> parentForeignKeys(Database& db, uint32_t tableId) {
+    return db.catalog().foreignKeysForParentTable(tableId);
+}
+
+// Compares two non-NULL values for equality using the same total order used by
+// index keys. NULLs are considered equal to each other.
+bool valuesEqual(const DbValue& a, const DbValue& b) {
+    if (a.isNull() || b.isNull()) {
+        return a.isNull() && b.isNull();
+    }
+    return compareValues(a, b) == 0;
+}
+
+// Returns the index of the mutation targeting `loc`, or -1 when the row is not
+// part of the batch.
+int findMutationIndex(const std::vector<RowMutation>& mutations,
+                      const RowLocator& loc) {
+    for (size_t i = 0; i < mutations.size(); ++i) {
+        if (mutations[i].locator.pageId == loc.pageId &&
+            mutations[i].locator.slot == loc.slot) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Checks child-side FK constraints for a row being inserted or updated.
+// For each non-NULL FK value, the referenced parent row must exist in the
+// statement's final logical state. When `batch` is provided (UPDATE/DELETE),
+// self-referential parents that are inserted or moved within the same
+// statement are taken into account, and parent rows that are deleted or moved
+// away by the same statement are treated as absent.
+DbResult enforceChildForeignKeys(Database& db, uint32_t tableId,
+                                 const std::vector<DbValue>& values,
+                                 const std::vector<RowMutation>* batch) {
+    const std::vector<Catalog::ForeignKeyRecord> fks = childForeignKeys(db, tableId);
+    for (size_t i = 0; i < fks.size(); ++i) {
+        const Catalog::ForeignKeyRecord& fk = fks[i];
+        if (fk.childColumnOrdinal >= values.size()) {
+            continue;
+        }
+        const DbValue& childValue = values[fk.childColumnOrdinal];
+        if (childValue.isNull()) {
+            continue;
+        }
+        const Catalog::IndexRecord* parentRec = db.catalog().findIndex(fk.referencedIndexId);
+        if (parentRec == nullptr) {
+            return DbResult::error(DbStatus::Internal, "FK referenced index not found");
+        }
+        const Catalog::TableRecord* parentTable = db.catalog().findTable(parentRec->tableId);
+        if (parentTable == nullptr) {
+            return DbResult::error(DbStatus::Internal, "FK parent table not found");
+        }
+        std::vector<uint8_t> key;
+        if (!encodeIndexKey(parentTable->columns[parentRec->columnOrdinal].type, childValue, key)) {
+            return DbResult::error(DbStatus::Internal, "FK key encoding failed");
+        }
+        IndexTree tree(db.pages(), parentTable->columns[parentRec->columnOrdinal].type,
+                       parentRec->indexId);
+        std::vector<IndexEntry> entries;
+        DbResult result = tree.lookupAll(key, parentRec->rootPageId, entries);
+        if (!result.isOk()) {
+            return result;
+        }
+
+        if (fk.parentTableId != tableId || batch == nullptr) {
+            // Cross-table (or plain insert): the referenced parent must already
+            // exist in the index.
+            if (entries.empty()) {
+                return DbResult::error(
+                    DbStatus::ForeignKeyViolation,
+                    "foreign key constraint violation: referenced parent row does not exist");
+            }
+            continue;
+        }
+
+        // Self-referential final-state check.
+        const uint32_t parentCol = fk.parentColumnOrdinal;
+        bool live = false;
+        for (size_t e = 0; e < entries.size() && !live; ++e) {
+            const int mi = findMutationIndex(*batch, entries[e].locator);
+            if (mi < 0) {
+                live = true; // parent row is untouched by this statement
+                break;
+            }
+            const RowMutation& m = (*batch)[static_cast<size_t>(mi)];
+            if (!m.deleted && parentCol < m.values.size() &&
+                valuesEqual(m.values[parentCol], childValue)) {
+                live = true;
+            }
+        }
+        if (!live) {
+            // A parent row may be provided by the same statement even though the
+            // index has not been updated yet.
+            for (size_t m = 0; m < batch->size(); ++m) {
+                const RowMutation& mut = (*batch)[m];
+                if (!mut.deleted && parentCol < mut.values.size() &&
+                    valuesEqual(mut.values[parentCol], childValue)) {
+                    live = true;
+                    break;
+                }
+            }
+        }
+        if (!live) {
+            return DbResult::error(
+                DbStatus::ForeignKeyViolation,
+                "foreign key constraint violation: referenced parent row does not exist");
+        }
+    }
+    return DbResult::ok();
+}
+
+// Checks parent-side FK RESTRICT constraints against the statement's final
+// logical state. A parent key that is removed (deleted or changed away) by the
+// statement is rejected when a surviving child row still references it. For a
+// self-referential FK, child rows that are themselves deleted or moved away by
+// the same statement do not block the parent change.
+DbResult enforceParentForeignKeys(Database& db, uint32_t tableId,
+                                  const std::vector<RowMutation>& mutations,
+                                  const std::vector<std::vector<DbValue> >& oldValues) {
+    const std::vector<Catalog::ForeignKeyRecord> fks = parentForeignKeys(db, tableId);
+    for (size_t f = 0; f < fks.size(); ++f) {
+        const Catalog::ForeignKeyRecord& fk = fks[f];
+        const uint32_t parentCol = fk.parentColumnOrdinal;
+        const uint32_t childCol = fk.childColumnOrdinal;
+
+        // Values still provided by the statement (non-deleted replacement rows).
+        std::vector<DbValue> stillPresent;
+        for (size_t i = 0; i < mutations.size(); ++i) {
+            if (!mutations[i].deleted && parentCol < mutations[i].values.size()) {
+                stillPresent.push_back(mutations[i].values[parentCol]);
+            }
+        }
+
+        for (size_t i = 0; i < mutations.size(); ++i) {
+            const RowMutation& mutation = mutations[i];
+            if (parentCol >= oldValues[i].size()) {
+                continue;
+            }
+            const DbValue& oldKey = oldValues[i][parentCol];
+            if (oldKey.isNull()) {
+                continue;
+            }
+            DbValue newKey = DbValue::null();
+            if (!mutation.deleted && parentCol < mutation.values.size()) {
+                newKey = mutation.values[parentCol];
+            }
+            if (!mutation.deleted && valuesEqual(oldKey, newKey)) {
+                continue; // parent key unchanged
+            }
+            bool present = false;
+            for (size_t s = 0; s < stillPresent.size(); ++s) {
+                if (valuesEqual(stillPresent[s], oldKey)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) {
+                continue; // key is re-established by the same statement
+            }
+
+            const Catalog::TableRecord* childTable = db.catalog().findTable(fk.childTableId);
+            if (childTable == nullptr) {
+                return DbResult::error(DbStatus::Internal, "FK child table not found");
+            }
+            const Catalog::IndexRecord* supportRec = db.catalog().findIndex(fk.supportIndexId);
+            if (supportRec == nullptr) {
+                return DbResult::error(DbStatus::Internal, "FK support index not found");
+            }
+            std::vector<uint8_t> key;
+            if (!encodeIndexKey(childTable->columns[fk.childColumnOrdinal].type, oldKey, key)) {
+                return DbResult::error(DbStatus::Internal, "FK key encoding failed");
+            }
+            IndexTree tree(db.pages(), childTable->columns[fk.childColumnOrdinal].type,
+                           supportRec->indexId);
+            std::vector<IndexEntry> entries;
+            DbResult result = tree.lookupAll(key, supportRec->rootPageId, entries);
+            if (!result.isOk()) {
+                return result;
+            }
+            for (size_t e = 0; e < entries.size(); ++e) {
+                if (fk.childTableId == tableId) {
+                    const int mi = findMutationIndex(mutations, entries[e].locator);
+                    if (mi < 0) {
+                        return DbResult::error(
+                            DbStatus::ForeignKeyViolation,
+                            "foreign key constraint violation: parent row is referenced by child rows");
+                    }
+                    const RowMutation& child = mutations[static_cast<size_t>(mi)];
+                    if (child.deleted) {
+                        continue; // child row removed by this statement
+                    }
+                    if (childCol < child.values.size() &&
+                        valuesEqual(child.values[childCol], oldKey)) {
+                        return DbResult::error(
+                            DbStatus::ForeignKeyViolation,
+                            "foreign key constraint violation: parent row is referenced by child rows");
+                    }
+                    // child moved away from this key: resolved
+                } else {
+                    return DbResult::error(
+                        DbStatus::ForeignKeyViolation,
+                        "foreign key constraint violation: parent row is referenced by child rows");
+                }
+            }
+        }
+    }
+    return DbResult::ok();
+}
+
 } // namespace
 
 Table::Table(Database& db, uint32_t tableId)
     : _db(db), _tableId(tableId), _lastHeapPageId(0), _lastResolved(false),
-      _resolvedEpoch(0) {}
+      _resolvedEpoch(0), _skipForeignKeys(false) {}
 
 const std::string& Table::name() const {
     static const std::string empty;
@@ -745,6 +995,14 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
                 return DbResult::error(DbStatus::AlreadyExists,
                                        "unique index constraint violation");
             }
+        }
+    }
+
+    // SQL8: enforce child-side foreign key constraints.
+    if (!_skipForeignKeys) {
+        result = enforceChildForeignKeys(_db, _tableId, values, nullptr);
+        if (!result.isOk()) {
+            return result;
         }
     }
 
@@ -961,6 +1219,34 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
         byPage[mutation.locator.pageId].push_back(entry);
     }
 
+    // SQL8: enforce foreign key constraints before applying mutations, against
+    // the statement's final logical state. Child-side checks validate every
+    // replacement row; parent-side checks consider all mutations together so a
+    // self-referential statement that removes both sides in one batch succeeds.
+    if (!_skipForeignKeys) {
+        DbResult fkResult;
+        std::vector<std::vector<DbValue> > oldValuesList(mutations.size());
+        for (size_t i = 0; i < mutations.size(); ++i) {
+            fkResult = fetchRow(mutations[i].locator, oldValuesList[i]);
+            if (!fkResult.isOk()) {
+                return fkResult;
+            }
+        }
+        for (size_t i = 0; i < mutations.size(); ++i) {
+            if (!mutations[i].deleted) {
+                fkResult = enforceChildForeignKeys(_db, _tableId, mutations[i].values,
+                                                   &mutations);
+                if (!fkResult.isOk()) {
+                    return fkResult;
+                }
+            }
+        }
+        fkResult = enforceParentForeignKeys(_db, _tableId, mutations, oldValuesList);
+        if (!fkResult.isOk()) {
+            return fkResult;
+        }
+    }
+
     // Walk the heap chain once to establish physical order, so relocated rows
     // preserve the relative order of the pages they came from.
     std::vector<uint64_t> chain;
@@ -1160,6 +1446,79 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
     DbResult statsResult = updateStats(rowDelta, newPages, firstNewPage);
     _db.refreshBufferDiagnostics();
     return statsResult;
+}
+
+DbResult Table::alterAddColumn(const ColumnDefinition& newCol) {
+    // Must be called with an active transaction so the statement savepoint can
+    // restore the old schema and rows on any failure.
+    const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
+    if (rec == nullptr) {
+        return DbResult::error(DbStatus::Internal, "table record not found");
+    }
+    if (!newCol.nullable && !newCol.hasDefault && rec->rowCount > 0) {
+        return DbResult::error(
+            DbStatus::InvalidArgument,
+            "cannot add a NOT NULL column without a default to a non-empty table");
+    }
+
+    // 1. Scan all existing rows under the current (old) schema.
+    std::vector<RowLocator> locators;
+    std::vector<std::vector<DbValue> > rows;
+    std::unique_ptr<TableScan> scan;
+    DbResult result = scanStart(scan);
+    if (!result.isOk()) {
+        return result;
+    }
+    std::vector<DbValue> row;
+    while (scan->next(row)) {
+        locators.push_back(RowLocator(scan->currentPageId(), scan->currentSlotIndex()));
+        rows.push_back(row);
+    }
+    if (!scan->status().isOk()) {
+        return scan->status();
+    }
+
+    // 2. Remove every old row. FK enforcement is suspended: the logical rows are
+    // unchanged, only their physical encoding/locators change.
+    _skipForeignKeys = true;
+    if (!locators.empty()) {
+        std::vector<RowMutation> deletions;
+        deletions.reserve(locators.size());
+        for (size_t i = 0; i < locators.size(); ++i) {
+            RowMutation del;
+            del.locator = locators[i];
+            del.deleted = true;
+            deletions.push_back(del);
+        }
+        result = applyMutationsInTransaction(deletions);
+        if (!result.isOk()) {
+            _skipForeignKeys = false;
+            return result;
+        }
+    }
+
+    // 3. Append the column to the catalog (old rows are already gone).
+    const DbValue fill = newCol.hasDefault ? newCol.defaultValue : DbValue::null();
+    result = _db.catalog().addColumnToTable(_tableId, newCol, _db.pageSize());
+    if (!result.isOk()) {
+        _skipForeignKeys = false;
+        return result;
+    }
+    markCatalogDirty();
+
+    // 4. Re-insert every row with the appended value. Existing indexes are
+    // maintained and receive the new physical locators.
+    for (size_t i = 0; i < rows.size(); ++i) {
+        std::vector<DbValue> newValues = rows[i];
+        newValues.push_back(fill);
+        result = insertInTransaction(newValues);
+        if (!result.isOk()) {
+            _skipForeignKeys = false;
+            return result;
+        }
+    }
+    _skipForeignKeys = false;
+    return DbResult::ok();
 }
 
 DbResult Table::fetchRow(const RowLocator& locator, std::vector<DbValue>& out) const {

@@ -75,6 +75,12 @@ public:
     // active.
     DbResult applyMutations(const std::vector<RowMutation>& mutations);
 
+    // SQL8: ALTER TABLE ADD COLUMN. Scans existing rows under the old schema,
+    // removes them, appends the column to the catalog, then re-inserts every
+    // row with the new column backfilled. Must run inside an active
+    // transaction so the statement savepoint can restore the old schema.
+    DbResult alterAddColumn(const ColumnDefinition& newCol);
+
     uint32_t tableId() const { return _tableId; }
     const std::string& name() const;
     uint32_t columnCount() const;
@@ -100,6 +106,9 @@ private:
     mutable uint64_t _lastHeapPageId;
     mutable bool _lastResolved;
     mutable uint64_t _resolvedEpoch;
+    // SQL8: set while an internal ALTER rewrite is relocating rows. The logical
+    // rows are unchanged, so FK enforcement is suspended for the rewrite.
+    bool _skipForeignKeys;
 };
 
 class TableScan {

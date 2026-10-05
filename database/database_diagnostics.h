@@ -36,19 +36,32 @@ inline const char* walStateName(WalState state) {
     return "Unknown";
 }
 
+// Per-column relational diagnostics (read-only). SQL8.
+struct ColumnDiagnostics {
+    std::string name;
+    std::string typeName;
+    bool nullable;
+    bool hasDefault;
+    std::string defaultValue; // human-readable; empty when no default
+
+    ColumnDiagnostics() : nullable(false), hasDefault(false) {}
+};
+
 // Per-table relational diagnostics (read-only).
 struct TableDiagnostics {
     uint32_t tableId;
     std::string name;
+    uint32_t schemaVersion;
     uint32_t columnCount;
     uint32_t heapPageCount;
     uint64_t rowCount;
+    std::vector<ColumnDiagnostics> columns;
 
     TableDiagnostics()
-        : tableId(0), columnCount(0), heapPageCount(0), rowCount(0) {}
+        : tableId(0), schemaVersion(0), columnCount(0), heapPageCount(0), rowCount(0) {}
 };
 
-// Per-index relational diagnostics (read-only). SQL6.
+// Per-index relational diagnostics (read-only). SQL6. SQL8 adds ownership.
 struct IndexDiagnostics {
     uint32_t indexId;
     std::string name;
@@ -57,13 +70,32 @@ struct IndexDiagnostics {
     std::string columnName;
     bool unique;
     bool primaryKey;
+    bool systemOwned;
+    uint32_t ownerForeignKeyId;
     uint64_t rootPageId;
     uint64_t entryCount;
     uint16_t formatVersion;
 
     IndexDiagnostics()
-        : indexId(0), tableId(0), unique(false), primaryKey(false), rootPageId(0),
-          entryCount(0), formatVersion(0) {}
+        : indexId(0), tableId(0), unique(false), primaryKey(false), systemOwned(false),
+          ownerForeignKeyId(0), rootPageId(0), entryCount(0), formatVersion(0) {}
+};
+
+// Per-foreign-key diagnostics (read-only). SQL8.
+struct ForeignKeyDiagnostics {
+    uint32_t foreignKeyId;
+    uint32_t childTableId;
+    std::string childTableName;
+    std::string childColumnName;
+    uint32_t parentTableId;
+    std::string parentTableName;
+    std::string parentColumnName;
+    uint32_t referencedIndexId;
+    uint32_t supportIndexId;
+
+    ForeignKeyDiagnostics()
+        : foreignKeyId(0), childTableId(0), parentTableId(0), referencedIndexId(0),
+          supportIndexId(0) {}
 };
 
 struct DatabaseDiagnostics {
@@ -90,6 +122,10 @@ struct DatabaseDiagnostics {
     // SQL6 index diagnostics.
     uint32_t indexCount;
     std::vector<IndexDiagnostics> indexes;
+
+    // SQL8 foreign-key diagnostics.
+    uint32_t foreignKeyCount;
+    std::vector<ForeignKeyDiagnostics> foreignKeys;
 
     // SQL3 transaction / write-ahead-log diagnostics (read-only).
     bool transactionActive;
@@ -118,6 +154,7 @@ struct DatabaseDiagnostics {
           bufferResident(0),
           bufferDirty(0),
           indexCount(0),
+          foreignKeyCount(0),
           transactionActive(false),
           transactionId(0),
           transactionModifiedPages(0),
