@@ -56,7 +56,7 @@ std::string describeDbValue(const DbValue& value) {
 Database::Database()
     : _file(), _buffer(), _wal(), _catalog(), _diagnostics(), _open(false),
       _readOnly(false), _catalogDirty(false), _activeTx(nullptr), _nextTxId(1),
-      _dataEpoch(0), _walPath(), _fileSystem(nullptr) {}
+      _dataEpoch(0), _schemaGeneration(1), _walPath(), _fileSystem(nullptr) {}
 
 Database::~Database() {
     if (_open) {
@@ -517,6 +517,7 @@ DbResult Database::dropIndex(const std::string& name) {
         DbResult result = _catalog.removeIndex(rec->indexId);
         if (result.isOk()) {
             markCatalogDirty();
+            ++_schemaGeneration;
         }
         return result;
     }
@@ -532,6 +533,7 @@ DbResult Database::dropIndex(const std::string& name) {
         return result;
     }
     markCatalogDirty();
+    ++_schemaGeneration;
     return tx->commit();
 }
 
@@ -550,6 +552,7 @@ DbResult Database::dropTable(const std::string& name) {
         DbResult result = _catalog.removeTable(rec->tableId);
         if (result.isOk()) {
             markCatalogDirty();
+            ++_schemaGeneration;
         }
         return result;
     }
@@ -565,6 +568,7 @@ DbResult Database::dropTable(const std::string& name) {
         return result;
     }
     markCatalogDirty();
+    ++_schemaGeneration;
     return tx->commit();
 }
 

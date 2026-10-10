@@ -1,6 +1,7 @@
 #include "database_sql.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <set>
@@ -27,6 +28,7 @@ const char* literalKindName(SqlLiteralKind kind) {
     case SqlLiteralKind::Float: return "FLOAT";
     case SqlLiteralKind::String: return "TEXT";
     case SqlLiteralKind::Blob: return "BLOB";
+    case SqlLiteralKind::Parameter: return "parameter";
     }
     return "value";
 }
@@ -116,6 +118,8 @@ bool coerceLiteral(const SqlLiteralAst& literal, const ColumnDefinition& column,
                                     literal.blobValue.size()));
         return true;
     case SqlLiteralKind::Null:
+        break;
+    case SqlLiteralKind::Parameter:
         break;
     }
 
@@ -642,6 +646,35 @@ public:
 
 private:
     const std::vector<BoundSource>& _sources;
+};
+
+class PreparedColumnResolver : public SqlColumnResolver {
+public:
+    explicit PreparedColumnResolver(const std::vector<ColumnDefinition>& columns)
+        : _columns(columns) {}
+
+    bool resolveColumn(const SqlIdentifier& identifier, size_t& ordinal,
+                       DbType& type, SqlError& error) const override {
+        if (identifier.hasQualifier) {
+            error = makeSemantic("unknown relation qualifier '" +
+                                     identifier.qualifier + "'",
+                                 identifier.line, identifier.column);
+            return false;
+        }
+        for (size_t i = 0; i < _columns.size(); ++i) {
+            if (_columns[i].name == identifier.name) {
+                ordinal = i;
+                type = _columns[i].type;
+                return true;
+            }
+        }
+        error = makeSemantic("unknown column '" + identifier.name + "'",
+                             identifier.line, identifier.column);
+        return false;
+    }
+
+private:
+    const std::vector<ColumnDefinition>& _columns;
 };
 
 // Classifies a column reference into (source index, local ordinal) without
@@ -1203,12 +1236,477 @@ SqlExecutionResult::SqlExecutionResult()
     : ok(false), error(), statements(), failedStatementIndex(0), stoppedEarly(false),
       transactionActiveAfter(false) {}
 
+struct SqlEngineLifetime {
+    explicit SqlEngineLifetime(SqlEngine* ownerIn) : owner(ownerIn) {}
+    SqlEngine* owner;
+};
+
+namespace {
+
+SqlError makePreparedError(SqlErrorCode code, const std::string& message,
+                           uint32_t line = 0, uint32_t column = 0) {
+    SqlError error;
+    error.code = code;
+    error.message = message;
+    error.line = line;
+    error.column = column;
+    error.hasLocation = line != 0 || column != 0;
+    return error;
+}
+
+SqlLiteralAst literalFromValue(const DbValue& value, uint32_t line,
+                               uint32_t column) {
+    SqlLiteralAst literal;
+    literal.line = line;
+    literal.column = column;
+    if (value.isNull()) {
+        literal.kind = SqlLiteralKind::Null;
+    } else {
+        switch (value.type()) {
+        case DbType::Boolean:
+            literal.kind = SqlLiteralKind::Boolean;
+            literal.boolValue = value.booleanValue();
+            break;
+        case DbType::Int32:
+            literal.kind = SqlLiteralKind::Integer;
+            literal.int64Value = value.int32Value();
+            break;
+        case DbType::Int64:
+            literal.kind = SqlLiteralKind::Integer;
+            literal.int64Value = value.int64Value();
+            break;
+        case DbType::Float64:
+            literal.kind = SqlLiteralKind::Float;
+            literal.float64Value = value.float64Value();
+            break;
+        case DbType::Text:
+            literal.kind = SqlLiteralKind::String;
+            literal.textValue = value.textValue();
+            break;
+        case DbType::Blob:
+            literal.kind = SqlLiteralKind::Blob;
+            literal.blobValue = value.blobValue();
+            break;
+        case DbType::Unknown:
+            literal.kind = SqlLiteralKind::Null;
+            break;
+        }
+    }
+    return literal;
+}
+
+bool resolvePreparedAst(SqlStatementAst& statement,
+                        const std::vector<DbValue>& bindings) {
+    const auto bindLiteral = [&bindings](SqlLiteralAst& literal) {
+        if (literal.kind != SqlLiteralKind::Parameter ||
+            literal.parameterOrdinal >= bindings.size()) {
+            return;
+        }
+        const uint32_t line = literal.line;
+        const uint32_t column = literal.column;
+        literal = literalFromValue(bindings[literal.parameterOrdinal], line, column);
+    };
+    const auto bindPredicate = [&bindings](SqlPredicateAst& predicate) {
+        for (size_t i = 0; i < predicate.nodes.size(); ++i) {
+            SqlExprNode& node = predicate.nodes[i];
+            if (node.kind == SqlExprKind::Parameter &&
+                node.parameterOrdinal < bindings.size()) {
+                node.kind = SqlExprKind::Literal;
+                node.literal = literalFromValue(bindings[node.parameterOrdinal],
+                                                node.line, node.column);
+            }
+        }
+    };
+    switch (statement.type) {
+    case SqlStatementType::Insert:
+        for (size_t i = 0; i < statement.insert.values.size(); ++i) {
+            bindLiteral(statement.insert.values[i]);
+        }
+        break;
+    case SqlStatementType::Update:
+        for (size_t i = 0; i < statement.update.assignments.size(); ++i) {
+            bindLiteral(statement.update.assignments[i].value);
+        }
+        bindPredicate(statement.update.where);
+        break;
+    case SqlStatementType::Delete:
+        bindPredicate(statement.deleteStatement.where);
+        break;
+    case SqlStatementType::Select:
+        bindPredicate(statement.select.where);
+        for (size_t i = 0; i < statement.select.joins.size(); ++i) {
+            bindPredicate(statement.select.joins[i].on);
+        }
+        if (statement.select.limitIsParameter) {
+            const DbValue& value = bindings[statement.select.limitParameterOrdinal];
+            statement.select.limit = static_cast<uint64_t>(value.int64Value());
+            statement.select.limitIsParameter = false;
+        }
+        if (statement.select.offsetIsParameter) {
+            const DbValue& value = bindings[statement.select.offsetParameterOrdinal];
+            statement.select.offset = static_cast<uint64_t>(value.int64Value());
+            statement.select.offsetIsParameter = false;
+        }
+        break;
+    default:
+        break;
+    }
+    return true;
+}
+
+} // namespace
+
+SqlPreparedStatement::SqlPreparedStatement()
+    : _lifetime(), _statement(), _type(SqlStatementType::Unknown), _parameters(),
+      _bindings(), _isBound(), _resultColumns(), _schemaGeneration(0),
+      _prepared(false) {}
+
+SqlPreparedStatement::~SqlPreparedStatement() {}
+
+SqlPreparedStatement::SqlPreparedStatement(SqlPreparedStatement&& other) noexcept
+    : _lifetime(std::move(other._lifetime)), _statement(std::move(other._statement)),
+      _type(other._type), _parameters(std::move(other._parameters)),
+      _bindings(std::move(other._bindings)), _isBound(std::move(other._isBound)),
+      _resultColumns(std::move(other._resultColumns)),
+      _schemaGeneration(other._schemaGeneration), _prepared(other._prepared) {
+    other._type = SqlStatementType::Unknown;
+    other._schemaGeneration = 0;
+    other._prepared = false;
+}
+
+SqlPreparedStatement& SqlPreparedStatement::operator=(SqlPreparedStatement&& other) noexcept {
+    if (this != &other) {
+        _lifetime = std::move(other._lifetime);
+        _statement = std::move(other._statement);
+        _type = other._type;
+        _parameters = std::move(other._parameters);
+        _bindings = std::move(other._bindings);
+        _isBound = std::move(other._isBound);
+        _resultColumns = std::move(other._resultColumns);
+        _schemaGeneration = other._schemaGeneration;
+        _prepared = other._prepared;
+        other._type = SqlStatementType::Unknown;
+        other._schemaGeneration = 0;
+        other._prepared = false;
+    }
+    return *this;
+}
+
+SqlError SqlPreparedStatement::bind(size_t index, const DbValue& value) {
+    return bindChecked(index, value);
+}
+
+SqlError SqlPreparedStatement::bindNull(size_t index) {
+    return bindChecked(index, DbValue::null());
+}
+
+SqlError SqlPreparedStatement::bindBoolean(size_t index, bool value) {
+    return bindChecked(index, DbValue::boolean(value));
+}
+
+SqlError SqlPreparedStatement::bindInt32(size_t index, int32_t value) {
+    return bindChecked(index, DbValue::int32(value));
+}
+
+SqlError SqlPreparedStatement::bindInt64(size_t index, int64_t value) {
+    return bindChecked(index, DbValue::int64(value));
+}
+
+SqlError SqlPreparedStatement::bindFloat64(size_t index, double value) {
+    return bindChecked(index, DbValue::float64(value));
+}
+
+SqlError SqlPreparedStatement::bindText(size_t index, const std::string& value) {
+    if (value.size() > kMaxTextBytes) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "Text parameter exceeds the 65,536-byte limit");
+    }
+    return bindChecked(index, DbValue::text(value));
+}
+
+SqlError SqlPreparedStatement::bindBlob(size_t index, const uint8_t* data,
+                                        size_t length) {
+    if (length > kMaxBlobBytes) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "BLOB parameter exceeds the 65,536-byte limit");
+    }
+    if (length > 0 && data == nullptr) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "non-empty BLOB binding requires a data pointer");
+    }
+    return bindChecked(index, DbValue::blob(data, length));
+}
+
+SqlError SqlPreparedStatement::bindChecked(size_t index, const DbValue& value) {
+    if (!_prepared) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "statement is not prepared");
+    }
+    if (index >= _parameters.size()) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "parameter index is out of range");
+    }
+    const SqlParameterInfo& info = _parameters[index];
+    const auto fail = [&info, index](const std::string& message) {
+        return makePreparedError(SqlErrorCode::ParameterError,
+                                 "parameter #" +
+                                     std::to_string(static_cast<unsigned long long>(index)) +
+                                     " " + message,
+                                 info.line, info.column);
+    };
+    if (info.type == DbType::Unknown) {
+        return fail("has no inferred SQL type");
+    }
+    if (value.isNull()) {
+        if (!info.nullable) {
+            return fail("does not allow NULL");
+        }
+        _bindings[index] = DbValue::null();
+        _isBound[index] = true;
+        return SqlError();
+    }
+    if (value.type() != info.type &&
+        !(info.type == DbType::Int64 && value.type() == DbType::Int32)) {
+        return fail(std::string("expects ") + dbTypeName(info.type) +
+                    ", received " + dbTypeName(value.type()));
+    }
+    if (info.nonNegative &&
+        ((value.type() == DbType::Int64 && value.int64Value() < 0) ||
+         (value.type() == DbType::Int32 && value.int32Value() < 0))) {
+        return fail("must be nonnegative");
+    }
+    if (value.type() == DbType::Text && value.textValue().size() > kMaxTextBytes) {
+        return fail("Text exceeds the 65,536-byte limit");
+    }
+    if (value.type() == DbType::Blob && value.blobValue().size() > kMaxBlobBytes) {
+        return fail("BLOB exceeds the 65,536-byte limit");
+    }
+    if (value.type() == DbType::Float64 && !std::isfinite(value.float64Value())) {
+        return fail("Float64 must be finite");
+    }
+
+    DbValue owned = value;
+    if (info.type == DbType::Int64 && value.type() == DbType::Int32) {
+        owned = DbValue::int64(value.int32Value());
+    }
+    _bindings[index] = owned;
+    _isBound[index] = true;
+    return SqlError();
+}
+
+void SqlPreparedStatement::clearBindings() {
+    for (size_t i = 0; i < _bindings.size(); ++i) {
+        _bindings[i] = DbValue::null();
+        _isBound[i] = false;
+    }
+}
+
+namespace {
+
+bool setPreparedParameterType(std::vector<SqlParameterInfo>& parameters,
+                              uint32_t ordinal, DbType type, bool nullable,
+                              bool nonNegative, uint32_t line, uint32_t column,
+                              SqlError& error) {
+    if (ordinal >= parameters.size() || !isConcreteDbType(type)) {
+        error = makePreparedError(SqlErrorCode::ParameterError,
+                                  "parameter type cannot be inferred", line, column);
+        return false;
+    }
+    SqlParameterInfo& info = parameters[ordinal];
+    if (info.type == DbType::Unknown) {
+        info.type = type;
+        info.nullable = nullable;
+        info.nonNegative = nonNegative;
+        return true;
+    }
+    if (info.type != type) {
+        if ((info.type == DbType::Int32 && type == DbType::Int64) ||
+            (info.type == DbType::Int64 && type == DbType::Int32)) {
+            info.type = DbType::Int64;
+        } else {
+            error = makePreparedError(
+                SqlErrorCode::ParameterError,
+                "parameter #" +
+                    std::to_string(static_cast<unsigned long long>(ordinal)) +
+                    " is used with incompatible types " + dbTypeName(info.type) +
+                    " and " + dbTypeName(type),
+                line, column);
+            return false;
+        }
+    }
+    info.nullable = info.nullable && nullable;
+    info.nonNegative = info.nonNegative || nonNegative;
+    return true;
+}
+
+DbType preparedLiteralType(const SqlLiteralAst& literal) {
+    switch (literal.kind) {
+    case SqlLiteralKind::Boolean: return DbType::Boolean;
+    case SqlLiteralKind::Integer: return DbType::Int64;
+    case SqlLiteralKind::Float: return DbType::Float64;
+    case SqlLiteralKind::String: return DbType::Text;
+    case SqlLiteralKind::Blob: return DbType::Blob;
+    case SqlLiteralKind::Null:
+    case SqlLiteralKind::Parameter:
+        return DbType::Unknown;
+    }
+    return DbType::Unknown;
+}
+
+DbType preparedExprType(const SqlExprNode& node,
+                        const SqlColumnResolver& resolver, SqlError& error) {
+    if (node.kind == SqlExprKind::ColumnRef) {
+        size_t ordinal = 0;
+        DbType type = DbType::Unknown;
+        if (!resolver.resolveColumn(node.identifier, ordinal, type, error)) {
+            return DbType::Unknown;
+        }
+        return type;
+    }
+    if (node.kind == SqlExprKind::Literal) {
+        return preparedLiteralType(node.literal);
+    }
+    return DbType::Unknown;
+}
+
+bool inferPreparedPredicate(const SqlPredicateAst& predicate,
+                            const SqlColumnResolver& resolver,
+                            std::vector<SqlParameterInfo>& parameters,
+                            SqlError& error) {
+    for (size_t i = 0; i < predicate.nodes.size(); ++i) {
+        const SqlExprNode& node = predicate.nodes[i];
+        if (node.kind == SqlExprKind::ColumnRef) {
+            size_t ordinal = 0;
+            DbType type = DbType::Unknown;
+            if (!resolver.resolveColumn(node.identifier, ordinal, type, error)) {
+                return false;
+            }
+        }
+        if (node.kind == SqlExprKind::Compare && node.left >= 0 && node.right >= 0) {
+            const SqlExprNode& left = predicate.nodes[static_cast<size_t>(node.left)];
+            const SqlExprNode& right = predicate.nodes[static_cast<size_t>(node.right)];
+            if (left.kind == SqlExprKind::Parameter &&
+                right.kind == SqlExprKind::Parameter) {
+                error = makePreparedError(SqlErrorCode::ParameterError,
+                                          "comparison between parameters has no inferable type",
+                                          node.line, node.column);
+                return false;
+            }
+            if (left.kind == SqlExprKind::Parameter ||
+                right.kind == SqlExprKind::Parameter) {
+                const SqlExprNode& parameter =
+                    left.kind == SqlExprKind::Parameter ? left : right;
+                const SqlExprNode& other =
+                    left.kind == SqlExprKind::Parameter ? right : left;
+                SqlError resolveError;
+                const DbType type = preparedExprType(other, resolver, resolveError);
+                if (!resolveError.isOk()) {
+                    error = resolveError;
+                    return false;
+                }
+                if (type == DbType::Unknown) {
+                    error = makePreparedError(
+                        SqlErrorCode::ParameterError,
+                        "parameter type is ambiguous in comparison; compare it with a typed column or literal",
+                        parameter.line, parameter.column);
+                    return false;
+                }
+                if (!setPreparedParameterType(parameters, parameter.parameterOrdinal,
+                                              type, true, false, parameter.line,
+                                              parameter.column, error)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+DbValue dummyValue(DbType type) {
+    switch (type) {
+    case DbType::Boolean: return DbValue::boolean(false);
+    case DbType::Int32: return DbValue::int32(0);
+    case DbType::Int64: return DbValue::int64(0);
+    case DbType::Float64: return DbValue::float64(0.0);
+    case DbType::Text: return DbValue::text(std::string());
+    case DbType::Blob: return DbValue::blob(nullptr, 0);
+    case DbType::Unknown: return DbValue::null();
+    }
+    return DbValue::null();
+}
+
+void replacePredicateParameters(SqlPredicateAst& predicate,
+                                const std::vector<SqlParameterInfo>& parameters) {
+    for (size_t i = 0; i < predicate.nodes.size(); ++i) {
+        SqlExprNode& node = predicate.nodes[i];
+        if (node.kind == SqlExprKind::Parameter &&
+            node.parameterOrdinal < parameters.size()) {
+            node.kind = SqlExprKind::Literal;
+            node.literal = literalFromValue(
+                dummyValue(parameters[node.parameterOrdinal].type), node.line,
+                node.column);
+        }
+    }
+}
+
+bool validatePreparedPredicate(const SqlPredicateAst& predicate,
+                               const SqlColumnResolver& resolver,
+                               const std::vector<SqlParameterInfo>& parameters,
+                               SqlError& error) {
+    SqlPredicateAst bound = predicate;
+    replacePredicateParameters(bound, parameters);
+    BoundPredicate validator;
+    return validator.bind(bound.nodes, bound.present ? bound.root : -1, resolver, error);
+}
+
+bool findPreparedColumn(const std::vector<ColumnDefinition>& columns,
+                        const std::string& name, size_t& ordinal) {
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (columns[i].name == name) {
+            ordinal = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+SqlStatementResult SqlPreparedStatement::execute() {
+    std::shared_ptr<SqlEngineLifetime> lifetime = _lifetime.lock();
+    if (!lifetime || lifetime->owner == nullptr) {
+        SqlStatementResult result;
+        result.type = _type;
+        result.error = makePreparedError(SqlErrorCode::DatabaseClosed,
+                                         "prepared statement's SQL connection no longer exists");
+        return result;
+    }
+    return lifetime->owner->executePrepared(*this);
+}
+
+SqlStatementResult SqlPreparedStatement::executeQuery() {
+    if (!_prepared || _type != SqlStatementType::Select) {
+        SqlStatementResult result;
+        result.type = _type;
+        result.error = makePreparedError(SqlErrorCode::ParameterError,
+                                         "executeQuery requires a prepared SELECT statement");
+        return result;
+    }
+    return execute();
+}
+
 // ---------------------------------------------------------------------------
 // Engine.
 
-SqlEngine::SqlEngine(Database& db) : _db(db), _tx(), _forceNestedLoop(false) {}
+SqlEngine::SqlEngine(Database& db)
+    : _db(db), _tx(), _forceNestedLoop(false),
+      _lifetime(new SqlEngineLifetime(this)), _sqlParseCount(0),
+      _preparedExecutionCount(0) {}
 
 SqlEngine::~SqlEngine() {
+    if (_lifetime) {
+        _lifetime->owner = nullptr;
+    }
     if (_tx && _tx->isActive()) {
         _tx->rollback();
     }
@@ -1282,6 +1780,7 @@ SqlExecutionResult SqlEngine::execute(const std::string& sql) {
         if (done) {
             break;
         }
+        ++_sqlParseCount;
         if (statementCount >= kSqlMaxStatements) {
             SqlError limitError;
             limitError.code = SqlErrorCode::ResourceLimit;
@@ -1317,6 +1816,457 @@ SqlExecutionResult SqlEngine::execute(const std::string& sql) {
     }
 
     result.transactionActiveAfter = inTransaction();
+    return result;
+}
+
+SqlError SqlEngine::prepare(const std::string& sql, SqlPreparedStatement& out) {
+    out = SqlPreparedStatement();
+    if (!_db.isOpen()) {
+        return makePreparedError(SqlErrorCode::DatabaseClosed,
+                                 "database is not open");
+    }
+    if (sql.size() > kSqlMaxInputBytes) {
+        return makePreparedError(SqlErrorCode::ResourceLimit,
+                                 "SQL input exceeds the maximum allowed size", 1, 1);
+    }
+
+    std::vector<SqlToken> tokens;
+    SqlError error;
+    SqlTokenizer tokenizer;
+    if (!tokenizer.tokenize(sql, tokens, error)) {
+        return error;
+    }
+
+    size_t parameterCount = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind == SqlTokenKind::Parameter) {
+            ++parameterCount;
+        }
+    }
+    if (parameterCount > kSqlMaxParameters) {
+        return makePreparedError(SqlErrorCode::ResourceLimit,
+                                 "parameter count exceeds the SQL9 maximum", 1, 1);
+    }
+
+    SqlParser parser(tokens);
+    SqlStatementAst statement;
+    bool done = false;
+    if (!parser.next(statement, error, done)) {
+        return error;
+    }
+    if (done) {
+        return makePreparedError(SqlErrorCode::SyntaxError,
+                                 "prepare requires one non-empty SQL statement", 1, 1);
+    }
+    ++_sqlParseCount;
+    SqlStatementAst extra;
+    if (!parser.next(extra, error, done)) {
+        return error;
+    }
+    if (!done) {
+        return makePreparedError(SqlErrorCode::Unsupported,
+                                 "prepare accepts exactly one SQL statement",
+                                 extra.line, extra.column);
+    }
+
+    std::vector<SqlParameterInfo> parameters(parameterCount);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind == SqlTokenKind::Parameter &&
+            tokens[i].parameterOrdinal < parameters.size()) {
+            SqlParameterInfo& info = parameters[tokens[i].parameterOrdinal];
+            info.ordinal = tokens[i].parameterOrdinal;
+            info.line = tokens[i].line;
+            info.column = tokens[i].column;
+        }
+    }
+    std::vector<SqlColumn> resultColumns;
+    if (!inferPreparedMetadata(statement, parameters, resultColumns, error)) {
+        return error;
+    }
+    for (size_t i = 0; i < parameters.size(); ++i) {
+        if (parameters[i].type == DbType::Unknown) {
+            return makePreparedError(
+                SqlErrorCode::ParameterError,
+                "parameter #" +
+                    std::to_string(static_cast<unsigned long long>(i)) +
+                    " has an ambiguous type; use it with a typed column or LIMIT/OFFSET",
+                parameters[i].line, parameters[i].column);
+        }
+    }
+
+    out._statement = std::move(statement);
+    out._type = out._statement.type;
+    out._parameters = std::move(parameters);
+    out._bindings.assign(out._parameters.size(), DbValue::null());
+    out._isBound.assign(out._parameters.size(), false);
+    out._resultColumns = std::move(resultColumns);
+    out._schemaGeneration = _db.schemaGeneration();
+    out._lifetime = _lifetime;
+    out._prepared = true;
+    return SqlError();
+}
+
+bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
+                                      std::vector<SqlParameterInfo>& parameters,
+                                      std::vector<SqlColumn>& resultColumns,
+                                      SqlError& error) {
+    resultColumns.clear();
+    const auto tableOrError = [this, &error](const SqlIdentifier& identifier)
+        -> const Catalog::TableRecord* {
+        const Catalog::TableRecord* table = _db.catalog().findTable(identifier.name);
+        if (table == nullptr) {
+            error = makeSemantic("unknown table '" + identifier.name + "'",
+                                 identifier.line, identifier.column);
+        }
+        return table;
+    };
+    const auto resolveInsertColumns = [&error](const SqlInsertAst& ast,
+                                               const std::vector<ColumnDefinition>& columns,
+                                               std::vector<size_t>& ordinals) {
+        if (ast.hasColumnList) {
+            if (ast.columnList.empty() || ast.values.size() != ast.columnList.size()) {
+                error = makeSemantic("INSERT value count does not match its column list",
+                                     ast.line, ast.column);
+                return false;
+            }
+            for (size_t i = 0; i < ast.columnList.size(); ++i) {
+                size_t found = 0;
+                if (!findPreparedColumn(columns, ast.columnList[i].name, found)) {
+                    error = makeSemantic("unknown column '" + ast.columnList[i].name +
+                                             "' in INSERT column list",
+                                         ast.columnList[i].line,
+                                         ast.columnList[i].column);
+                    return false;
+                }
+                if (std::find(ordinals.begin(), ordinals.end(), found) != ordinals.end()) {
+                    error = makeSemantic("duplicate column '" + ast.columnList[i].name +
+                                             "' in INSERT column list",
+                                         ast.columnList[i].line,
+                                         ast.columnList[i].column);
+                    return false;
+                }
+                ordinals.push_back(found);
+            }
+        } else {
+            if (ast.values.size() != columns.size()) {
+                error = makeSemantic("wrong INSERT value count for table '" +
+                                         ast.table.name + "'",
+                                     ast.table.line, ast.table.column);
+                return false;
+            }
+            for (size_t i = 0; i < columns.size(); ++i) ordinals.push_back(i);
+        }
+        return true;
+    };
+
+    if (statement.type == SqlStatementType::Insert) {
+        const SqlInsertAst& ast = statement.insert;
+        const Catalog::TableRecord* table = tableOrError(ast.table);
+        if (table == nullptr) return false;
+        std::vector<size_t> ordinals;
+        if (!resolveInsertColumns(ast, table->columns, ordinals)) return false;
+        std::vector<bool> specified(table->columns.size(), false);
+        for (size_t i = 0; i < ordinals.size(); ++i) {
+            const size_t ordinal = ordinals[i];
+            const SqlLiteralAst& value = ast.values[i];
+            specified[ordinal] = true;
+            if (value.isDefault) {
+                if (!table->columns[ordinal].hasDefault) {
+                    error = makeSemantic("column '" + table->columns[ordinal].name +
+                                             "' has no default value",
+                                         value.line, value.column);
+                    return false;
+                }
+            } else if (value.kind == SqlLiteralKind::Parameter) {
+                if (!setPreparedParameterType(parameters, value.parameterOrdinal,
+                                              table->columns[ordinal].type,
+                                              table->columns[ordinal].nullable,
+                                              false, value.line, value.column, error)) {
+                    return false;
+                }
+            } else {
+                std::vector<DbValue> checked;
+                if (!coerceLiteral(value, table->columns[ordinal], checked, error)) {
+                    return false;
+                }
+            }
+        }
+        for (size_t i = 0; i < table->columns.size(); ++i) {
+            if (!specified[i] && !table->columns[i].hasDefault &&
+                !table->columns[i].nullable) {
+                error = makeSemantic("column '" + table->columns[i].name +
+                                         "' is NOT NULL and has no default",
+                                     ast.table.line, ast.table.column);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (statement.type == SqlStatementType::Update ||
+        statement.type == SqlStatementType::Delete) {
+        const SqlIdentifier& tableName = statement.type == SqlStatementType::Update
+                                             ? statement.update.table
+                                             : statement.deleteStatement.table;
+        const Catalog::TableRecord* table = tableOrError(tableName);
+        if (table == nullptr) return false;
+        if (statement.type == SqlStatementType::Update) {
+            std::vector<size_t> assigned;
+            for (size_t i = 0; i < statement.update.assignments.size(); ++i) {
+                const SqlAssignmentAst& item = statement.update.assignments[i];
+                size_t ordinal = 0;
+                if (!findPreparedColumn(table->columns, item.column.name, ordinal)) {
+                    error = makeSemantic("unknown column '" + item.column.name +
+                                             "' in UPDATE",
+                                         item.column.line, item.column.column);
+                    return false;
+                }
+                if (std::find(assigned.begin(), assigned.end(), ordinal) != assigned.end()) {
+                    error = makeSemantic("column '" + item.column.name +
+                                             "' is assigned more than once",
+                                         item.column.line, item.column.column);
+                    return false;
+                }
+                assigned.push_back(ordinal);
+                if (item.value.kind == SqlLiteralKind::Parameter) {
+                    if (!setPreparedParameterType(parameters,
+                                                  item.value.parameterOrdinal,
+                                                  table->columns[ordinal].type,
+                                                  table->columns[ordinal].nullable,
+                                                  false, item.value.line,
+                                                  item.value.column, error)) {
+                        return false;
+                    }
+                } else {
+                    std::vector<DbValue> checked;
+                    if (!coerceLiteral(item.value, table->columns[ordinal], checked,
+                                       error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        PreparedColumnResolver resolver(table->columns);
+        const SqlPredicateAst& predicate = statement.type == SqlStatementType::Update
+                                               ? statement.update.where
+                                               : statement.deleteStatement.where;
+        if (!inferPreparedPredicate(predicate, resolver, parameters, error) ||
+            !validatePreparedPredicate(predicate, resolver, parameters, error)) {
+            return false;
+        }
+        return true;
+    }
+
+    if (statement.type == SqlStatementType::Select) {
+        const SqlSelectAst& ast = statement.select;
+        std::vector<BoundSource> sources;
+        const auto appendSource = [this, &sources, &error](const SqlTableRefAst& ref,
+                                                          bool outerNullable) {
+            const Catalog::TableRecord* table = _db.catalog().findTable(ref.table.name);
+            if (table == nullptr) {
+                error = makeSemantic("unknown table '" + ref.table.name + "'",
+                                     ref.table.line, ref.table.column);
+                return false;
+            }
+            BoundSource source;
+            source.tableName = ref.table.name;
+            source.qualifier = ref.hasAlias ? ref.alias.name : ref.table.name;
+            source.columns = &table->columns;
+            source.baseOrdinal = sources.empty()
+                                    ? 0
+                                    : sources.back().baseOrdinal +
+                                          sources.back().columnCount;
+            source.columnCount = static_cast<uint32_t>(table->columns.size());
+            source.outerNullable = outerNullable;
+            sources.push_back(source);
+            return true;
+        };
+        if (!appendSource(ast.from, false)) return false;
+        for (size_t i = 0; i < ast.joins.size(); ++i) {
+            if (!appendSource(ast.joins[i].table,
+                              ast.joins[i].type == SqlJoinType::Left)) return false;
+        }
+        for (size_t i = 0; i < sources.size(); ++i) {
+            for (size_t j = i + 1; j < sources.size(); ++j) {
+                if (sources[i].qualifier == sources[j].qualifier) {
+                    error = makeSemantic("duplicate relation alias '" +
+                                             sources[i].qualifier + "'",
+                                         ast.line, ast.column);
+                    return false;
+                }
+            }
+        }
+        SourceColumnResolver resolver(sources);
+        if (!inferPreparedPredicate(ast.where, resolver, parameters, error) ||
+            !validatePreparedPredicate(ast.where, resolver, parameters, error)) {
+            return false;
+        }
+        for (size_t i = 0; i < ast.joins.size(); ++i) {
+            std::vector<BoundSource> prefix(sources.begin(), sources.begin() + i + 2);
+            SourceColumnResolver onResolver(prefix);
+            if (!inferPreparedPredicate(ast.joins[i].on, onResolver, parameters, error) ||
+                !validatePreparedPredicate(ast.joins[i].on, onResolver, parameters,
+                                           error)) {
+                return false;
+            }
+        }
+        if (ast.limitIsParameter &&
+            !setPreparedParameterType(parameters, ast.limitParameterOrdinal,
+                                      DbType::Int64, false, true, ast.line,
+                                      ast.column, error)) {
+            return false;
+        }
+        if (ast.offsetIsParameter &&
+            !setPreparedParameterType(parameters, ast.offsetParameterOrdinal,
+                                      DbType::Int64, false, true, ast.line,
+                                      ast.column, error)) {
+            return false;
+        }
+
+        std::vector<ProjectionItemBound> projection;
+        bool hasAggregate = false;
+        if (ast.star) {
+            for (size_t s = 0; s < sources.size(); ++s) {
+                for (size_t c = 0; c < sources[s].columns->size(); ++c) {
+                    ProjectionItemBound item;
+                    item.kind = SqlProjectionKind::Column;
+                    item.ordinal = sources[s].baseOrdinal + c;
+                    item.type = (*sources[s].columns)[c].type;
+                    item.nullable = (*sources[s].columns)[c].nullable ||
+                                    sources[s].outerNullable;
+                    item.name = (*sources[s].columns)[c].name;
+                    projection.push_back(item);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < ast.projection.size(); ++i) {
+                const SqlProjectionItemAst& item = ast.projection[i];
+                ProjectionItemBound bound;
+                if (item.kind == SqlProjectionKind::Aggregate) {
+                    hasAggregate = true;
+                    if (!bindAggregateItem(item, resolver, bound, error)) return false;
+                } else {
+                    size_t ordinal = 0;
+                    DbType type = DbType::Unknown;
+                    if (!resolver.resolveColumn(item.columnRef, ordinal, type, error)) {
+                        return false;
+                    }
+                    bound.kind = SqlProjectionKind::Column;
+                    bound.ordinal = ordinal;
+                    bound.type = type;
+                    bound.nullable = nullableForOrdinal(sources, ordinal);
+                    bound.name = item.hasAlias ? item.alias.name : item.columnRef.name;
+                }
+                projection.push_back(bound);
+            }
+        }
+
+        std::vector<size_t> groupOrdinals;
+        for (size_t i = 0; i < ast.groupBy.size(); ++i) {
+            size_t ordinal = 0;
+            DbType type = DbType::Unknown;
+            if (!resolver.resolveColumn(ast.groupBy[i], ordinal, type, error)) return false;
+            groupOrdinals.push_back(ordinal);
+        }
+        if (hasAggregate || !groupOrdinals.empty()) {
+            for (size_t p = 0; p < projection.size(); ++p) {
+                if (projection[p].kind != SqlProjectionKind::Column) continue;
+                if (std::find(groupOrdinals.begin(), groupOrdinals.end(),
+                              projection[p].ordinal) == groupOrdinals.end()) {
+                    error = makeSemantic("column '" + projection[p].name +
+                                             "' must appear in GROUP BY or be used in an aggregate",
+                                         ast.line, ast.column);
+                    return false;
+                }
+            }
+        }
+
+        const bool hasGroup = !groupOrdinals.empty();
+        for (size_t i = 0; i < ast.orderBy.size(); ++i) {
+            const SqlIdentifier& identifier = ast.orderBy[i].column;
+            bool projectionMatch = false;
+            if (!identifier.hasQualifier) {
+                for (size_t p = 0; p < projection.size(); ++p) {
+                    if (projection[p].name == identifier.name) {
+                        projectionMatch = true;
+                        break;
+                    }
+                }
+            }
+            size_t ordinal = 0;
+            DbType type = DbType::Unknown;
+            if (!projectionMatch && !resolver.resolveColumn(identifier, ordinal, type,
+                                                              error)) {
+                return false;
+            }
+            if (!projectionMatch && (ast.distinct || hasAggregate || hasGroup)) {
+                bool grouped = std::find(groupOrdinals.begin(), groupOrdinals.end(),
+                                         ordinal) != groupOrdinals.end();
+                if (!grouped || ast.distinct) {
+                    error = makeSemantic(
+                        "ORDER BY must reference a projected column or alias in a DISTINCT or aggregate query",
+                        identifier.line, identifier.column);
+                    return false;
+                }
+            }
+            if (!projectionMatch && type == DbType::Blob) {
+                error = makeSemantic("ORDER BY is not supported for Blob column '" +
+                                         identifier.name + "'",
+                                     identifier.line, identifier.column);
+                return false;
+            }
+        }
+
+        for (size_t i = 0; i < projection.size(); ++i) {
+            resultColumns.push_back(SqlColumn(projection[i].name, projection[i].type,
+                                              projection[i].nullable));
+        }
+        return true;
+    }
+
+    // Prepared DDL and transaction-control statements are accepted when they
+    // contain no runtime parameters. A parameter in schema syntax is never a
+    // value context and remains untyped, so the final ambiguity check rejects it.
+    return true;
+}
+
+SqlStatementResult SqlEngine::executePrepared(SqlPreparedStatement& statement) {
+    SqlStatementResult result;
+    result.type = statement._type;
+    ++_preparedExecutionCount;
+    if (!_db.isOpen()) {
+        result.error = makePreparedError(SqlErrorCode::DatabaseClosed,
+                                         "database is not open");
+        return result;
+    }
+    if (!statement._prepared) {
+        result.error = makePreparedError(SqlErrorCode::ParameterError,
+                                         "statement is not prepared");
+        return result;
+    }
+    if (statement._schemaGeneration != _db.schemaGeneration()) {
+        result.error = makePreparedError(
+            SqlErrorCode::SchemaChanged,
+            "database schema changed after this statement was prepared; prepare it again");
+        return result;
+    }
+    for (size_t i = 0; i < statement._isBound.size(); ++i) {
+        if (!statement._isBound[i]) {
+            const SqlParameterInfo& info = statement._parameters[i];
+            result.error = makePreparedError(
+                SqlErrorCode::ParameterNotBound,
+                "parameter #" +
+                    std::to_string(static_cast<unsigned long long>(i)) +
+                    " has not been bound",
+                info.line, info.column);
+            return result;
+        }
+    }
+
+    SqlStatementAst resolved = statement._statement;
+    resolvePreparedAst(resolved, statement._bindings);
+    ExecContext context;
+    executeStatement(resolved, context, result);
     return result;
 }
 

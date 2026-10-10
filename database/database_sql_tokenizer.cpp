@@ -142,7 +142,8 @@ SqlTokenKind keywordKind(const std::string& upper) {
 class Lexer {
 public:
     Lexer(const std::string& input, std::vector<SqlToken>& out)
-        : _input(input), _out(out), _index(0), _line(1), _column(1) {}
+        : _input(input), _out(out), _index(0), _line(1), _column(1),
+          _parameterCount(0) {}
 
     bool run(SqlError& error) {
         _out.clear();
@@ -181,6 +182,20 @@ public:
             } else if (c == ';') {
                 advance();
                 emit(SqlTokenKind::Semicolon, startOffset, startLine, startColumn);
+            } else if (c == '?') {
+                if (_parameterCount >= kSqlMaxParameters) {
+                    return fail(error, SqlErrorCode::ResourceLimit,
+                                "parameter count exceeds the SQL9 maximum", startOffset,
+                                startLine, startColumn);
+                }
+                advance();
+                SqlToken token;
+                token.kind = SqlTokenKind::Parameter;
+                token.parameterOrdinal = static_cast<uint32_t>(_parameterCount++);
+                token.offset = startOffset;
+                token.line = startLine;
+                token.column = startColumn;
+                _out.push_back(token);
             } else if (c == '*') {
                 advance();
                 emit(SqlTokenKind::Star, startOffset, startLine, startColumn);
@@ -544,6 +559,7 @@ private:
     size_t _index;
     uint32_t _line;
     uint32_t _column;
+    size_t _parameterCount;
 };
 
 } // namespace

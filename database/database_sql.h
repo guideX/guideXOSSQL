@@ -127,6 +127,68 @@ struct SqlStatementResult {
     SqlStatementResult();
 };
 
+struct SqlParameterInfo {
+    size_t ordinal;
+    DbType type;
+    bool nullable;
+    bool nonNegative;
+    uint32_t line;
+    uint32_t column;
+
+    SqlParameterInfo()
+        : ordinal(0), type(DbType::Unknown), nullable(true), nonNegative(false),
+          line(0), column(0) {}
+};
+
+class SqlEngine;
+struct SqlEngineLifetime;
+
+// Caller-owned, reusable prepared statement. Bind operations copy Text/BLOB
+// bytes and replace an earlier binding at the same ordinal. The statement is
+// movable and non-copyable, and may not outlive its SqlEngine/Database.
+class SqlPreparedStatement {
+public:
+    SqlPreparedStatement();
+    ~SqlPreparedStatement();
+    SqlPreparedStatement(SqlPreparedStatement&& other) noexcept;
+    SqlPreparedStatement& operator=(SqlPreparedStatement&& other) noexcept;
+    SqlPreparedStatement(const SqlPreparedStatement&) = delete;
+    SqlPreparedStatement& operator=(const SqlPreparedStatement&) = delete;
+
+    bool isPrepared() const { return _prepared; }
+    SqlStatementType statementType() const { return _type; }
+    size_t parameterCount() const { return _parameters.size(); }
+    const std::vector<SqlParameterInfo>& parameters() const { return _parameters; }
+    const std::vector<SqlColumn>& resultColumns() const { return _resultColumns; }
+
+    SqlError bind(size_t index, const DbValue& value);
+    SqlError bindNull(size_t index);
+    SqlError bindBoolean(size_t index, bool value);
+    SqlError bindInt32(size_t index, int32_t value);
+    SqlError bindInt64(size_t index, int64_t value);
+    SqlError bindFloat64(size_t index, double value);
+    SqlError bindText(size_t index, const std::string& value);
+    SqlError bindBlob(size_t index, const uint8_t* data, size_t length);
+    void clearBindings();
+
+    SqlStatementResult execute();
+    SqlStatementResult executeQuery();
+
+private:
+    friend class SqlEngine;
+    SqlError bindChecked(size_t index, const DbValue& value);
+
+    std::weak_ptr<SqlEngineLifetime> _lifetime;
+    SqlStatementAst _statement;
+    SqlStatementType _type;
+    std::vector<SqlParameterInfo> _parameters;
+    std::vector<DbValue> _bindings;
+    std::vector<bool> _isBound;
+    std::vector<SqlColumn> _resultColumns;
+    uint64_t _schemaGeneration;
+    bool _prepared;
+};
+
 // The structured result of one execute() call (possibly many statements).
 struct SqlExecutionResult {
     bool ok;
@@ -153,6 +215,13 @@ public:
     // execution error stops after the preceding statements have run.
     SqlExecutionResult execute(const std::string& sql);
 
+    // Parses one non-empty statement and binds its static metadata without
+    // executing it. Parameters use 0-based lexical ordinals.
+    SqlError prepare(const std::string& sql, SqlPreparedStatement& out);
+
+    uint64_t sqlParseCount() const { return _sqlParseCount; }
+    uint64_t preparedExecutionCount() const { return _preparedExecutionCount; }
+
     bool inTransaction() const { return _tx != nullptr; }
     uint64_t transactionId() const;
 
@@ -164,12 +233,19 @@ public:
     void setForceNestedLoop(bool force) { _forceNestedLoop = force; }
 
 private:
+    friend class SqlPreparedStatement;
+
     struct ExecContext {
         std::map<std::string, std::unique_ptr<Table> > tables;
     };
 
     bool executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
                           SqlStatementResult& out);
+    SqlStatementResult executePrepared(SqlPreparedStatement& statement);
+    bool inferPreparedMetadata(const SqlStatementAst& statement,
+                               std::vector<SqlParameterInfo>& parameters,
+                               std::vector<SqlColumn>& resultColumns,
+                               SqlError& error);
     bool executeCreateTable(const SqlCreateTableAst& ast, SqlStatementResult& out);
     bool executeCreateIndex(const SqlCreateIndexAst& ast, SqlStatementResult& out);
     bool executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
@@ -203,6 +279,9 @@ private:
     Database& _db;
     std::unique_ptr<Transaction> _tx;
     bool _forceNestedLoop;
+    std::shared_ptr<SqlEngineLifetime> _lifetime;
+    uint64_t _sqlParseCount;
+    uint64_t _preparedExecutionCount;
 };
 
 } // namespace db

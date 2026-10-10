@@ -87,6 +87,7 @@ DbResult Transaction::createTable(const TableDefinition& def, uint32_t& outTable
     if (!result.isOk()) {
         return result;
     }
+    ++_db._schemaGeneration;
     markCatalogChanged();
     return DbResult::ok();
 }
@@ -99,8 +100,10 @@ DbResult Transaction::createIndex(const IndexDefinition& def, uint32_t& outIndex
     if (!result.isOk()) {
         return result;
     }
+    ++_db._schemaGeneration;
     markCatalogChanged();
-    return _db.buildIndex(outIndexId);
+    result = _db.buildIndex(outIndexId);
+    return result;
 }
 
 DbResult Transaction::openTable(const std::string& name, std::unique_ptr<Table>& out) {

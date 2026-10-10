@@ -55,6 +55,7 @@ enum class DbType : uint16_t {
 
 inline const char* dbTypeName(DbType type) {
     switch (type) {
+    case DbType::Unknown: return "Unknown";
     case DbType::Boolean: return "Boolean";
     case DbType::Int32: return "Int32";
     case DbType::Int64: return "Int64";

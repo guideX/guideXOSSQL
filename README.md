@@ -342,6 +342,35 @@ build/gxdb_cli run sample.gxdb schema.sql
 build/gxdb_cli shell sample.gxdb
 ```
 
+## Prepared statements (SQL9)
+
+Applications can prepare one statement and bind owned, typed values for each
+execution without formatting SQL strings:
+
+```cpp
+SqlEngine connection(database);
+SqlPreparedStatement insert;
+SqlError error = connection.prepare(
+    "INSERT INTO Users (Id, Name) VALUES (?, ?);", insert);
+if (error.isOk()) {
+    insert.bindInt64(0, 1);
+    insert.bindText(1, "Alice");
+    SqlStatementResult inserted = insert.execute();
+}
+
+SqlPreparedStatement find;
+error = connection.prepare("SELECT Name FROM Users WHERE Id = ?;", find);
+if (error.isOk()) {
+    find.bindInt64(0, 1);
+    SqlStatementResult selected = find.executeQuery();
+}
+```
+
+See [SQL9 prepared statements API](docs/SQL9_PREPARED_STATEMENTS_API.md) for
+parameter type inference, NULL behavior, transaction use, and stale-schema
+handling. SQL9 prepared execution currently reuses the parsed AST but still
+chooses the physical access path per execution.
+
 ## Status
 
 Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,

@@ -1504,6 +1504,7 @@ DbResult Table::alterAddColumn(const ColumnDefinition& newCol) {
         _skipForeignKeys = false;
         return result;
     }
+    ++_db._schemaGeneration;
     markCatalogDirty();
 
     // 4. Re-insert every row with the appended value. Existing indexes are

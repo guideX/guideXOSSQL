@@ -159,6 +159,11 @@ public:
     // re-resolved. Committed transactions do not invalidate caches.
     uint64_t dataEpoch() const { return _dataEpoch; }
 
+    // Volatile, database-wide schema epoch for runtime prepared-plan
+    // invalidation. It is never persisted and advances for successful DDL,
+    // including transaction-local DDL (rollback does not revive old plans).
+    uint64_t schemaGeneration() const { return _schemaGeneration; }
+
     // Marks the catalog as needing a durable re-save on commit.
     void markCatalogDirty();
 
@@ -167,6 +172,9 @@ public:
     void refreshBufferDiagnostics();
 
 private:
+    friend class Transaction;
+    friend class Table;
+
     Database();
     DbResult openImpl(const std::string& path, const DatabaseOpenOptions& options,
                       const DatabaseCreateOptions& createOptions, bool create,
@@ -187,6 +195,7 @@ private:
     Transaction* _activeTx;
     uint64_t _nextTxId;
     uint64_t _dataEpoch;
+    uint64_t _schemaGeneration;
     std::string _walPath;
     IDatabaseFileSystem* _fileSystem;
 };

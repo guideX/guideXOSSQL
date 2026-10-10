@@ -15,6 +15,10 @@ const char* sqlErrorCodeName(SqlErrorCode code) {
     case SqlErrorCode::Unsupported: return "Unsupported";
     case SqlErrorCode::ForeignKeyViolation: return "ForeignKeyViolation";
     case SqlErrorCode::DependencyError: return "DependencyError";
+    case SqlErrorCode::ParameterError: return "ParameterError";
+    case SqlErrorCode::ParameterNotBound: return "ParameterNotBound";
+    case SqlErrorCode::SchemaChanged: return "SchemaChanged";
+    case SqlErrorCode::DatabaseClosed: return "DatabaseClosed";
     }
     return "Unknown";
 }
@@ -98,6 +102,7 @@ const char* sqlTokenKindName(SqlTokenKind kind) {
     case SqlTokenKind::Alter: return "ALTER";
     case SqlTokenKind::Add: return "ADD";
     case SqlTokenKind::Column: return "COLUMN";
+    case SqlTokenKind::Parameter: return "parameter marker";
     case SqlTokenKind::Identifier: return "identifier";
     case SqlTokenKind::IntegerLiteral: return "integer literal";
     case SqlTokenKind::FloatLiteral: return "float literal";

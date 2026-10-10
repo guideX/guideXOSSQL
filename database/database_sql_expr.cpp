@@ -56,6 +56,7 @@ DbType literalKindToType(SqlLiteralKind kind) {
     case SqlLiteralKind::Float: return DbType::Float64;
     case SqlLiteralKind::String: return DbType::Text;
     case SqlLiteralKind::Blob: return DbType::Blob;
+    case SqlLiteralKind::Parameter: return DbType::Unknown;
     case SqlLiteralKind::Null: return DbType::Unknown;
     }
     return DbType::Unknown;
@@ -74,6 +75,8 @@ DbValue literalToValue(const SqlLiteralAst& literal) {
     case SqlLiteralKind::Blob:
         return DbValue::blob(literal.blobValue.empty() ? nullptr : literal.blobValue.data(),
                              literal.blobValue.size());
+    case SqlLiteralKind::Parameter:
+        return DbValue::null();
     case SqlLiteralKind::Null:
         break;
     }
@@ -451,8 +454,12 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
     }
 
     case SqlExprKind::Invalid:
+    case SqlExprKind::Parameter:
     default:
-        error = semanticError("unsupported predicate expression", src.line, src.column);
+        error = semanticError(src.kind == SqlExprKind::Parameter
+                                  ? "unbound SQL parameter"
+                                  : "unsupported predicate expression",
+                              src.line, src.column);
         return false;
     }
 }

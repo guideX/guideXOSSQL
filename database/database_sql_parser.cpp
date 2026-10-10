@@ -886,38 +886,52 @@ bool SqlParser::parseOrderBy(std::vector<SqlOrderTermAst>& out, SqlError& error)
 
 bool SqlParser::parseLimitOffset(SqlSelectAst& out, SqlError& error) {
     if (match(SqlTokenKind::Limit)) {
-        if (!check(SqlTokenKind::IntegerLiteral)) {
-            std::string message = "expected a nonnegative integer after LIMIT, found ";
-            message += sqlTokenKindName(peek().kind);
-            error = makeError(SqlErrorCode::SyntaxError, message, peek());
-            return false;
+        if (check(SqlTokenKind::Parameter)) {
+            out.hasLimit = true;
+            out.limitIsParameter = true;
+            out.limitParameterOrdinal = peek().parameterOrdinal;
+            advance();
+        } else {
+            if (!check(SqlTokenKind::IntegerLiteral)) {
+                std::string message = "expected a nonnegative integer after LIMIT, found ";
+                message += sqlTokenKindName(peek().kind);
+                error = makeError(SqlErrorCode::SyntaxError, message, peek());
+                return false;
+            }
+            const int64_t value = peek().int64Value;
+            if (value < 0) {
+                error = makeError(SqlErrorCode::SyntaxError,
+                                  "LIMIT must be a nonnegative integer", peek());
+                return false;
+            }
+            out.hasLimit = true;
+            out.limit = static_cast<uint64_t>(value);
+            advance();
         }
-        const int64_t value = peek().int64Value;
-        if (value < 0) {
-            error = makeError(SqlErrorCode::SyntaxError,
-                              "LIMIT must be a nonnegative integer", peek());
-            return false;
-        }
-        out.hasLimit = true;
-        out.limit = static_cast<uint64_t>(value);
-        advance();
     }
     if (match(SqlTokenKind::Offset)) {
-        if (!check(SqlTokenKind::IntegerLiteral)) {
-            std::string message = "expected a nonnegative integer after OFFSET, found ";
-            message += sqlTokenKindName(peek().kind);
-            error = makeError(SqlErrorCode::SyntaxError, message, peek());
-            return false;
+        if (check(SqlTokenKind::Parameter)) {
+            out.hasOffset = true;
+            out.offsetIsParameter = true;
+            out.offsetParameterOrdinal = peek().parameterOrdinal;
+            advance();
+        } else {
+            if (!check(SqlTokenKind::IntegerLiteral)) {
+                std::string message = "expected a nonnegative integer after OFFSET, found ";
+                message += sqlTokenKindName(peek().kind);
+                error = makeError(SqlErrorCode::SyntaxError, message, peek());
+                return false;
+            }
+            const int64_t value = peek().int64Value;
+            if (value < 0) {
+                error = makeError(SqlErrorCode::SyntaxError,
+                                  "OFFSET must be a nonnegative integer", peek());
+                return false;
+            }
+            out.hasOffset = true;
+            out.offset = static_cast<uint64_t>(value);
+            advance();
         }
-        const int64_t value = peek().int64Value;
-        if (value < 0) {
-            error = makeError(SqlErrorCode::SyntaxError,
-                              "OFFSET must be a nonnegative integer", peek());
-            return false;
-        }
-        out.hasOffset = true;
-        out.offset = static_cast<uint64_t>(value);
-        advance();
     }
     return true;
 }
@@ -928,6 +942,11 @@ bool SqlParser::parseLiteral(SqlLiteralAst& out, SqlError& error) {
     out.line = token.line;
     out.column = token.column;
     switch (token.kind) {
+    case SqlTokenKind::Parameter:
+        out.kind = SqlLiteralKind::Parameter;
+        out.parameterOrdinal = token.parameterOrdinal;
+        advance();
+        return true;
     case SqlTokenKind::Null:
         out.kind = SqlLiteralKind::Null;
         advance();
@@ -1193,6 +1212,18 @@ bool SqlParser::parsePrimary(SqlPredicateAst& arena, int32_t& out, SqlError& err
         arena.nodes[index].kind = SqlExprKind::ColumnRef;
         arena.nodes[index].identifier = identifier;
         out = index;
+        return true;
+    }
+
+    if (token.kind == SqlTokenKind::Parameter) {
+        const int32_t index = allocExpr(arena, token, error);
+        if (index < 0) {
+            return false;
+        }
+        arena.nodes[index].kind = SqlExprKind::Parameter;
+        arena.nodes[index].parameterOrdinal = token.parameterOrdinal;
+        out = index;
+        advance();
         return true;
     }
 

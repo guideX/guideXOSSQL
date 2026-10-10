@@ -68,6 +68,9 @@ const size_t kSqlMaxOrderByColumns = 64u;
 // Maximum assignments in one UPDATE SET list.
 const size_t kSqlMaxUpdateAssignments = 64u;
 
+// Maximum positional parameters accepted in one SQL input/prepared statement.
+const size_t kSqlMaxParameters = 256u;
+
 // Maximum rows materialized for one SELECT result set.
 const size_t kSqlMaxResultRows = 100000u;
 
@@ -136,7 +139,11 @@ enum class SqlErrorCode {
     Unsupported,
     // SQL8 schema lifecycle / referential integrity.
     ForeignKeyViolation,
-    DependencyError
+    DependencyError,
+    ParameterError,
+    ParameterNotBound,
+    SchemaChanged,
+    DatabaseClosed
 };
 
 const char* sqlErrorCodeName(SqlErrorCode code);
@@ -233,6 +240,7 @@ enum class SqlTokenKind {
     Add,
     Column,
     // Literals.
+    Parameter,
     Identifier,
     IntegerLiteral,
     FloatLiteral,
@@ -278,12 +286,14 @@ struct SqlToken {
     std::vector<uint8_t> bytes;
     int64_t int64Value;
     double float64Value;
+    uint32_t parameterOrdinal;
     uint32_t offset;
     uint32_t line;
     uint32_t column;
 
     SqlToken()
         : kind(SqlTokenKind::EndOfInput), int64Value(0), float64Value(0.0),
+          parameterOrdinal(0),
           offset(0), line(1), column(1) {}
 };
 

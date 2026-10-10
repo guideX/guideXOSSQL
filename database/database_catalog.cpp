@@ -1079,8 +1079,10 @@ void Catalog::serializeColumnRecord(const ColumnDefinition& col,
             }
             case DbType::Float64: {
                 const double v = col.defaultValue.float64Value();
+                uint64_t bits = 0;
+                std::memcpy(&bits, &v, sizeof(bits));
                 out.resize(out.size() + 8);
-                storeLe64(out.data() + out.size() - 8, *reinterpret_cast<const uint64_t*>(&v));
+                storeLe64(out.data() + out.size() - 8, bits);
                 break;
             }
             case DbType::Text: {

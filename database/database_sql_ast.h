@@ -57,7 +57,7 @@ struct SqlIdentifier {
 };
 
 // A literal value in an INSERT ... VALUES list or an expression.
-enum class SqlLiteralKind { Null, Boolean, Integer, Float, String, Blob };
+enum class SqlLiteralKind { Null, Boolean, Integer, Float, String, Blob, Parameter };
 
 struct SqlLiteralAst {
     SqlLiteralKind kind;
@@ -67,12 +67,13 @@ struct SqlLiteralAst {
     std::string textValue;
     std::vector<uint8_t> blobValue;
     bool isDefault; // SQL8: true when this is the DEFAULT keyword in VALUES
+    uint32_t parameterOrdinal;
     uint32_t line;
     uint32_t column;
 
     SqlLiteralAst()
         : kind(SqlLiteralKind::Null), boolValue(false), int64Value(0),
-          float64Value(0.0), isDefault(false), line(0), column(0) {}
+          float64Value(0.0), isDefault(false), parameterOrdinal(0), line(0), column(0) {}
 };
 
 // ---- SQL5 predicate expressions -------------------------------------------
@@ -85,7 +86,8 @@ enum class SqlExprKind {
     And,       // left, right
     Or,        // left, right
     Not,       // left
-    IsNull     // left; negated == true means IS NOT NULL
+    IsNull,    // left; negated == true means IS NOT NULL
+    Parameter  // parameter ordinal
 };
 
 enum class SqlCompareOp { Eq = 0, Ne, Lt, Le, Gt, Ge };
@@ -99,6 +101,7 @@ struct SqlExprNode {
     SqlIdentifier identifier; // ColumnRef
     SqlLiteralAst literal;    // Literal
     SqlCompareOp compareOp;   // Compare
+    uint32_t parameterOrdinal; // Parameter
     bool negated;             // IsNull
     int32_t left;
     int32_t right;
@@ -106,7 +109,8 @@ struct SqlExprNode {
     uint32_t column;
 
     SqlExprNode()
-        : kind(SqlExprKind::Invalid), compareOp(SqlCompareOp::Eq), negated(false),
+        : kind(SqlExprKind::Invalid), compareOp(SqlCompareOp::Eq), parameterOrdinal(0),
+          negated(false),
           left(-1), right(-1), line(0), column(0) {}
 };
 
@@ -290,14 +294,20 @@ struct SqlSelectAst {
     std::vector<SqlOrderTermAst> orderBy;
     bool hasLimit;
     uint64_t limit;
+    bool limitIsParameter;
+    uint32_t limitParameterOrdinal;
     bool hasOffset;
     uint64_t offset;
+    bool offsetIsParameter;
+    uint32_t offsetParameterOrdinal;
     uint32_t line;
     uint32_t column;
 
     SqlSelectAst()
-        : distinct(false), star(false), hasLimit(false), limit(0), hasOffset(false),
-          offset(0), line(0), column(0) {}
+        : distinct(false), star(false), hasLimit(false), limit(0),
+          limitIsParameter(false), limitParameterOrdinal(0), hasOffset(false),
+          offset(0), offsetIsParameter(false), offsetParameterOrdinal(0), line(0),
+          column(0) {}
 };
 
 struct SqlAssignmentAst {
