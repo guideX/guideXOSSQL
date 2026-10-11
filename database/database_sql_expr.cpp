@@ -244,16 +244,24 @@ bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
                           const std::vector<ColumnDefinition>& columns,
                           SqlError& error) {
     ColumnListResolver resolver(columns);
-    return bindInternal(nodes, root, resolver, error);
+    return bindInternal(nodes, root, resolver, nullptr, error);
 }
 
 bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
                           const SqlColumnResolver& resolver, SqlError& error) {
-    return bindInternal(nodes, root, resolver, error);
+    return bindInternal(nodes, root, resolver, nullptr, error);
+}
+
+bool BoundPredicate::bind(const std::vector<SqlExprNode>& nodes, int32_t root,
+                          const SqlColumnResolver& resolver,
+                          const std::vector<DbType>& parameterTypes,
+                          SqlError& error) {
+    return bindInternal(nodes, root, resolver, &parameterTypes, error);
 }
 
 bool BoundPredicate::bindInternal(const std::vector<SqlExprNode>& nodes,
                                   int32_t root, const SqlColumnResolver& resolver,
+                                  const std::vector<DbType>* parameterTypes,
                                   SqlError& error) {
     _nodes.clear();
     _root = -1;
@@ -266,7 +274,7 @@ bool BoundPredicate::bindInternal(const std::vector<SqlExprNode>& nodes,
     }
 
     int32_t boundRoot = -1;
-    if (!bindNode(nodes, root, resolver, boundRoot, error)) {
+    if (!bindNode(nodes, root, resolver, boundRoot, parameterTypes, error)) {
         return false;
     }
     if (!isTruthNode(boundRoot)) {
@@ -283,6 +291,7 @@ bool BoundPredicate::bindInternal(const std::vector<SqlExprNode>& nodes,
 
 bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t index,
                               const SqlColumnResolver& resolver, int32_t& outIndex,
+                              const std::vector<DbType>* parameterTypes,
                               SqlError& error) {
     if (index < 0 || static_cast<size_t>(index) >= nodes.size()) {
         error = semanticError("malformed predicate expression", 0, 0);
@@ -316,17 +325,35 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
         return true;
     }
 
+    case SqlExprKind::Parameter: {
+        if (parameterTypes == nullptr ||
+            src.parameterOrdinal >= parameterTypes->size() ||
+            !isConcreteDbType((*parameterTypes)[src.parameterOrdinal])) {
+            error = semanticError("unbound SQL parameter", src.line, src.column);
+            return false;
+        }
+        Node node;
+        node.kind = Kind::Parameter;
+        node.parameterOrdinal = src.parameterOrdinal;
+        node.type = (*parameterTypes)[src.parameterOrdinal];
+        _nodes.push_back(node);
+        outIndex = static_cast<int32_t>(_nodes.size() - 1);
+        return true;
+    }
+
     case SqlExprKind::Compare: {
         int32_t left = -1;
         int32_t right = -1;
-        if (!bindNode(nodes, src.left, resolver, left, error) ||
-            !bindNode(nodes, src.right, resolver, right, error)) {
+        if (!bindNode(nodes, src.left, resolver, left, parameterTypes, error) ||
+            !bindNode(nodes, src.right, resolver, right, parameterTypes, error)) {
             return false;
         }
         const Node& ln = _nodes[static_cast<size_t>(left)];
         const Node& rn = _nodes[static_cast<size_t>(right)];
-        if ((ln.kind != Kind::Column && ln.kind != Kind::Literal) ||
-            (rn.kind != Kind::Column && rn.kind != Kind::Literal)) {
+        if ((ln.kind != Kind::Column && ln.kind != Kind::Literal &&
+             ln.kind != Kind::Parameter) ||
+            (rn.kind != Kind::Column && rn.kind != Kind::Literal &&
+             rn.kind != Kind::Parameter)) {
             error = semanticError(
                 "comparison operands must be a column or literal in SQL5",
                 src.line, src.column);
@@ -397,8 +424,8 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
     case SqlExprKind::Or: {
         int32_t left = -1;
         int32_t right = -1;
-        if (!bindNode(nodes, src.left, resolver, left, error) ||
-            !bindNode(nodes, src.right, resolver, right, error)) {
+        if (!bindNode(nodes, src.left, resolver, left, parameterTypes, error) ||
+            !bindNode(nodes, src.right, resolver, right, parameterTypes, error)) {
             return false;
         }
         if (!isTruthNode(left) || !isTruthNode(right)) {
@@ -417,7 +444,7 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
 
     case SqlExprKind::Not: {
         int32_t operand = -1;
-        if (!bindNode(nodes, src.left, resolver, operand, error)) {
+        if (!bindNode(nodes, src.left, resolver, operand, parameterTypes, error)) {
             return false;
         }
         if (!isTruthNode(operand)) {
@@ -435,7 +462,7 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
 
     case SqlExprKind::IsNull: {
         int32_t operand = -1;
-        if (!bindNode(nodes, src.left, resolver, operand, error)) {
+        if (!bindNode(nodes, src.left, resolver, operand, parameterTypes, error)) {
             return false;
         }
         const Node& on = _nodes[static_cast<size_t>(operand)];
@@ -454,7 +481,6 @@ bool BoundPredicate::bindNode(const std::vector<SqlExprNode>& nodes, int32_t ind
     }
 
     case SqlExprKind::Invalid:
-    case SqlExprKind::Parameter:
     default:
         error = semanticError(src.kind == SqlExprKind::Parameter
                                   ? "unbound SQL parameter"
@@ -480,21 +506,30 @@ bool BoundPredicate::isTruthNode(int32_t index) const {
         return node.type == DbType::Boolean;
     case Kind::Literal:
         return node.literal.isNull() || node.type == DbType::Boolean;
+    case Kind::Parameter:
+        return node.type == DbType::Boolean;
     }
     return false;
 }
 
 SqlTruth BoundPredicate::evaluate(const std::vector<DbValue>& row) const {
+    static const std::vector<DbValue> noParameters;
+    return evaluate(row, noParameters);
+}
+
+SqlTruth BoundPredicate::evaluate(const std::vector<DbValue>& row,
+                                  const std::vector<DbValue>& parameters) const {
     if (!_bound) {
         return SqlTruth::Unknown;
     }
     if (_root < 0) {
         return SqlTruth::True;
     }
-    return evalTruth(_root, row);
+    return evalTruth(_root, row, parameters);
 }
 
-SqlTruth BoundPredicate::evalTruth(int32_t index, const std::vector<DbValue>& row) const {
+SqlTruth BoundPredicate::evalTruth(int32_t index, const std::vector<DbValue>& row,
+                                   const std::vector<DbValue>& parameters) const {
     const Node& node = _nodes[static_cast<size_t>(index)];
     switch (node.kind) {
     case Kind::Column: {
@@ -512,12 +547,17 @@ SqlTruth BoundPredicate::evalTruth(int32_t index, const std::vector<DbValue>& ro
             return SqlTruth::Unknown;
         }
         return node.literal.booleanValue() ? SqlTruth::True : SqlTruth::False;
+    case Kind::Parameter: {
+        const DbValue value = evalValue(index, row, parameters);
+        if (value.isNull()) return SqlTruth::Unknown;
+        return value.booleanValue() ? SqlTruth::True : SqlTruth::False;
+    }
     case Kind::Compare: {
         if (node.alwaysUnknown) {
             return SqlTruth::Unknown;
         }
-        const DbValue left = evalValue(node.left, row);
-        const DbValue right = evalValue(node.right, row);
+        const DbValue left = evalValue(node.left, row, parameters);
+        const DbValue right = evalValue(node.right, row, parameters);
         if (left.isNull() || right.isNull()) {
             return SqlTruth::Unknown;
         }
@@ -532,13 +572,15 @@ SqlTruth BoundPredicate::evalTruth(int32_t index, const std::vector<DbValue>& ro
                    : SqlTruth::False;
     }
     case Kind::And:
-        return sqlTruthAnd(evalTruth(node.left, row), evalTruth(node.right, row));
+        return sqlTruthAnd(evalTruth(node.left, row, parameters),
+                           evalTruth(node.right, row, parameters));
     case Kind::Or:
-        return sqlTruthOr(evalTruth(node.left, row), evalTruth(node.right, row));
+        return sqlTruthOr(evalTruth(node.left, row, parameters),
+                          evalTruth(node.right, row, parameters));
     case Kind::Not:
-        return sqlTruthNot(evalTruth(node.left, row));
+        return sqlTruthNot(evalTruth(node.left, row, parameters));
     case Kind::IsNull: {
-        const DbValue value = evalValue(node.left, row);
+        const DbValue value = evalValue(node.left, row, parameters);
         bool isNull = value.isNull();
         if (node.negated) {
             isNull = !isNull;
@@ -549,13 +591,18 @@ SqlTruth BoundPredicate::evalTruth(int32_t index, const std::vector<DbValue>& ro
     return SqlTruth::Unknown;
 }
 
-DbValue BoundPredicate::evalValue(int32_t index, const std::vector<DbValue>& row) const {
+DbValue BoundPredicate::evalValue(int32_t index, const std::vector<DbValue>& row,
+                                  const std::vector<DbValue>& parameters) const {
     const Node& node = _nodes[static_cast<size_t>(index)];
     if (node.kind == Kind::Column) {
         if (node.ordinal >= row.size()) {
             return DbValue::null();
         }
         return row[node.ordinal];
+    }
+    if (node.kind == Kind::Parameter) {
+        if (node.parameterOrdinal >= parameters.size()) return DbValue::null();
+        return parameters[node.parameterOrdinal];
     }
     return node.literal;
 }

@@ -117,6 +117,16 @@ endif()
 
 add_test(NAME database_sql9_test COMMAND database_sql9_test)
 
+add_executable(database_sql9r_test tests/database_sql9r_test.cpp)
+target_link_libraries(database_sql9r_test PRIVATE gxos_database)
+if(MSVC)
+    target_compile_options(database_sql9r_test PRIVATE /W4)
+else()
+    target_compile_options(database_sql9r_test PRIVATE -Wall -Wextra)
+endif()
+
+add_test(NAME database_sql9r_test COMMAND database_sql9r_test)
+
 add_executable(gxdb_cli tools/gxdb_cli.cpp)
 target_link_libraries(gxdb_cli PRIVATE gxos_database)
 if(MSVC)

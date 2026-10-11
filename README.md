@@ -349,35 +349,33 @@ execution without formatting SQL strings:
 
 ```cpp
 SqlEngine connection(database);
-SqlPreparedStatement insert;
-SqlError error = connection.prepare(
-    "INSERT INTO Users (Id, Name) VALUES (?, ?);", insert);
+SqlPreparedStatement query;
+SqlError error = connection.prepare("SELECT Name FROM Users WHERE Id = ?;", query);
 if (error.isOk()) {
-    insert.bindInt64(0, 1);
-    insert.bindText(1, "Alice");
-    SqlStatementResult inserted = insert.execute();
-}
-
-SqlPreparedStatement find;
-error = connection.prepare("SELECT Name FROM Users WHERE Id = ?;", find);
-if (error.isOk()) {
-    find.bindInt64(0, 1);
-    SqlStatementResult selected = find.executeQuery();
+    for (int64_t id : userIds) {
+        query.bindInt64(0, id);
+        SqlStatementResult result = query.executeQuery();
+        // Consume result.resultSet before the next execution.
+    }
 }
 ```
 
 See [SQL9 prepared statements API](docs/SQL9_PREPARED_STATEMENTS_API.md) for
 parameter type inference, NULL behavior, transaction use, and stale-schema
-handling. SQL9 prepared execution currently reuses the parsed AST but still
-chooses the physical access path per execution.
+handling. Parsing, semantic binding, and physical access planning occur once
+per prepared statement; each execution supplies new parameter values and fresh
+query or mutation state.
 
 ## Status
 
-Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2285 checks,
+Hosted proof complete (SQL1: 172 checks, SQL2: 10398 checks, SQL3: 2469 checks,
 SQL4: 429 checks, SQL5: 1779 checks, SQL6: 2752 checks, SQL7: 1307 checks,
-SQL8: 4503 checks). SQL3 proves
+SQL8: 4503 checks, SQL9: 15274 checks, SQL9R: 53898 checks). The SQL9R
+prepared crash matrices add 184 SQL3 transaction-suite checks over its 2285
+check baseline. SQL3 proves
 crash-atomic transactions on the hosted backend, including a full commit crash
-matrix and a 250-lifecycle transaction/recovery stress suite. SQL4 proves a
+matrix, prepared INSERT/UPDATE/DELETE and parent+child commit crash matrices,
+and a 250-lifecycle transaction/recovery stress suite. SQL4 proves a
 bounded SQL language over that engine. SQL5 proves predicates with three-valued
 logic, deterministic ordering and LIMIT/OFFSET, plus UPDATE/DELETE with
 statement-level atomicity, variable width row relocation, multi-page compaction
@@ -409,4 +407,7 @@ schema/integrity workload, and CREATE TABLE+FK / parent+child commit / DROP
 INDEX / DROP TABLE / ALTER crash matrices. SQL8 introduces catalog v4 while the
 outer `.gxdb`, heap, B+ tree and WAL formats remain unchanged. QEMU and bare-metal proof are deferred to the phase
 that provides a native `IDatabaseFile` backend over the guideXOS VFS / block
-device.
+device. SQL9 adds typed owned parameter binding, stale-schema checks, and
+prepared SELECT/INSERT/UPDATE/DELETE. SQL9R proves one retained bound physical
+plan across changing parameter values, a 5,000-execution indexed SELECT, a
+5,525-operation mixed prepared workload, and prepared SQL3 crash recovery.

@@ -142,6 +142,27 @@ struct SqlParameterInfo {
 
 class SqlEngine;
 struct SqlEngineLifetime;
+struct SqlPreparedPlan;
+
+// Read-only counters and selected physical identities for the prepared-plan
+// reuse proof. They describe one caller-owned prepared statement.
+struct SqlPreparedDiagnostics {
+    uint64_t tokenizeCount;
+    uint64_t parseCount;
+    uint64_t semanticBindCount;
+    uint64_t physicalPlanBuildCount;
+    uint64_t executionCount;
+    uint64_t physicalPlanReuseCount;
+    std::string accessPath;
+    uint32_t indexId;
+    std::vector<std::string> joinAccessPaths;
+    std::vector<uint32_t> joinIndexIds;
+
+    SqlPreparedDiagnostics()
+        : tokenizeCount(0), parseCount(0), semanticBindCount(0),
+          physicalPlanBuildCount(0), executionCount(0),
+          physicalPlanReuseCount(0), indexId(0) {}
+};
 
 // Caller-owned, reusable prepared statement. Bind operations copy Text/BLOB
 // bytes and replace an earlier binding at the same ordinal. The statement is
@@ -160,6 +181,7 @@ public:
     size_t parameterCount() const { return _parameters.size(); }
     const std::vector<SqlParameterInfo>& parameters() const { return _parameters; }
     const std::vector<SqlColumn>& resultColumns() const { return _resultColumns; }
+    const SqlPreparedDiagnostics& diagnostics() const { return _diagnostics; }
 
     SqlError bind(size_t index, const DbValue& value);
     SqlError bindNull(size_t index);
@@ -185,6 +207,8 @@ private:
     std::vector<DbValue> _bindings;
     std::vector<bool> _isBound;
     std::vector<SqlColumn> _resultColumns;
+    std::shared_ptr<SqlPreparedPlan> _plan;
+    SqlPreparedDiagnostics _diagnostics;
     uint64_t _schemaGeneration;
     bool _prepared;
 };
@@ -237,6 +261,9 @@ private:
 
     struct ExecContext {
         std::map<std::string, std::unique_ptr<Table> > tables;
+        std::unique_ptr<Table> preparedDmlTable;
+        const SqlPreparedPlan* preparedPlan = nullptr;
+        const std::vector<DbValue>* parameterValues = nullptr;
     };
 
     bool executeStatement(const SqlStatementAst& stmt, ExecContext& ctx,
@@ -245,7 +272,7 @@ private:
     bool inferPreparedMetadata(const SqlStatementAst& statement,
                                std::vector<SqlParameterInfo>& parameters,
                                std::vector<SqlColumn>& resultColumns,
-                               SqlError& error);
+                               SqlPreparedPlan* plan, SqlError& error);
     bool executeCreateTable(const SqlCreateTableAst& ast, SqlStatementResult& out);
     bool executeCreateIndex(const SqlCreateIndexAst& ast, SqlStatementResult& out);
     bool executeInsert(const SqlInsertAst& ast, ExecContext& ctx,

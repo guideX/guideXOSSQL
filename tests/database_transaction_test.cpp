@@ -34,9 +34,11 @@
 #include "database_engine.h"
 #include "database_format.h"
 #include "database_heap.h"
+#include "database_index.h"
 #include "database_io.h"
 #include "database_relational.h"
 #include "database_schema.h"
+#include "database_sql.h"
 #include "database_transaction.h"
 #include "database_types.h"
 #include "database_wal.h"
@@ -48,6 +50,7 @@ namespace {
 int g_pass = 0;
 int g_fail = 0;
 int g_caseCounter = 0;
+const int kPreparedCrashSeedChildren = 40;
 
 void checkTrue(bool condition, const char* what, int line) {
     if (condition) {
@@ -136,9 +139,13 @@ struct BudgetState {
     uint64_t written;   // cumulative bytes written so far
     bool exhausted;     // true once a write was cut short
     bool recording;     // record a boundary offset at the start of every write
+    bool pendingCommitRecord;
+    uint64_t durableCommitOffset;
     std::vector<uint64_t> boundaries;
 
-    BudgetState() : budget(UINT64_MAX), written(0), exhausted(false), recording(false) {}
+    BudgetState()
+        : budget(UINT64_MAX), written(0), exhausted(false), recording(false),
+          pendingCommitRecord(false), durableCommitOffset(UINT64_MAX) {}
 
     void freeze() { budget = written; }
 };
@@ -180,11 +187,25 @@ public:
             return false;
         }
         _state->written += length;
+        const std::string& path = _inner->path();
+        if (path.size() >= 6 && path.compare(path.size() - 6, 6, ".gxwal") == 0 &&
+            length >= kWalRecordPrefixSize &&
+            static_cast<const uint8_t*>(buffer)[wal_record_offset::RecordType] ==
+                kWalRecordCommit) {
+            _state->pendingCommitRecord = true;
+        }
         return true;
     }
 
     bool truncateTo(uint64_t size) override { return _inner->truncateTo(size); }
-    bool flush() override { return _inner->flush(); }
+    bool flush() override {
+        if (!_inner->flush()) return false;
+        if (_state->pendingCommitRecord) {
+            _state->durableCommitOffset = _state->written;
+            _state->pendingCommitRecord = false;
+        }
+        return true;
+    }
     const std::string& path() const override { return _inner->path(); }
 
 private:
@@ -413,6 +434,256 @@ DbResult runCrashedCreateTables(const std::string& path, int startIndex, int cou
     result = tx->commit();
     db->close();
     return result;
+}
+
+enum PreparedCrashKind {
+    PreparedInsert,
+    PreparedUpdate,
+    PreparedDelete,
+    PreparedParentChild
+};
+
+bool sqlOk(SqlEngine& engine, const std::string& sql, bool reportFailure = false) {
+    const SqlExecutionResult result = engine.execute(sql);
+    if (reportFailure && !result.ok) {
+        std::printf("  SQL crash-fixture command failed: %s -- %s\n", sql.c_str(),
+                    result.error.describe().c_str());
+    }
+    return result.ok;
+}
+
+bool createPreparedCrashBase(const std::string& path) {
+    std::unique_ptr<Database> db;
+    if (!Database::create(path, DatabaseCreateOptions(), db).isOk() || !db) return false;
+    bool ok = false;
+    {
+        SqlEngine engine(*db);
+        ok = sqlOk(engine,
+                   "CREATE TABLE Parent (Id INT64 PRIMARY KEY, Name TEXT NOT NULL);", true) &&
+             sqlOk(engine,
+                   "CREATE TABLE Child (Id INT64 PRIMARY KEY, ParentId INT64 NOT NULL, "
+                   "Code TEXT NOT NULL UNIQUE, Payload TEXT NOT NULL, "
+                   "FOREIGN KEY (ParentId) REFERENCES Parent (Id));", true) &&
+             sqlOk(engine, "INSERT INTO Parent VALUES (1, 'one');", true) &&
+             sqlOk(engine, "INSERT INTO Parent VALUES (2, 'two');", true);
+        for (int i = 0; ok && i < kPreparedCrashSeedChildren; ++i) {
+            const int id = 10 + i;
+            const std::string statement =
+                "INSERT INTO Child VALUES (" + std::to_string(id) + ", 1, 'old-code-" +
+                std::to_string(id) + "', 'seed-" + std::to_string(id) + "');";
+            ok = sqlOk(engine, statement, true);
+        }
+    }
+    if (ok) ok = db->flush().isOk();
+    if (!db->close().isOk()) ok = false;
+    return ok;
+}
+
+bool executePreparedCrashOperation(const std::string& path, PreparedCrashKind kind,
+                                   const std::shared_ptr<BudgetState>& state) {
+    BudgetFileSystem fs(state);
+    std::unique_ptr<Database> db;
+    if (!Database::open(path, DatabaseOpenOptions(), db, &fs).isOk() || !db) return false;
+    bool ok = false;
+    {
+        SqlEngine engine(*db);
+        SqlPreparedStatement first;
+        SqlPreparedStatement second;
+        if (kind == PreparedInsert) {
+            ok = engine.prepare("INSERT INTO Child VALUES (?, ?, ?, ?);", first).isOk() &&
+                 first.diagnostics().physicalPlanBuildCount == 1 &&
+                 first.bindInt64(0, 60).isOk() && first.bindInt64(1, 1).isOk() &&
+                 first.bindText(2, "insert-code").isOk() &&
+                 first.bindText(3, std::string(2048, 'i')).isOk();
+        } else if (kind == PreparedUpdate) {
+            ok = engine.prepare("UPDATE Child SET Code = ?, Payload = ?, ParentId = ? "
+                                "WHERE Id = ?;", first).isOk() &&
+                 first.diagnostics().accessPath == "IndexLookup" &&
+                 first.diagnostics().physicalPlanBuildCount == 1 &&
+                 first.bindText(0, "updated-code").isOk() &&
+                 first.bindText(1, std::string(3000, 'u')).isOk() &&
+                 first.bindInt64(2, 2).isOk() && first.bindInt64(3, 49).isOk();
+        } else if (kind == PreparedDelete) {
+            ok = engine.prepare("DELETE FROM Child WHERE Id = ?;", first).isOk() &&
+                 first.diagnostics().accessPath == "IndexLookup" &&
+                 first.diagnostics().physicalPlanBuildCount == 1 &&
+                 first.bindInt64(0, 49).isOk();
+        } else {
+            ok = engine.prepare("INSERT INTO Parent VALUES (?, ?);", first).isOk() &&
+                 engine.prepare("INSERT INTO Child VALUES (?, ?, ?, ?);", second).isOk() &&
+                 first.diagnostics().physicalPlanBuildCount == 1 &&
+                 second.diagnostics().physicalPlanBuildCount == 1 &&
+                 first.bindInt64(0, 3).isOk() && first.bindText(1, "parent-three").isOk() &&
+                 second.bindInt64(0, 61).isOk() && second.bindInt64(1, 3).isOk() &&
+                 second.bindText(2, "pair-code").isOk() &&
+                 second.bindText(3, "pair-payload").isOk();
+        }
+        if (ok) ok = sqlOk(engine, "BEGIN;");
+        if (ok && kind == PreparedParentChild) {
+            const SqlStatementResult parent = first.execute();
+            const SqlStatementResult child = second.execute();
+            ok = parent.ok && child.ok;
+            if (!ok) std::printf("  parent/child prepared inserts failed: %s / %s\n",
+                                 parent.error.describe().c_str(),
+                                 child.error.describe().c_str());
+        } else if (ok) {
+            const SqlStatementResult mutation = first.execute();
+            ok = mutation.ok &&
+                 ((kind == PreparedUpdate || kind == PreparedDelete)
+                      ? mutation.affectedRows == 1 : true);
+            if (!ok) std::printf("  prepared crash mutation failed: %s, rows=%llu\n",
+                                 mutation.error.describe().c_str(),
+                                 static_cast<unsigned long long>(mutation.affectedRows));
+            if (ok && kind == PreparedUpdate) {
+                std::unique_ptr<Table> table;
+                ok = db->openTable("Child", table).isOk() && table &&
+                     table->heapPageCount() > 1;
+                if (!ok) std::printf("  prepared UPDATE did not relocate the enlarged row\n");
+            }
+        }
+        if (ok) ok = sqlOk(engine, "COMMIT;");
+    }
+    // This flush applies committed pages to the data file. If the byte budget
+    // is exhausted, the caller reopens the files and lets WAL recovery decide.
+    db->close();
+    return ok;
+}
+
+bool verifyPreparedCrashState(const std::string& path, PreparedCrashKind kind,
+                              bool committed) {
+    std::unique_ptr<Database> db;
+    if (!Database::open(path, DatabaseOpenOptions(), db).isOk() || !db) return false;
+    bool ok = true;
+    {
+        SqlEngine engine(*db);
+        SqlExecutionResult parents = engine.execute("SELECT Id FROM Parent ORDER BY Id;");
+        SqlExecutionResult children = engine.execute(
+            "SELECT Id, ParentId, Code, Payload FROM Child ORDER BY Id;");
+        const bool pairCommitted = kind == PreparedParentChild && committed;
+        const bool insertCommitted = kind == PreparedInsert && committed;
+        const bool updateCommitted = kind == PreparedUpdate && committed;
+        const bool deleteCommitted = kind == PreparedDelete && committed;
+        ok = parents.ok && children.ok &&
+             parents.statements.size() == 1 && children.statements.size() == 1;
+        if (ok) {
+            const SqlResultSet& parentRows = parents.statements[0].resultSet;
+            const SqlResultSet& childRows = children.statements[0].resultSet;
+            ok = parentRows.rowCount() == (pairCommitted ? 3u : 2u) &&
+             childRows.rowCount() ==
+                     (static_cast<size_t>(kPreparedCrashSeedChildren) -
+                      (deleteCommitted ? 1u : 0u) + (insertCommitted ? 1u : 0u) +
+                      (pairCommitted ? 1u : 0u));
+            if (ok && pairCommitted) {
+                ok = parentRows.value(2, 0).int64Value() == 3 &&
+                     childRows.value(kPreparedCrashSeedChildren, 0).int64Value() == 61 &&
+                     childRows.value(kPreparedCrashSeedChildren, 1).int64Value() == 3 &&
+                     childRows.value(kPreparedCrashSeedChildren, 2).textValue() == "pair-code" &&
+                     childRows.value(kPreparedCrashSeedChildren, 3).textValue() == "pair-payload";
+            }
+            if (ok && insertCommitted) {
+                ok = childRows.value(kPreparedCrashSeedChildren, 0).int64Value() == 60 &&
+                     childRows.value(kPreparedCrashSeedChildren, 1).int64Value() == 1 &&
+                     childRows.value(kPreparedCrashSeedChildren, 2).textValue() == "insert-code" &&
+                     childRows.value(kPreparedCrashSeedChildren, 3).textValue() == std::string(2048, 'i');
+            }
+            for (int i = 0; ok && i < kPreparedCrashSeedChildren; ++i) {
+                if (deleteCommitted && i == kPreparedCrashSeedChildren - 1) continue;
+                const int64_t id = 10 + i;
+                const bool updated = updateCommitted && id == 49;
+                const std::string code = updated ? "updated-code"
+                                                 : "old-code-" + std::to_string(id);
+                const std::string payload = updated ? std::string(3000, 'u')
+                                                    : "seed-" + std::to_string(id);
+                const int64_t parentId = updated ? 2 : 1;
+                const size_t row = static_cast<size_t>(i);
+                ok = childRows.value(row, 0).int64Value() == id &&
+                     childRows.value(row, 1).int64Value() == parentId &&
+                     childRows.value(row, 2).textValue() == code &&
+                     childRows.value(row, 3).textValue() == payload;
+            }
+        }
+    }
+    std::string integrity;
+    if (ok) ok = db->validateIntegrity(integrity).isOk();
+    std::vector<IndexInfo> indexes;
+    if (ok) ok = db->listIndexes(indexes).isOk();
+    for (size_t i = 0; ok && i < indexes.size(); ++i) {
+        IndexValidation validation;
+        ok = db->validateIndex(indexes[i].indexId, validation).isOk() && validation.ok;
+    }
+    if (ok) ok = db->flush().isOk() && db->diagnostics().walState == WalState::Clean;
+    db->close();
+    return ok;
+}
+
+void testPreparedCrashMatrix(PreparedCrashKind kind, const char* label) {
+    std::printf("prepared %s crash matrix\n", label);
+    const std::string base = uniquePath(std::string("prepared_") + label + "_base");
+    const bool baseOk = createPreparedCrashBase(base);
+    CHECK(baseOk);
+    if (!baseOk) return;
+    const std::vector<uint8_t> baseBytes = readFileBytes(base);
+    const std::string measurePath = uniquePath(std::string("prepared_") + label + "_measure");
+    CHECK(writeFileBytes(measurePath, baseBytes));
+    removeFile(walPath(measurePath));
+    std::shared_ptr<BudgetState> measured(new BudgetState());
+    measured->recording = true;
+    const bool measureOk = executePreparedCrashOperation(measurePath, kind, measured);
+    CHECK(measureOk);
+    CHECK(measured->durableCommitOffset != UINT64_MAX);
+    CHECK(measured->durableCommitOffset <= measured->written);
+    if (!measureOk || measured->durableCommitOffset == UINT64_MAX ||
+        measured->durableCommitOffset > measured->written) {
+        removeFile(walPath(measurePath));
+        removeFile(measurePath);
+        removeFile(walPath(base));
+        removeFile(base);
+        return;
+    }
+    const uint64_t durableOffset = measured->durableCommitOffset;
+    std::set<uint64_t> points;
+    points.insert(0);
+    // Sample the SQL3 transaction's WAL append boundaries and cut immediately
+    // after its durable COMMIT. Later buffer-page flushing is outside this
+    // WAL commit-boundary matrix.
+    for (size_t i = 0; i < measured->boundaries.size(); ++i) {
+        const uint64_t start = measured->boundaries[i];
+        if (start >= durableOffset) continue;
+        const uint64_t next = (i + 1 < measured->boundaries.size())
+                                  ? measured->boundaries[i + 1]
+                                  : durableOffset;
+        const uint64_t end = next < durableOffset ? next : durableOffset;
+        points.insert(start);
+        if (end > start) points.insert(start + (end - start) / 2);
+    }
+    points.insert(durableOffset);
+    int tested = 0;
+    for (std::set<uint64_t>::const_iterator it = points.begin(); it != points.end(); ++it) {
+        const std::string work = uniquePath(std::string("prepared_") + label + "_work");
+        CHECK(writeFileBytes(work, baseBytes));
+        removeFile(walPath(work));
+        std::shared_ptr<BudgetState> state(new BudgetState());
+        state->budget = *it;
+        executePreparedCrashOperation(work, kind, state);
+        const bool committed = *it >= durableOffset;
+        if (!verifyPreparedCrashState(work, kind, committed)) {
+            std::printf("  %s boundary %llu failed (durable at %llu, expected %s)\n",
+                        label, static_cast<unsigned long long>(*it),
+                        static_cast<unsigned long long>(durableOffset),
+                        committed ? "post-state" : "pre-state");
+            CHECK(false);
+        } else {
+            CHECK(true);
+        }
+        ++tested;
+        removeFile(walPath(work));
+        removeFile(work);
+    }
+    CHECK(tested > 5);
+    removeFile(walPath(measurePath));
+    removeFile(measurePath);
+    removeFile(walPath(base));
+    removeFile(base);
 }
 
 uint64_t measureCreateTables(const std::string& path, int startIndex, int count,
@@ -1721,6 +1992,10 @@ int main() {
     testWalIntegrity();
     testForeignWalDifferentDatabase();
     testWalTruncation();
+    testPreparedCrashMatrix(PreparedInsert, "INSERT");
+    testPreparedCrashMatrix(PreparedUpdate, "UPDATE");
+    testPreparedCrashMatrix(PreparedDelete, "DELETE");
+    testPreparedCrashMatrix(PreparedParentChild, "parent_child");
     testCrashMatrix();
     testCatalogGrowthCrashMatrix();
     testCrashDuringRedo();

@@ -210,15 +210,19 @@ int compareOrderValues(const DbValue& a, const DbValue& b, DbType type) {
 struct AccessPathChoice {
     enum class Kind { FullScan, IndexLookup, IndexRange };
     Kind kind;
-    const Catalog::IndexRecord* index;
+    uint32_t indexId;
+    std::string indexName;
     uint32_t columnOrdinal;
     SqlCompareOp op;
     DbValue value;
+    bool parameterized;
+    uint32_t parameterOrdinal;
     int score;
 
     AccessPathChoice()
-        : kind(Kind::FullScan), index(nullptr), columnOrdinal(0),
-          op(SqlCompareOp::Eq), value(), score(0) {}
+        : kind(Kind::FullScan), indexId(0), indexName(), columnOrdinal(0),
+          op(SqlCompareOp::Eq), value(), parameterized(false),
+          parameterOrdinal(0), score(0) {}
 };
 
 int compareOpScore(SqlCompareOp op) {
@@ -294,12 +298,167 @@ void considerIndexCandidate(const std::vector<SqlExprNode>& nodes, int32_t index
     if (score > best.score) {
         best.kind = (op == SqlCompareOp::Eq) ? AccessPathChoice::Kind::IndexLookup
                                              : AccessPathChoice::Kind::IndexRange;
-        best.index = idx;
+        best.indexId = idx->indexId;
+        best.indexName = idx->name;
         best.columnOrdinal = static_cast<uint32_t>(ordinal);
         best.op = op;
         best.value = coerced[0];
+        best.parameterized = false;
         best.score = score;
     }
+}
+
+void considerPreparedIndexCandidate(
+    const std::vector<SqlExprNode>& nodes, int32_t index,
+    const std::vector<ColumnDefinition>& columns, Database& db, uint32_t tableId,
+    const std::vector<DbType>& parameterTypes, AccessPathChoice& best) {
+    if (index < 0 || static_cast<size_t>(index) >= nodes.size()) return;
+    const SqlExprNode& node = nodes[static_cast<size_t>(index)];
+    if (node.kind == SqlExprKind::And) {
+        considerPreparedIndexCandidate(nodes, node.left, columns, db, tableId,
+                                       parameterTypes, best);
+        considerPreparedIndexCandidate(nodes, node.right, columns, db, tableId,
+                                       parameterTypes, best);
+        return;
+    }
+    if (node.kind != SqlExprKind::Compare || node.left < 0 || node.right < 0)
+        return;
+
+    const SqlExprNode& lhs = nodes[static_cast<size_t>(node.left)];
+    const SqlExprNode& rhs = nodes[static_cast<size_t>(node.right)];
+    const SqlExprNode* columnNode = nullptr;
+    const SqlExprNode* valueNode = nullptr;
+    SqlCompareOp op = node.compareOp;
+    if (lhs.kind == SqlExprKind::ColumnRef &&
+        (rhs.kind == SqlExprKind::Literal || rhs.kind == SqlExprKind::Parameter)) {
+        columnNode = &lhs;
+        valueNode = &rhs;
+    } else if (rhs.kind == SqlExprKind::ColumnRef &&
+               (lhs.kind == SqlExprKind::Literal || lhs.kind == SqlExprKind::Parameter)) {
+        columnNode = &rhs;
+        valueNode = &lhs;
+        switch (op) {
+        case SqlCompareOp::Lt: op = SqlCompareOp::Gt; break;
+        case SqlCompareOp::Le: op = SqlCompareOp::Ge; break;
+        case SqlCompareOp::Gt: op = SqlCompareOp::Lt; break;
+        case SqlCompareOp::Ge: op = SqlCompareOp::Le; break;
+        default: break;
+        }
+    } else {
+        return;
+    }
+    if (op == SqlCompareOp::Ne ||
+        (valueNode->kind == SqlExprKind::Literal &&
+         valueNode->literal.kind == SqlLiteralKind::Null)) return;
+
+    size_t ordinal = columns.size();
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (columns[i].name == columnNode->identifier.name) {
+            ordinal = i;
+            break;
+        }
+    }
+    if (ordinal == columns.size() || !isIndexableType(columns[ordinal].type)) return;
+
+    DbValue constant;
+    bool parameterized = false;
+    uint32_t parameterOrdinal = 0;
+    if (valueNode->kind == SqlExprKind::Parameter) {
+        parameterOrdinal = valueNode->parameterOrdinal;
+        if (parameterOrdinal >= parameterTypes.size() ||
+            parameterTypes[parameterOrdinal] != columns[ordinal].type) return;
+        parameterized = true;
+    } else {
+        std::vector<DbValue> coerced;
+        SqlError error;
+        if (!coerceLiteral(valueNode->literal, columns[ordinal], coerced, error) ||
+            coerced.empty() || coerced[0].isNull()) return;
+        constant = coerced[0];
+        std::vector<uint8_t> encoded;
+        if (!encodeIndexKey(columns[ordinal].type, constant, encoded)) return;
+    }
+
+    const Catalog::IndexRecord* idx =
+        db.findIndexForColumn(tableId, static_cast<uint32_t>(ordinal));
+    if (idx == nullptr) return;
+    const int score = compareOpScore(op);
+    if (score > best.score) {
+        best.kind = op == SqlCompareOp::Eq ? AccessPathChoice::Kind::IndexLookup
+                                           : AccessPathChoice::Kind::IndexRange;
+        best.indexId = idx->indexId;
+        best.indexName = idx->name;
+        best.columnOrdinal = static_cast<uint32_t>(ordinal);
+        best.op = op;
+        best.value = constant;
+        best.parameterized = parameterized;
+        best.parameterOrdinal = parameterOrdinal;
+        best.score = score;
+    }
+}
+
+AccessPathChoice selectPreparedAccessPath(
+    const SqlPredicateAst& where, const std::vector<ColumnDefinition>& columns,
+    Database& db, uint32_t tableId, const std::vector<DbType>& parameterTypes) {
+    AccessPathChoice best;
+    if (where.present) {
+        considerPreparedIndexCandidate(where.nodes, where.root, columns, db,
+                                       tableId, parameterTypes, best);
+    }
+    return best;
+}
+
+AccessPathChoice accessPathForExecution(const AccessPathChoice& plan,
+                                        const std::vector<DbValue>* values) {
+    AccessPathChoice execution = plan;
+    if (plan.parameterized && values != nullptr &&
+        plan.parameterOrdinal < values->size()) {
+        execution.value = (*values)[plan.parameterOrdinal];
+    }
+    return execution;
+}
+
+DbResult collectAccessPathLocators(Database& db, const AccessPathChoice& plan,
+                                   const std::vector<DbValue>* values,
+                                   DbType keyType,
+                                   std::vector<RowLocator>& locators) {
+    locators.clear();
+    const AccessPathChoice path = accessPathForExecution(plan, values);
+    if (path.kind == AccessPathChoice::Kind::FullScan) return DbResult::ok();
+    if (path.value.isNull()) return DbResult::ok();
+    if (path.kind == AccessPathChoice::Kind::IndexLookup) {
+        std::vector<uint8_t> key;
+        if (!encodeIndexKey(keyType, path.value, key))
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "value cannot be indexed");
+        return db.indexLookup(path.indexId, key, locators);
+    }
+    IndexRangeBound bound;
+    switch (path.op) {
+    case SqlCompareOp::Lt:
+        bound.hasUpper = true;
+        bound.upperInclusive = false;
+        bound.upper = path.value;
+        break;
+    case SqlCompareOp::Le:
+        bound.hasUpper = true;
+        bound.upperInclusive = true;
+        bound.upper = path.value;
+        break;
+    case SqlCompareOp::Gt:
+        bound.hasLower = true;
+        bound.lowerInclusive = false;
+        bound.lower = path.value;
+        break;
+    case SqlCompareOp::Ge:
+        bound.hasLower = true;
+        bound.lowerInclusive = true;
+        bound.lower = path.value;
+        break;
+    default:
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "unsupported prepared range operator");
+    }
+    return db.indexRange(path.indexId, bound, locators);
 }
 
 AccessPathChoice selectAccessPath(const SqlPredicateAst& where,
@@ -825,13 +984,14 @@ bool bindAggregateItem(const SqlProjectionItemAst& item,
 struct JoinPathChoice {
     enum class Kind { NestedLoop, IndexNestedLoop };
     Kind kind;
-    const Catalog::IndexRecord* index;
+    uint32_t indexId;
+    std::string indexName;
     size_t probeOrdinal; // left column ordinal in the accumulated joined row
     DbType indexType;
     int score;
 
     JoinPathChoice()
-        : kind(Kind::NestedLoop), index(nullptr), probeOrdinal(0),
+        : kind(Kind::NestedLoop), indexId(0), indexName(), probeOrdinal(0),
           indexType(DbType::Unknown), score(0) {}
 };
 
@@ -899,7 +1059,8 @@ void considerJoinCandidate(const std::vector<SqlExprNode>& nodes, int32_t index,
     const int score = (idx->primaryKey() || idx->unique()) ? 3 : 2;
     if (score > best.score) {
         best.kind = JoinPathChoice::Kind::IndexNestedLoop;
-        best.index = idx;
+        best.indexId = idx->indexId;
+        best.indexName = idx->name;
         best.probeOrdinal = sources[leftSource].baseOrdinal + leftLocal;
         best.indexType = rightColumn.type;
         best.score = score;
@@ -955,7 +1116,8 @@ bool runJoinStep(const BoundSource& right, SqlJoinType type,
                  const BoundPredicate& on, const JoinPathChoice& path,
                  std::vector<std::vector<DbValue> >& current, size_t leftWidth,
                  SqlJoinDiagnostics& diag, SqlError& error, uint32_t line,
-                 uint32_t column, Database& db) {
+                 uint32_t column, Database& db,
+                 const std::vector<DbValue>* parameters) {
     diag.joinType = (type == SqlJoinType::Left) ? "LEFT JOIN" : "INNER JOIN";
     diag.rightTable = right.tableName;
     diag.rightAlias = right.qualifier;
@@ -965,7 +1127,7 @@ bool runJoinStep(const BoundSource& right, SqlJoinType type,
 
     if (path.kind == JoinPathChoice::Kind::IndexNestedLoop) {
         diag.accessPath = "IndexNestedLoop";
-        diag.indexName = path.index->name;
+        diag.indexName = path.indexName;
         for (size_t li = 0; li < current.size(); ++li) {
             ++diag.leftRowsProcessed;
             const std::vector<DbValue>& leftRow = current[li];
@@ -980,7 +1142,7 @@ bool runJoinStep(const BoundSource& right, SqlJoinType type,
                     if (encodeIndexKey(path.indexType, probe, key)) {
                         ++diag.indexProbes;
                         DbResult result =
-                            db.indexLookup(path.index->indexId, key, locators);
+                            db.indexLookup(path.indexId, key, locators);
                         if (!result.isOk()) {
                             error = executionError(result, line, column);
                             return false;
@@ -1000,7 +1162,10 @@ bool runJoinStep(const BoundSource& right, SqlJoinType type,
                 candidate.reserve(leftRow.size() + rightRow.size());
                 candidate.insert(candidate.end(), leftRow.begin(), leftRow.end());
                 candidate.insert(candidate.end(), rightRow.begin(), rightRow.end());
-                if (on.evaluate(candidate) == SqlTruth::True) {
+                const SqlTruth truth = parameters == nullptr
+                                           ? on.evaluate(candidate)
+                                           : on.evaluate(candidate, *parameters);
+                if (truth == SqlTruth::True) {
                     matched = true;
                     ++diag.matchesEmitted;
                     if (!appendJoinedRow(next, candidate, bytes, error, line,
@@ -1034,7 +1199,10 @@ bool runJoinStep(const BoundSource& right, SqlJoinType type,
                 candidate.insert(candidate.end(), leftRow.begin(), leftRow.end());
                 candidate.insert(candidate.end(), rightRows[ri].begin(),
                                  rightRows[ri].end());
-                if (on.evaluate(candidate) == SqlTruth::True) {
+                const SqlTruth truth = parameters == nullptr
+                                           ? on.evaluate(candidate)
+                                           : on.evaluate(candidate, *parameters);
+                if (truth == SqlTruth::True) {
                     matched = true;
                     ++diag.matchesEmitted;
                     if (!appendJoinedRow(next, candidate, bytes, error, line,
@@ -1356,10 +1524,45 @@ bool resolvePreparedAst(SqlStatementAst& statement,
 
 } // namespace
 
+// Schema-generation-scoped physical choices retained by one prepared
+// statement. It owns identifiers by value and never retains catalog pointers.
+struct PreparedSelectPlan {
+    std::vector<std::unique_ptr<Table> > tables;
+    std::vector<BoundSource> sources;
+    BoundPredicate where;
+    std::vector<BoundPredicate> onPredicates;
+    std::vector<ProjectionItemBound> projection;
+    std::vector<size_t> groupOrdinals;
+    std::vector<OrderTermBound> orderTerms;
+    std::vector<JoinPathChoice> joins;
+    std::vector<SqlColumn> resultColumns;
+    AccessPathChoice baseAccess;
+    bool hasAggregate;
+    bool hasGroup;
+
+    PreparedSelectPlan() : hasAggregate(false), hasGroup(false) {}
+};
+
+struct PreparedDmlPlan {
+    uint32_t tableId;
+    bool hasTable;
+    std::vector<size_t> insertOrdinals;
+    std::vector<size_t> assignmentOrdinals;
+    BoundPredicate predicate;
+    AccessPathChoice targetAccess;
+
+    PreparedDmlPlan() : tableId(0), hasTable(false) {}
+};
+
+struct SqlPreparedPlan {
+    PreparedSelectPlan select;
+    PreparedDmlPlan dml;
+};
+
 SqlPreparedStatement::SqlPreparedStatement()
     : _lifetime(), _statement(), _type(SqlStatementType::Unknown), _parameters(),
-      _bindings(), _isBound(), _resultColumns(), _schemaGeneration(0),
-      _prepared(false) {}
+      _bindings(), _isBound(), _resultColumns(), _plan(), _diagnostics(),
+      _schemaGeneration(0), _prepared(false) {}
 
 SqlPreparedStatement::~SqlPreparedStatement() {}
 
@@ -1368,6 +1571,7 @@ SqlPreparedStatement::SqlPreparedStatement(SqlPreparedStatement&& other) noexcep
       _type(other._type), _parameters(std::move(other._parameters)),
       _bindings(std::move(other._bindings)), _isBound(std::move(other._isBound)),
       _resultColumns(std::move(other._resultColumns)),
+      _plan(std::move(other._plan)), _diagnostics(std::move(other._diagnostics)),
       _schemaGeneration(other._schemaGeneration), _prepared(other._prepared) {
     other._type = SqlStatementType::Unknown;
     other._schemaGeneration = 0;
@@ -1383,6 +1587,8 @@ SqlPreparedStatement& SqlPreparedStatement::operator=(SqlPreparedStatement&& oth
         _bindings = std::move(other._bindings);
         _isBound = std::move(other._isBound);
         _resultColumns = std::move(other._resultColumns);
+        _plan = std::move(other._plan);
+        _diagnostics = std::move(other._diagnostics);
         _schemaGeneration = other._schemaGeneration;
         _prepared = other._prepared;
         other._type = SqlStatementType::Unknown;
@@ -1880,7 +2086,8 @@ SqlError SqlEngine::prepare(const std::string& sql, SqlPreparedStatement& out) {
         }
     }
     std::vector<SqlColumn> resultColumns;
-    if (!inferPreparedMetadata(statement, parameters, resultColumns, error)) {
+    std::shared_ptr<SqlPreparedPlan> plan(new SqlPreparedPlan());
+    if (!inferPreparedMetadata(statement, parameters, resultColumns, plan.get(), error)) {
         return error;
     }
     for (size_t i = 0; i < parameters.size(); ++i) {
@@ -1900,8 +2107,40 @@ SqlError SqlEngine::prepare(const std::string& sql, SqlPreparedStatement& out) {
     out._bindings.assign(out._parameters.size(), DbValue::null());
     out._isBound.assign(out._parameters.size(), false);
     out._resultColumns = std::move(resultColumns);
+    out._plan = std::move(plan);
     out._schemaGeneration = _db.schemaGeneration();
     out._lifetime = _lifetime;
+    out._diagnostics.tokenizeCount = 1;
+    out._diagnostics.parseCount = 1;
+    out._diagnostics.semanticBindCount = 1;
+    out._diagnostics.physicalPlanBuildCount = 1;
+    if (out._type == SqlStatementType::Select) {
+        const AccessPathChoice& access = out._plan->select.baseAccess;
+        out._diagnostics.accessPath = access.kind == AccessPathChoice::Kind::IndexLookup
+                                          ? "IndexLookup"
+                                      : access.kind == AccessPathChoice::Kind::IndexRange
+                                          ? "IndexRange"
+                                          : "FullScan";
+        out._diagnostics.indexId = access.indexId;
+        for (size_t i = 0; i < out._plan->select.joins.size(); ++i) {
+            const JoinPathChoice& join = out._plan->select.joins[i];
+            out._diagnostics.joinAccessPaths.push_back(
+                join.kind == JoinPathChoice::Kind::IndexNestedLoop
+                    ? "IndexNestedLoop" : "NestedLoop");
+            out._diagnostics.joinIndexIds.push_back(join.indexId);
+        }
+    } else if (out._type == SqlStatementType::Update ||
+               out._type == SqlStatementType::Delete) {
+        const AccessPathChoice& access = out._plan->dml.targetAccess;
+        out._diagnostics.accessPath = access.kind == AccessPathChoice::Kind::IndexLookup
+                                          ? "IndexLookup"
+                                      : access.kind == AccessPathChoice::Kind::IndexRange
+                                          ? "IndexRange"
+                                          : "FullScan";
+        out._diagnostics.indexId = access.indexId;
+    } else {
+        out._diagnostics.accessPath = "Insert";
+    }
     out._prepared = true;
     return SqlError();
 }
@@ -1909,7 +2148,7 @@ SqlError SqlEngine::prepare(const std::string& sql, SqlPreparedStatement& out) {
 bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
                                       std::vector<SqlParameterInfo>& parameters,
                                       std::vector<SqlColumn>& resultColumns,
-                                      SqlError& error) {
+                                      SqlPreparedPlan* plan, SqlError& error) {
     resultColumns.clear();
     const auto tableOrError = [this, &error](const SqlIdentifier& identifier)
         -> const Catalog::TableRecord* {
@@ -2000,6 +2239,11 @@ bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
                 return false;
             }
         }
+        if (plan != nullptr) {
+            plan->dml.insertOrdinals = ordinals;
+            plan->dml.tableId = table->tableId;
+            plan->dml.hasTable = true;
+        }
         return true;
     }
 
@@ -2010,8 +2254,8 @@ bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
                                              : statement.deleteStatement.table;
         const Catalog::TableRecord* table = tableOrError(tableName);
         if (table == nullptr) return false;
+        std::vector<size_t> assigned;
         if (statement.type == SqlStatementType::Update) {
-            std::vector<size_t> assigned;
             for (size_t i = 0; i < statement.update.assignments.size(); ++i) {
                 const SqlAssignmentAst& item = statement.update.assignments[i];
                 size_t ordinal = 0;
@@ -2054,31 +2298,49 @@ bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
             !validatePreparedPredicate(predicate, resolver, parameters, error)) {
             return false;
         }
+        if (plan != nullptr) {
+            std::vector<DbType> parameterTypes(parameters.size(), DbType::Unknown);
+            for (size_t i = 0; i < parameters.size(); ++i)
+                parameterTypes[i] = parameters[i].type;
+            if (!plan->dml.predicate.bind(predicate.nodes,
+                                          predicate.present ? predicate.root : -1,
+                                          resolver, parameterTypes, error)) {
+                return false;
+            }
+            plan->dml.assignmentOrdinals = assigned;
+            plan->dml.tableId = table->tableId;
+            plan->dml.hasTable = true;
+            plan->dml.targetAccess = selectPreparedAccessPath(
+                predicate, table->columns, _db, table->tableId, parameterTypes);
+        }
         return true;
     }
 
     if (statement.type == SqlStatementType::Select) {
         const SqlSelectAst& ast = statement.select;
         std::vector<BoundSource> sources;
-        const auto appendSource = [this, &sources, &error](const SqlTableRefAst& ref,
-                                                          bool outerNullable) {
-            const Catalog::TableRecord* table = _db.catalog().findTable(ref.table.name);
-            if (table == nullptr) {
-                error = makeSemantic("unknown table '" + ref.table.name + "'",
-                                     ref.table.line, ref.table.column);
+        if (plan != nullptr) plan->select.tables.reserve(1 + ast.joins.size());
+        const auto appendSource = [this, &sources, &error, plan](const SqlTableRefAst& ref,
+                                                           bool outerNullable) {
+            std::unique_ptr<Table> opened;
+            DbResult openResult = _db.openTable(ref.table.name, opened);
+            if (!openResult.isOk()) {
+                error = errorFromResult(openResult, ref.table.line, ref.table.column);
                 return false;
             }
             BoundSource source;
             source.tableName = ref.table.name;
             source.qualifier = ref.hasAlias ? ref.alias.name : ref.table.name;
-            source.columns = &table->columns;
+            source.table = opened.get();
+            source.columns = &opened->columns();
             source.baseOrdinal = sources.empty()
                                     ? 0
                                     : sources.back().baseOrdinal +
                                           sources.back().columnCount;
-            source.columnCount = static_cast<uint32_t>(table->columns.size());
+            source.columnCount = static_cast<uint32_t>(source.columns->size());
             source.outerNullable = outerNullable;
             sources.push_back(source);
+            if (plan != nullptr) plan->select.tables.push_back(std::move(opened));
             return true;
         };
         if (!appendSource(ast.from, false)) return false;
@@ -2121,6 +2383,27 @@ bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
                                       DbType::Int64, false, true, ast.line,
                                       ast.column, error)) {
             return false;
+        }
+
+        std::vector<DbType> parameterTypes(parameters.size(), DbType::Unknown);
+        for (size_t i = 0; i < parameters.size(); ++i)
+            parameterTypes[i] = parameters[i].type;
+        if (plan != nullptr) {
+            if (!plan->select.where.bind(ast.where.nodes,
+                                         ast.where.present ? ast.where.root : -1,
+                                         resolver, parameterTypes, error)) {
+                return false;
+            }
+            plan->select.onPredicates.resize(ast.joins.size());
+            for (size_t i = 0; i < ast.joins.size(); ++i) {
+                std::vector<BoundSource> prefix(sources.begin(), sources.begin() + i + 2);
+                SourceColumnResolver onResolver(prefix);
+                if (!plan->select.onPredicates[i].bind(
+                        ast.joins[i].on.nodes, ast.joins[i].on.root, onResolver,
+                        parameterTypes, error)) {
+                    return false;
+                }
+            }
         }
 
         std::vector<ProjectionItemBound> projection;
@@ -2182,44 +2465,116 @@ bool SqlEngine::inferPreparedMetadata(const SqlStatementAst& statement,
         }
 
         const bool hasGroup = !groupOrdinals.empty();
+        std::vector<OrderTermBound> orderTerms;
         for (size_t i = 0; i < ast.orderBy.size(); ++i) {
-            const SqlIdentifier& identifier = ast.orderBy[i].column;
-            bool projectionMatch = false;
-            if (!identifier.hasQualifier) {
+            const SqlOrderTermAst& term = ast.orderBy[i];
+            OrderTermBound bound;
+            bound.descending = term.descending;
+            bool matchedProjection = false;
+            if (!term.column.hasQualifier) {
+                size_t projectionIndex = 0;
+                size_t matches = 0;
                 for (size_t p = 0; p < projection.size(); ++p) {
-                    if (projection[p].name == identifier.name) {
-                        projectionMatch = true;
+                    if (projection[p].name == term.column.name) {
+                        ++matches;
+                        projectionIndex = p;
+                    }
+                }
+                if (matches == 1) {
+                    bound.useProjection = true;
+                    bound.ordinal = projectionIndex;
+                    bound.type = projection[projectionIndex].type;
+                    matchedProjection = true;
+                } else if (matches > 1) {
+                    error = makeSemantic("ambiguous ORDER BY name '" +
+                                             term.column.name +
+                                             "'; use a unique projection alias",
+                                         term.column.line, term.column.column);
+                    return false;
+                }
+            }
+
+            bool resolved = false;
+            size_t sourceOrdinal = 0;
+            DbType sourceType = DbType::Unknown;
+            if (!matchedProjection) {
+                resolved = resolver.resolveColumn(term.column, sourceOrdinal,
+                                                   sourceType, error);
+                if (resolved) {
+                    for (size_t p = 0; p < projection.size(); ++p) {
+                        if (projection[p].kind == SqlProjectionKind::Column &&
+                            projection[p].ordinal == sourceOrdinal) {
+                            bound.useProjection = true;
+                            bound.ordinal = p;
+                            bound.type = projection[p].type;
+                            matchedProjection = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!matchedProjection && (hasAggregate || hasGroup) && !ast.distinct &&
+                resolved) {
+                for (size_t g = 0; g < groupOrdinals.size(); ++g) {
+                    if (groupOrdinals[g] == sourceOrdinal) {
+                        bound.useProjection = false;
+                        bound.ordinal = g;
+                        bound.type = sourceType;
+                        matchedProjection = true;
                         break;
                     }
                 }
             }
-            size_t ordinal = 0;
-            DbType type = DbType::Unknown;
-            if (!projectionMatch && !resolver.resolveColumn(identifier, ordinal, type,
-                                                              error)) {
-                return false;
-            }
-            if (!projectionMatch && (ast.distinct || hasAggregate || hasGroup)) {
-                bool grouped = std::find(groupOrdinals.begin(), groupOrdinals.end(),
-                                         ordinal) != groupOrdinals.end();
-                if (!grouped || ast.distinct) {
+            if (!matchedProjection) {
+                if (ast.distinct || hasAggregate || hasGroup) {
                     error = makeSemantic(
                         "ORDER BY must reference a projected column or alias in a DISTINCT or aggregate query",
-                        identifier.line, identifier.column);
+                        term.column.line, term.column.column);
                     return false;
                 }
+                if (!resolved) return false;
+                if (sourceType == DbType::Blob) {
+                    error = makeSemantic("ORDER BY is not supported for Blob column '" +
+                                             term.column.name + "'",
+                                         term.column.line, term.column.column);
+                    return false;
+                }
+                bound.useProjection = false;
+                bound.ordinal = sourceOrdinal;
+                bound.type = sourceType;
             }
-            if (!projectionMatch && type == DbType::Blob) {
-                error = makeSemantic("ORDER BY is not supported for Blob column '" +
-                                         identifier.name + "'",
-                                     identifier.line, identifier.column);
-                return false;
-            }
+            orderTerms.push_back(bound);
         }
 
         for (size_t i = 0; i < projection.size(); ++i) {
             resultColumns.push_back(SqlColumn(projection[i].name, projection[i].type,
                                               projection[i].nullable));
+        }
+        if (plan != nullptr) {
+            plan->select.sources = sources;
+            plan->select.projection = projection;
+            plan->select.groupOrdinals = groupOrdinals;
+            plan->select.orderTerms = orderTerms;
+            plan->select.hasAggregate = hasAggregate;
+            plan->select.hasGroup = hasGroup;
+            plan->select.resultColumns = resultColumns;
+            if (sources.size() == 1) {
+                plan->select.baseAccess = selectPreparedAccessPath(
+                    ast.where, *sources[0].columns, _db,
+                    sources[0].table->tableId(), parameterTypes);
+            }
+            plan->select.joins.resize(ast.joins.size());
+            for (size_t i = 0; i < ast.joins.size(); ++i) {
+                considerJoinCandidate(ast.joins[i].on.nodes,
+                                      ast.joins[i].on.root, sources, i + 1,
+                                      _db, plan->select.joins[i]);
+                if (_forceNestedLoop) {
+                    plan->select.joins[i].kind = JoinPathChoice::Kind::NestedLoop;
+                    plan->select.joins[i].indexId = 0;
+                    plan->select.joins[i].indexName.clear();
+                    plan->select.joins[i].score = 0;
+                }
+            }
         }
         return true;
     }
@@ -2263,9 +2618,22 @@ SqlStatementResult SqlEngine::executePrepared(SqlPreparedStatement& statement) {
         }
     }
 
+    if (statement._diagnostics.executionCount != 0)
+        ++statement._diagnostics.physicalPlanReuseCount;
+    ++statement._diagnostics.executionCount;
+
     SqlStatementAst resolved = statement._statement;
     resolvePreparedAst(resolved, statement._bindings);
     ExecContext context;
+    if (statement._plan && statement._plan->dml.hasTable) {
+        // Table owns mutable tail-page cache state. Keep the prepared plan
+        // bound to a stable table ID, but create a fresh Table facade for each
+        // execution so no page locator or heap-tail cache survives DML.
+        context.preparedDmlTable.reset(
+            new Table(_db, statement._plan->dml.tableId));
+    }
+    context.preparedPlan = statement._plan.get();
+    context.parameterValues = &statement._bindings;
     executeStatement(resolved, context, result);
     return result;
 }
@@ -2495,8 +2863,12 @@ bool SqlEngine::executeCreateIndex(const SqlCreateIndexAst& ast,
 bool SqlEngine::executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
                               SqlStatementResult& out) {
     SqlError error;
-    Table* table =
-        openTableCached(ast.table.name, ctx, error, ast.table.line, ast.table.column);
+    const bool prepared = ctx.preparedPlan != nullptr &&
+                          ctx.preparedPlan->dml.hasTable;
+    Table* table = prepared
+                       ? ctx.preparedDmlTable.get()
+                       : openTableCached(ast.table.name, ctx, error,
+                                         ast.table.line, ast.table.column);
     if (table == nullptr) {
         out.error = error;
         return false;
@@ -2506,7 +2878,9 @@ bool SqlEngine::executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
 
     // SQL8: resolve column list to ordinals.
     std::vector<size_t> ordinals;
-    if (ast.hasColumnList) {
+    if (prepared) {
+        ordinals = ctx.preparedPlan->dml.insertOrdinals;
+    } else if (ast.hasColumnList) {
         if (ast.columnList.empty()) {
             out.error = makeSemantic("empty column list", ast.table.line, ast.table.column);
             return false;
@@ -2621,60 +2995,66 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
 
     // ---- 1. Bind relation sources (FROM plus every JOIN). ------------------
     std::vector<BoundSource> sources;
-    sources.reserve(1 + ast.joins.size());
-    {
-        Table* table = openTableCached(ast.from.table.name, ctx, error,
-                                       ast.from.table.line, ast.from.table.column);
-        if (table == nullptr) {
-            out.error = error;
-            return false;
-        }
-        BoundSource source;
-        source.tableName = ast.from.table.name;
-        source.qualifier =
-            ast.from.hasAlias ? ast.from.alias.name : ast.from.table.name;
-        source.table = table;
-        source.columns = &table->columns();
-        source.baseOrdinal = 0;
-        source.columnCount = static_cast<uint32_t>(source.columns->size());
-        source.outerNullable = false;
-        sources.push_back(source);
-    }
-    for (size_t i = 0; i < ast.joins.size(); ++i) {
-        const SqlTableRefAst& ref = ast.joins[i].table;
-        Table* table = openTableCached(ref.table.name, ctx, error, ref.table.line,
-                                       ref.table.column);
-        if (table == nullptr) {
-            out.error = error;
-            return false;
-        }
-        BoundSource source;
-        source.tableName = ref.table.name;
-        source.qualifier = ref.hasAlias ? ref.alias.name : ref.table.name;
-        source.table = table;
-        source.columns = &table->columns();
-        source.baseOrdinal = sources.back().baseOrdinal + sources.back().columnCount;
-        source.columnCount = static_cast<uint32_t>(source.columns->size());
-        source.outerNullable = (ast.joins[i].type == SqlJoinType::Left);
-        sources.push_back(source);
-    }
-
-    // Self-joins require distinct aliases: qualifiers are query-source
-    // identifiers and must be unique within the SELECT scope.
-    for (size_t i = 0; i < sources.size(); ++i) {
-        for (size_t j = i + 1; j < sources.size(); ++j) {
-            if (sources[i].qualifier == sources[j].qualifier) {
-                uint32_t line = ast.line;
-                uint32_t column = ast.column;
-                if (j >= 1 && j - 1 < ast.joins.size()) {
-                    line = ast.joins[j - 1].line;
-                    column = ast.joins[j - 1].column;
-                }
-                out.error = makeSemantic(
-                    "duplicate relation alias '" + sources[i].qualifier +
-                        "'; every joined source needs a unique alias",
-                    line, column);
+    const bool hasPreparedPlan = ctx.preparedPlan != nullptr &&
+                                 ctx.preparedPlan->select.sources.size() ==
+                                     1 + ast.joins.size();
+    if (hasPreparedPlan) {
+        sources = ctx.preparedPlan->select.sources;
+    } else {
+        sources.reserve(1 + ast.joins.size());
+        {
+            Table* table = openTableCached(ast.from.table.name, ctx, error,
+                                           ast.from.table.line, ast.from.table.column);
+            if (table == nullptr) {
+                out.error = error;
                 return false;
+            }
+            BoundSource source;
+            source.tableName = ast.from.table.name;
+            source.qualifier =
+                ast.from.hasAlias ? ast.from.alias.name : ast.from.table.name;
+            source.table = table;
+            source.columns = &table->columns();
+            source.baseOrdinal = 0;
+            source.columnCount = static_cast<uint32_t>(source.columns->size());
+            source.outerNullable = false;
+            sources.push_back(source);
+        }
+        for (size_t i = 0; i < ast.joins.size(); ++i) {
+            const SqlTableRefAst& ref = ast.joins[i].table;
+            Table* table = openTableCached(ref.table.name, ctx, error, ref.table.line,
+                                           ref.table.column);
+            if (table == nullptr) {
+                out.error = error;
+                return false;
+            }
+            BoundSource source;
+            source.tableName = ref.table.name;
+            source.qualifier = ref.hasAlias ? ref.alias.name : ref.table.name;
+            source.table = table;
+            source.columns = &table->columns();
+            source.baseOrdinal = sources.back().baseOrdinal + sources.back().columnCount;
+            source.columnCount = static_cast<uint32_t>(source.columns->size());
+            source.outerNullable = (ast.joins[i].type == SqlJoinType::Left);
+            sources.push_back(source);
+        }
+
+        // Self-joins require distinct aliases: qualifiers are query-local.
+        for (size_t i = 0; i < sources.size(); ++i) {
+            for (size_t j = i + 1; j < sources.size(); ++j) {
+                if (sources[i].qualifier == sources[j].qualifier) {
+                    uint32_t line = ast.line;
+                    uint32_t column = ast.column;
+                    if (j >= 1 && j - 1 < ast.joins.size()) {
+                        line = ast.joins[j - 1].line;
+                        column = ast.joins[j - 1].column;
+                    }
+                    out.error = makeSemantic(
+                        "duplicate relation alias '" + sources[i].qualifier +
+                            "'; every joined source needs a unique alias",
+                        line, column);
+                    return false;
+                }
             }
         }
     }
@@ -2683,13 +3063,15 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
 
     // ---- 2. Bind WHERE and ON predicates. ---------------------------------
     BoundPredicate where;
-    if (!where.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
-                    resolver, error)) {
+    if (hasPreparedPlan) where = ctx.preparedPlan->select.where;
+    else if (!where.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                         resolver, error)) {
         out.error = error;
         return false;
     }
     std::vector<BoundPredicate> onPredicates(ast.joins.size());
-    for (size_t i = 0; i < ast.joins.size(); ++i) {
+    if (hasPreparedPlan) onPredicates = ctx.preparedPlan->select.onPredicates;
+    else for (size_t i = 0; i < ast.joins.size(); ++i) {
         // ON may only reference the relations joined so far plus the current
         // right relation (left-deep scope).
         std::vector<BoundSource> prefix(sources.begin(), sources.begin() + i + 2);
@@ -2704,7 +3086,10 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
     // ---- 3. Bind projection. ----------------------------------------------
     std::vector<ProjectionItemBound> projection;
     bool hasAggregate = false;
-    if (ast.star) {
+    if (hasPreparedPlan) {
+        projection = ctx.preparedPlan->select.projection;
+        hasAggregate = ctx.preparedPlan->select.hasAggregate;
+    } else if (ast.star) {
         for (size_t s = 0; s < sources.size(); ++s) {
             const BoundSource& source = sources[s];
             for (size_t j = 0; j < source.columns->size(); ++j) {
@@ -2747,7 +3132,8 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
 
     // ---- 4. Bind GROUP BY and validate grouped projections. ---------------
     std::vector<size_t> groupOrdinals;
-    for (size_t i = 0; i < ast.groupBy.size(); ++i) {
+    if (hasPreparedPlan) groupOrdinals = ctx.preparedPlan->select.groupOrdinals;
+    else for (size_t i = 0; i < ast.groupBy.size(); ++i) {
         size_t ordinal = 0;
         DbType type = DbType::Unknown;
         if (!resolver.resolveColumn(ast.groupBy[i], ordinal, type, error)) {
@@ -2756,8 +3142,10 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
         }
         groupOrdinals.push_back(ordinal);
     }
-    const bool hasGroup = !groupOrdinals.empty();
-    if (hasAggregate || hasGroup) {
+    const bool hasGroup = hasPreparedPlan
+                              ? ctx.preparedPlan->select.hasGroup
+                              : !groupOrdinals.empty();
+    if (!hasPreparedPlan && (hasAggregate || hasGroup)) {
         for (size_t p = 0; p < projection.size(); ++p) {
             if (projection[p].kind != SqlProjectionKind::Column) {
                 continue;
@@ -2781,7 +3169,8 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
 
     // ---- 5. Bind ORDER BY. ------------------------------------------------
     std::vector<OrderTermBound> orderTerms;
-    for (size_t i = 0; i < ast.orderBy.size(); ++i) {
+    if (hasPreparedPlan) orderTerms = ctx.preparedPlan->select.orderTerms;
+    else for (size_t i = 0; i < ast.orderBy.size(); ++i) {
         const SqlOrderTermAst& term = ast.orderBy[i];
         OrderTermBound bound;
         bound.descending = term.descending;
@@ -2877,8 +3266,11 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
     {
         const BoundSource& base = sources[0];
         if (sources.size() == 1) {
-            AccessPathChoice path = selectAccessPath(ast.where, *base.columns, _db,
-                                                     base.table->tableId());
+            AccessPathChoice path = hasPreparedPlan
+                ? accessPathForExecution(ctx.preparedPlan->select.baseAccess,
+                                         ctx.parameterValues)
+                : selectAccessPath(ast.where, *base.columns, _db,
+                                   base.table->tableId());
             std::unique_ptr<RowSource> source;
             if (path.kind == AccessPathChoice::Kind::FullScan) {
                 std::unique_ptr<TableScan> scan;
@@ -2896,16 +3288,19 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
                 const DbType indexType = (*base.columns)[path.columnOrdinal].type;
                 if (path.kind == AccessPathChoice::Kind::IndexLookup) {
                     std::vector<uint8_t> key;
-                    if (!encodeIndexKey(indexType, path.value, key)) {
+                    if (path.value.isNull()) {
+                        // SQL equality against NULL is UNKNOWN for every row.
+                    } else if (!encodeIndexKey(indexType, path.value, key)) {
                         out.error = makeSemantic("value cannot be indexed", ast.line,
                                                  ast.column);
                         return false;
+                    } else {
+                        result = _db.indexLookup(path.indexId, key, locators);
                     }
-                    result = _db.indexLookup(path.index->indexId, key, locators);
                     out.accessPath = "IndexLookup";
                 } else {
                     IndexRangeBound bound;
-                    switch (path.op) {
+                    if (!path.value.isNull()) switch (path.op) {
                     case SqlCompareOp::Lt:
                         bound.hasUpper = true;
                         bound.upperInclusive = false;
@@ -2929,7 +3324,8 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
                     default:
                         break;
                     }
-                    result = _db.indexRange(path.index->indexId, bound, locators);
+                    if (!path.value.isNull())
+                        result = _db.indexRange(path.indexId, bound, locators);
                     out.accessPath = "IndexRange";
                 }
                 if (!result.isOk()) {
@@ -2937,7 +3333,7 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
                                                 ast.from.table.column);
                     return false;
                 }
-                out.accessIndexName = path.index->name;
+                out.accessIndexName = path.indexName;
                 out.candidateRowsVisited = static_cast<uint64_t>(locators.size());
                 source.reset(new LocatorRowSource(base.table, locators));
             }
@@ -2969,18 +3365,23 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
     for (size_t i = 0; i < ast.joins.size(); ++i) {
         const size_t rightIndex = i + 1;
         JoinPathChoice path;
-        considerJoinCandidate(ast.joins[i].on.nodes, ast.joins[i].on.root, sources,
-                              rightIndex, _db, path);
-        if (_forceNestedLoop) {
+        if (hasPreparedPlan && i < ctx.preparedPlan->select.joins.size()) {
+            path = ctx.preparedPlan->select.joins[i];
+        } else {
+            considerJoinCandidate(ast.joins[i].on.nodes, ast.joins[i].on.root,
+                                  sources, rightIndex, _db, path);
+        }
+        if (!hasPreparedPlan && _forceNestedLoop) {
             path.kind = JoinPathChoice::Kind::NestedLoop;
-            path.index = nullptr;
+            path.indexId = 0;
+            path.indexName.clear();
             path.score = 0;
         }
         SqlJoinDiagnostics diag;
         const size_t leftWidth = sources[rightIndex].baseOrdinal;
         if (!runJoinStep(sources[rightIndex], ast.joins[i].type, onPredicates[i],
                          path, current, leftWidth, diag, error, ast.joins[i].line,
-                         ast.joins[i].column, _db)) {
+                         ast.joins[i].column, _db, ctx.parameterValues)) {
             out.error = error;
             return false;
         }
@@ -2991,7 +3392,11 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
     if (ast.where.present) {
         std::vector<std::vector<DbValue> > filtered;
         for (size_t i = 0; i < current.size(); ++i) {
-            if (where.evaluate(current[i]) == SqlTruth::True) {
+            const SqlTruth truth = ctx.parameterValues == nullptr
+                                       ? where.evaluate(current[i])
+                                       : where.evaluate(current[i],
+                                                        *ctx.parameterValues);
+            if (truth == SqlTruth::True) {
                 filtered.push_back(current[i]);
             }
         }
@@ -3001,7 +3406,8 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
     // ---- 9. Result-column metadata. ---------------------------------------
     std::vector<SqlColumn> resultColumns;
     resultColumns.reserve(projection.size());
-    for (size_t p = 0; p < projection.size(); ++p) {
+    if (hasPreparedPlan) resultColumns = ctx.preparedPlan->select.resultColumns;
+    else for (size_t p = 0; p < projection.size(); ++p) {
         resultColumns.push_back(SqlColumn(projection[p].name, projection[p].type,
                                           projection[p].nullable));
     }
@@ -3236,8 +3642,12 @@ bool SqlEngine::applyMutationPlan(Table* table, ExecContext& ctx,
 bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
                               SqlStatementResult& out) {
     SqlError error;
-    Table* table =
-        openTableCached(ast.table.name, ctx, error, ast.table.line, ast.table.column);
+    const bool prepared = ctx.preparedPlan != nullptr &&
+                          ctx.preparedPlan->dml.hasTable;
+    Table* table = prepared
+                       ? ctx.preparedDmlTable.get()
+                       : openTableCached(ast.table.name, ctx, error,
+                                         ast.table.line, ast.table.column);
     if (table == nullptr) {
         out.error = error;
         return false;
@@ -3247,13 +3657,17 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
     // Statement-level semantic validation before any row is touched.
     std::vector<size_t> assignmentOrdinals;
     std::vector<DbValue> assignmentValues;
+    if (prepared)
+        assignmentOrdinals = ctx.preparedPlan->dml.assignmentOrdinals;
     for (size_t i = 0; i < ast.assignments.size(); ++i) {
         const SqlAssignmentAst& assignment = ast.assignments[i];
-        size_t found = columns.size();
-        for (size_t j = 0; j < columns.size(); ++j) {
-            if (columns[j].name == assignment.column.name) {
-                found = j;
-                break;
+        size_t found = prepared ? assignmentOrdinals[i] : columns.size();
+        if (!prepared) {
+            for (size_t j = 0; j < columns.size(); ++j) {
+                if (columns[j].name == assignment.column.name) {
+                    found = j;
+                    break;
+                }
             }
         }
         if (found == columns.size()) {
@@ -3262,13 +3676,15 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
                 assignment.column.line, assignment.column.column);
             return false;
         }
-        for (size_t k = 0; k < assignmentOrdinals.size(); ++k) {
-            if (assignmentOrdinals[k] == found) {
-                out.error = makeSemantic(
-                    "column '" + assignment.column.name +
-                        "' is assigned more than once",
-                    assignment.column.line, assignment.column.column);
-                return false;
+        if (!prepared) {
+            for (size_t k = 0; k < assignmentOrdinals.size(); ++k) {
+                if (assignmentOrdinals[k] == found) {
+                    out.error = makeSemantic(
+                        "column '" + assignment.column.name +
+                            "' is assigned more than once",
+                        assignment.column.line, assignment.column.column);
+                    return false;
+                }
             }
         }
         std::vector<DbValue> coerced;
@@ -3276,31 +3692,38 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
             out.error = error;
             return false;
         }
-        assignmentOrdinals.push_back(found);
+        if (!prepared) assignmentOrdinals.push_back(found);
         assignmentValues.push_back(coerced[0]);
     }
 
     BoundPredicate predicate;
-    if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
-                        columns, error)) {
+    if (prepared) predicate = ctx.preparedPlan->dml.predicate;
+    else if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                             columns, error)) {
         out.error = error;
         return false;
     }
 
-    std::unique_ptr<TableScan> scan;
-    DbResult result = table->scanStart(scan);
-    if (!result.isOk()) {
-        out.error = errorFromResult(result, ast.table.line, ast.table.column);
-        return false;
+    const AccessPathChoice preparedAccess = prepared
+        ? accessPathForExecution(ctx.preparedPlan->dml.targetAccess,
+                                 ctx.parameterValues)
+        : AccessPathChoice();
+    if (prepared) {
+        out.accessPath = preparedAccess.kind == AccessPathChoice::Kind::IndexLookup
+                             ? "IndexLookup"
+                         : preparedAccess.kind == AccessPathChoice::Kind::IndexRange
+                             ? "IndexRange" : "FullScan";
+        out.accessIndexName = preparedAccess.indexName;
     }
 
     std::vector<RowMutation> plan;
     size_t planBytes = 0;
-    std::vector<DbValue> row;
-    while (scan->next(row)) {
-        if (predicate.evaluate(row) != SqlTruth::True) {
-            continue;
-        }
+    const auto addTarget = [&](const std::vector<DbValue>& row,
+                               const RowLocator& locator) {
+        const SqlTruth truth = prepared
+                                   ? predicate.evaluate(row, *ctx.parameterValues)
+                                   : predicate.evaluate(row);
+        if (truth != SqlTruth::True) return true;
         if (plan.size() >= kSqlMaxMutationTargets) {
             out.error = makeSemantic(
                 "UPDATE target set exceeds the SQL5 row limit", ast.line, ast.column);
@@ -3308,8 +3731,7 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
             return false;
         }
         RowMutation mutation;
-        mutation.locator =
-            RowLocator(scan->currentPageId(), scan->currentSlotIndex());
+        mutation.locator = locator;
         mutation.deleted = false;
         mutation.values = row;
         for (size_t i = 0; i < assignmentOrdinals.size(); ++i) {
@@ -3323,10 +3745,45 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
             return false;
         }
         plan.push_back(std::move(mutation));
-    }
-    if (!scan->status().isOk()) {
-        out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
-        return false;
+        return true;
+    };
+
+    if (prepared && preparedAccess.kind != AccessPathChoice::Kind::FullScan) {
+        std::vector<RowLocator> locators;
+        DbResult lookup = collectAccessPathLocators(
+            _db, ctx.preparedPlan->dml.targetAccess, ctx.parameterValues,
+            columns[preparedAccess.columnOrdinal].type, locators);
+        if (!lookup.isOk()) {
+            out.error = errorFromResult(lookup, ast.table.line, ast.table.column);
+            return false;
+        }
+        for (size_t i = 0; i < locators.size(); ++i) {
+            std::vector<DbValue> row;
+            DbResult fetched = table->fetchRow(locators[i], row);
+            if (!fetched.isOk()) {
+                out.error = errorFromResult(fetched, ast.table.line, ast.table.column);
+                return false;
+            }
+            if (!addTarget(row, locators[i])) return false;
+        }
+    } else {
+        std::unique_ptr<TableScan> scan;
+        DbResult result = table->scanStart(scan);
+        if (!result.isOk()) {
+            out.error = errorFromResult(result, ast.table.line, ast.table.column);
+            return false;
+        }
+        std::vector<DbValue> row;
+        while (scan->next(row)) {
+            if (!addTarget(row, RowLocator(scan->currentPageId(),
+                                           scan->currentSlotIndex()))) {
+                return false;
+            }
+        }
+        if (!scan->status().isOk()) {
+            out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
+            return false;
+        }
     }
 
     out.objectName = ast.table.name;
@@ -3344,8 +3801,12 @@ bool SqlEngine::executeUpdate(const SqlUpdateAst& ast, ExecContext& ctx,
 bool SqlEngine::executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
                               SqlStatementResult& out) {
     SqlError error;
-    Table* table =
-        openTableCached(ast.table.name, ctx, error, ast.table.line, ast.table.column);
+    const bool prepared = ctx.preparedPlan != nullptr &&
+                          ctx.preparedPlan->dml.hasTable;
+    Table* table = prepared
+                       ? ctx.preparedDmlTable.get()
+                       : openTableCached(ast.table.name, ctx, error,
+                                         ast.table.line, ast.table.column);
     if (table == nullptr) {
         out.error = error;
         return false;
@@ -3353,25 +3814,27 @@ bool SqlEngine::executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
     const std::vector<ColumnDefinition>& columns = table->columns();
 
     BoundPredicate predicate;
-    if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
-                        columns, error)) {
+    if (prepared) predicate = ctx.preparedPlan->dml.predicate;
+    else if (!predicate.bind(ast.where.nodes, ast.where.present ? ast.where.root : -1,
+                             columns, error)) {
         out.error = error;
         return false;
     }
 
-    std::unique_ptr<TableScan> scan;
-    DbResult result = table->scanStart(scan);
-    if (!result.isOk()) {
-        out.error = errorFromResult(result, ast.table.line, ast.table.column);
-        return false;
+    const AccessPathChoice preparedAccess = prepared
+        ? accessPathForExecution(ctx.preparedPlan->dml.targetAccess,
+                                 ctx.parameterValues)
+        : AccessPathChoice();
+    if (prepared) {
+        out.accessPath = preparedAccess.kind == AccessPathChoice::Kind::IndexLookup
+                             ? "IndexLookup"
+                         : preparedAccess.kind == AccessPathChoice::Kind::IndexRange
+                             ? "IndexRange" : "FullScan";
+        out.accessIndexName = preparedAccess.indexName;
     }
 
     std::vector<RowMutation> plan;
-    std::vector<DbValue> row;
-    while (scan->next(row)) {
-        if (predicate.evaluate(row) != SqlTruth::True) {
-            continue;
-        }
+    const auto addTarget = [&](const RowLocator& locator) {
         if (plan.size() >= kSqlMaxMutationTargets) {
             out.error = makeSemantic(
                 "DELETE target set exceeds the SQL5 row limit", ast.line, ast.column);
@@ -3379,14 +3842,53 @@ bool SqlEngine::executeDelete(const SqlDeleteAst& ast, ExecContext& ctx,
             return false;
         }
         RowMutation mutation;
-        mutation.locator =
-            RowLocator(scan->currentPageId(), scan->currentSlotIndex());
+        mutation.locator = locator;
         mutation.deleted = true;
         plan.push_back(mutation);
-    }
-    if (!scan->status().isOk()) {
-        out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
-        return false;
+        return true;
+    };
+
+    const auto matchesTarget = [&](const std::vector<DbValue>& row) {
+        const SqlTruth truth = prepared
+                                   ? predicate.evaluate(row, *ctx.parameterValues)
+                                   : predicate.evaluate(row);
+        return truth == SqlTruth::True;
+    };
+    if (prepared && preparedAccess.kind != AccessPathChoice::Kind::FullScan) {
+        std::vector<RowLocator> locators;
+        DbResult lookup = collectAccessPathLocators(
+            _db, ctx.preparedPlan->dml.targetAccess, ctx.parameterValues,
+            columns[preparedAccess.columnOrdinal].type, locators);
+        if (!lookup.isOk()) {
+            out.error = errorFromResult(lookup, ast.table.line, ast.table.column);
+            return false;
+        }
+        for (size_t i = 0; i < locators.size(); ++i) {
+            std::vector<DbValue> row;
+            DbResult fetched = table->fetchRow(locators[i], row);
+            if (!fetched.isOk()) {
+                out.error = errorFromResult(fetched, ast.table.line, ast.table.column);
+                return false;
+            }
+            if (matchesTarget(row) && !addTarget(locators[i])) return false;
+        }
+    } else {
+        std::unique_ptr<TableScan> scan;
+        DbResult result = table->scanStart(scan);
+        if (!result.isOk()) {
+            out.error = errorFromResult(result, ast.table.line, ast.table.column);
+            return false;
+        }
+        std::vector<DbValue> row;
+        while (scan->next(row)) {
+            if (matchesTarget(row) &&
+                !addTarget(RowLocator(scan->currentPageId(),
+                                      scan->currentSlotIndex()))) return false;
+        }
+        if (!scan->status().isOk()) {
+            out.error = errorFromResult(scan->status(), ast.table.line, ast.table.column);
+            return false;
+        }
     }
 
     out.objectName = ast.table.name;

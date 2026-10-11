@@ -4,21 +4,60 @@
 
 SQL9 adds a caller-owned prepared-statement API above the SQL1–SQL8 executor.
 Prepared statements are runtime objects. SQL text containing parameters is
-tokenized and parsed once when `SqlEngine::prepare()` is called; repeated
-`execute()` calls bind copied typed values into a copy of the retained AST and
-then use the normal SQL executor, relational APIs, transaction layer,
-constraints, indexes, savepoints, and WAL path. Parameter values are never
-written into SQL text or sent back through the tokenizer.
-
-This implementation reuses the parsed statement and its inferred parameter
-and result metadata. The current executor still binds predicates and selects
-the physical access path on every execution. It does **not** yet retain a
-pre-bound physical plan, so access-path reuse is a remaining SQL9 acceptance
-gap. Global SQL text caches and persistent plans are not implemented.
+tokenized and parsed once when `SqlEngine::prepare()` is called. The original
+SQL9 implementation reused the AST and metadata but selected access paths on
+every execution; SQL9R closes that plan-reuse gap as described below. Parameter
+values are never written into SQL text or sent back through the tokenizer.
 
 No `.gxdb`, catalog, heap, B+ tree, or WAL format changed. Prepared statements
 are local to one `SqlEngine` and are not thread-safe. Use one engine and its
 statements from one thread at a time.
+
+## SQL9R: bound physical plan reuse
+
+Preparation builds a statement-local plan with four distinct parts:
+
+1. **Parsed AST.** The single parsed statement retains parameter ordinals.
+2. **Semantic bindings.** The plan binds table IDs, column ordinals, predicate
+   types, projection and result metadata, JOIN relations, aggregate outputs,
+   GROUP BY columns, and ORDER BY terms.
+3. **Physical access plan.** It retains the chosen FullScan, IndexLookup, or
+   IndexRange path, the selected index ID and key column, plus each JOIN step's
+   NestedLoop or IndexNestedLoop choice and index ID.
+4. **Per-execution state.** Every call gets fresh parameter values, encoded
+   search keys, scans, JOIN candidates, aggregate/group state, result rows,
+   LIMIT/OFFSET counters, row locators, mutation plans, and statement savepoints.
+
+While the captured schema generation remains current, rebinding values does
+not rebuild the physical plan. Runtime values supply the current index key and
+predicate operands to the retained descriptors. A NULL lookup keeps the same
+plan and returns no rows for `column = NULL`, consistent with SQL three-valued
+logic.
+
+Prepared INSERT/UPDATE/DELETE retain the table ID and column ordinals. They
+create a fresh table facade per execution and rediscover matching rows through
+the retained index or scan choice. They do not retain row locators or physical
+page pointers. Every execution still checks current transaction-visible rows,
+foreign keys, uniqueness, defaults, and the existing statement savepoint and
+WAL path.
+
+`SqlPreparedStatement::diagnostics()` exposes per-statement
+`tokenizeCount`, `parseCount`, `semanticBindCount`,
+`physicalPlanBuildCount`, `executionCount`, and `physicalPlanReuseCount`, along
+with the selected access path and index IDs. The SQL9R test suite checks one
+plan across 5,000 changing indexed SELECT keys, plus range, JOIN, aggregate,
+UPDATE/DELETE reuse and a mixed workload exceeding 5,000 prepared executions.
+
+Prepared DML crash matrices use the SQL3 byte-budgeted file provider. They
+destroy the engine/database state, reopen the persisted files, and check that
+recovery exposes exactly the pre-commit or post-commit rows and valid indexes.
+Prepared statements add no WAL record types or on-disk format changes.
+
+Prepare-time validation covers value-driven DML and SELECT semantics. DDL
+syntax is parsed at prepare time, but catalog-dependent DDL checks such as an
+unknown target, duplicate object, or drop dependency remain execution-time
+checks. This SQL9R repair does not move those checks or perform data-dependent
+constraint validation at prepare time.
 
 ## Prepare one statement
 
@@ -127,13 +166,11 @@ There is no automatic reprepare after a schema change.
 
 ## Access paths, diagnostics, and security
 
-Prepared execution uses the ordinary SQL6/SQL7 planner and exposes the same
-`accessPath`, index name, and join diagnostics as ordinary SQL. A bound
-primary-key value can therefore use `IndexLookup`, ranges can use
-`IndexRange`, and equality joins can use `IndexNestedLoop`. This implementation
-re-runs that lightweight physical selection for each execution rather than
-retaining it in the prepared object; this is the principal remaining plan-reuse
-gap.
+Prepared execution exposes the selected `accessPath`, index name, and join
+diagnostics as ordinary SQL does. A bound primary-key value can use
+`IndexLookup`, ranges can use `IndexRange`, and equality joins can use
+`IndexNestedLoop`. `physicalPlanBuildCount` distinguishes the single planning
+pass from repeated execution.
 
 The prepared object retains an AST containing explicit parameter ordinals.
 Execution copies that AST and converts those nodes to typed in-memory literal
@@ -147,10 +184,6 @@ Text value is data and cannot become another statement.
 - Parameters in identifiers, type names, schema objects, or DDL defaults.
 - Multi-statement prepare, persistent plans, and a global plan cache.
 - Automatic reprepare, fine-grained schema dependencies, or concurrent use.
-- Full physical plan caching and reuse across repeated execution.
-- Prepared-specific SQL3 crash fault matrices have not yet been added; prepared
-  mutations use the existing executor and WAL path, but SQL9-specific crash
-  recovery proof remains outstanding.
 - Native guideXOS VFS and .NET/REXX bindings.
 
 Prepared DDL without parameters can be parsed and executed. Some DDL semantic

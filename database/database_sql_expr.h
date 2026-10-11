@@ -66,16 +66,26 @@ public:
     bool bind(const std::vector<SqlExprNode>& nodes, int32_t root,
               const SqlColumnResolver& resolver, SqlError& error);
 
+    // Prepared SQL9 path: parameter nodes are bound by ordinal and declared
+    // type. Runtime values are supplied to evaluate() without changing this
+    // schema-bound predicate.
+    bool bind(const std::vector<SqlExprNode>& nodes, int32_t root,
+              const SqlColumnResolver& resolver,
+              const std::vector<DbType>& parameterTypes, SqlError& error);
+
     bool isBound() const { return _bound; }
 
     // Evaluates the bound predicate for one decoded row. Only safe after a
     // successful bind().
     SqlTruth evaluate(const std::vector<DbValue>& row) const;
+    SqlTruth evaluate(const std::vector<DbValue>& row,
+                      const std::vector<DbValue>& parameters) const;
 
 private:
     enum class Kind {
         Column,
         Literal,
+        Parameter,
         Compare,
         And,
         Or,
@@ -87,6 +97,7 @@ private:
         Kind kind;
         // Column
         size_t ordinal;
+        uint32_t parameterOrdinal;
         DbType type;
         // Literal
         DbValue literal;
@@ -101,20 +112,25 @@ private:
         int32_t right;
 
         Node()
-            : kind(Kind::Literal), ordinal(0), type(DbType::Unknown),
+            : kind(Kind::Literal), ordinal(0), parameterOrdinal(0),
+              type(DbType::Unknown),
               compareOp(SqlCompareOp::Eq), compareType(DbType::Unknown),
               alwaysUnknown(false), negated(false), left(-1), right(-1) {}
     };
 
     bool bindInternal(const std::vector<SqlExprNode>& nodes, int32_t root,
-                      const SqlColumnResolver& resolver, SqlError& error);
+                      const SqlColumnResolver& resolver,
+                      const std::vector<DbType>* parameterTypes,
+                      SqlError& error);
     bool bindNode(const std::vector<SqlExprNode>& nodes, int32_t index,
                   const SqlColumnResolver& resolver, int32_t& outIndex,
-                  SqlError& error);
+                  const std::vector<DbType>* parameterTypes, SqlError& error);
     bool isTruthNode(int32_t index) const;
 
-    SqlTruth evalTruth(int32_t index, const std::vector<DbValue>& row) const;
-    DbValue evalValue(int32_t index, const std::vector<DbValue>& row) const;
+    SqlTruth evalTruth(int32_t index, const std::vector<DbValue>& row,
+                       const std::vector<DbValue>& parameters) const;
+    DbValue evalValue(int32_t index, const std::vector<DbValue>& row,
+                      const std::vector<DbValue>& parameters) const;
 
     std::vector<Node> _nodes;
     int32_t _root;
