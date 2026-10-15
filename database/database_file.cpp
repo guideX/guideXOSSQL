@@ -82,7 +82,7 @@ DbResult DatabaseFile::fail(DbStatus status, const std::string& message) {
     return _lastError;
 }
 
-void DatabaseFile::refreshDiagnostics() {
+DbResult DatabaseFile::refreshDiagnostics() {
     _diagnostics.open = _open;
     _diagnostics.readOnly = _readOnly;
     _diagnostics.formatMajor = _header.formatMajor;
@@ -91,8 +91,19 @@ void DatabaseFile::refreshDiagnostics() {
     _diagnostics.pageCount = _header.pageCount;
     _diagnostics.rootPageId = _header.rootPageId;
     _diagnostics.databaseId = formatDatabaseId(_header.databaseId);
-    _diagnostics.fileSizeBytes = _file ? _file->size() : 0;
+    if (_file) {
+        uint64_t fileSize = 0;
+        DbResult sizeResult = _file->getSize(fileSize);
+        if (!sizeResult.isOk()) {
+            return fail(DbStatus::IoError,
+                        "failed to query database file size: " + sizeResult.describe());
+        }
+        _diagnostics.fileSizeBytes = fileSize;
+    } else {
+        _diagnostics.fileSizeBytes = 0;
+    }
     _diagnostics.state = _lastError.status();
+    return DbResult::ok();
 }
 
 bool DatabaseFile::computePageOffset(uint64_t pageId, uint64_t& outOffset) const {
@@ -234,7 +245,12 @@ DbResult DatabaseFile::create(std::unique_ptr<IDatabaseFile> file,
         return result;
     }
 
-    db->refreshDiagnostics();
+    result = db->refreshDiagnostics();
+    if (!result.isOk()) {
+        (void)db->_file->close();
+        db->_open = false;
+        return result;
+    }
     out = std::move(db);
     return DbResult::ok();
 }
@@ -252,7 +268,12 @@ DbResult DatabaseFile::open(std::unique_ptr<IDatabaseFile> file,
     db->_readOnly = options.readOnly;
     db->_headerDirty = false;
 
-    const uint64_t fileSize = db->_file->size();
+    uint64_t fileSize = 0;
+    DbResult sizeResult = db->_file->getSize(fileSize);
+    if (!sizeResult.isOk()) {
+        return db->fail(DbStatus::IoError,
+                        "failed to query database file size: " + sizeResult.describe());
+    }
     db->_diagnostics.fileSizeBytes = fileSize;
     if (fileSize < kHeaderSize) {
         return db->fail(DbStatus::Truncated, "file smaller than database header");
@@ -276,50 +297,75 @@ DbResult DatabaseFile::open(std::unique_ptr<IDatabaseFile> file,
     if (!checkedMulU64(header.pageCount, static_cast<uint64_t>(pageSize), requiredBytes)) {
         return db->fail(DbStatus::CorruptHeader, "page count overflows file size");
     }
-    if (fileSize < requiredBytes) {
-        return db->fail(DbStatus::Truncated, "file smaller than allocated page count");
-    }
-    if (fileSize % pageSize != 0) {
-        return db->fail(DbStatus::CorruptHeader, "file size is not page aligned");
-    }
-    // A larger file means uncommitted orphan pages from an interrupted write;
-    // they are ignored and reused by the next append.
-
-    std::vector<uint8_t> rootBytes;
-    result = db->readPageBytes(header.rootPageId, rootBytes);
-    if (!result.isOk()) {
-        return db->fail(result.status(), result.message());
-    }
-
-    DatabasePage root;
-    result = DatabasePage::parse(rootBytes.data(), pageSize, header.rootPageId, root);
-    if (!result.isOk()) {
-        return db->fail(result.status(), result.message());
-    }
-    result = db->validateBootstrap(root);
-    if (!result.isOk()) {
-        return db->fail(result.status(), result.message());
-    }
-
-    if (options.validateAllPages) {
-        for (uint64_t pageId = 1; pageId < header.pageCount; ++pageId) {
-            std::vector<uint8_t> bytes;
-            result = db->readPageBytes(pageId, bytes);
-            if (!result.isOk()) {
-                return db->fail(result.status(), result.message());
-            }
-            DatabasePage page;
-            result = DatabasePage::parse(bytes.data(), pageSize, pageId, page);
-            if (!result.isOk()) {
-                return db->fail(result.status(), result.message());
-            }
+    if (!options.deferPageValidationForWalRecovery) {
+        result = db->validateOpenedPages(options.validateAllPages);
+        if (!result.isOk()) {
+            return result;
         }
     }
 
     db->_headerDirty = false;
-    db->refreshDiagnostics();
+    result = db->refreshDiagnostics();
+    if (!result.isOk()) {
+        return result;
+    }
     out = std::move(db);
     return DbResult::ok();
+}
+
+DbResult DatabaseFile::getFileSize(uint64_t& outSize) {
+    if (!_open || !_file) {
+        return DbResult::error(DbStatus::NotOpen, "database file is not open");
+    }
+    DbResult result = _file->getSize(outSize);
+    if (!result.isOk()) {
+        return fail(DbStatus::IoError,
+                    "failed to query database file size: " + result.describe());
+    }
+    return DbResult::ok();
+}
+
+DbResult DatabaseFile::validateOpenedPages(bool validateAllPages) {
+    if (!_open || !_file) {
+        return DbResult::error(DbStatus::NotOpen, "database file is not open");
+    }
+    uint64_t fileSize = 0;
+    DbResult result = getFileSize(fileSize);
+    if (!result.isOk()) return result;
+    _diagnostics.fileSizeBytes = fileSize;
+
+    uint64_t requiredBytes = 0;
+    if (!checkedMulU64(_header.pageCount, static_cast<uint64_t>(_header.pageSize),
+                       requiredBytes)) {
+        return fail(DbStatus::CorruptHeader, "page count overflows file size");
+    }
+    if (fileSize < requiredBytes) {
+        return fail(DbStatus::Truncated, "file smaller than allocated page count");
+    }
+    if (fileSize % _header.pageSize != 0) {
+        return fail(DbStatus::CorruptHeader, "file size is not page aligned");
+    }
+
+    std::vector<uint8_t> rootBytes;
+    result = readPageBytes(_header.rootPageId, rootBytes);
+    if (!result.isOk()) return fail(result.status(), result.message());
+    DatabasePage root;
+    result = DatabasePage::parse(rootBytes.data(), _header.pageSize, _header.rootPageId, root);
+    if (!result.isOk()) return fail(result.status(), result.message());
+    result = validateBootstrap(root);
+    if (!result.isOk()) return fail(result.status(), result.message());
+
+    if (validateAllPages) {
+        for (uint64_t pageId = 1; pageId < _header.pageCount; ++pageId) {
+            std::vector<uint8_t> bytes;
+            result = readPageBytes(pageId, bytes);
+            if (!result.isOk()) return fail(result.status(), result.message());
+            DatabasePage page;
+            result = DatabasePage::parse(bytes.data(), _header.pageSize, pageId, page);
+            if (!result.isOk()) return fail(result.status(), result.message());
+        }
+    }
+    return refreshDiagnostics();
 }
 
 DbResult DatabaseFile::close() {
@@ -330,11 +376,11 @@ DbResult DatabaseFile::close() {
     if (!_readOnly && _headerDirty) {
         result = flush();
     }
-    _file->close();
+    DbResult closeResult = _file->close();
     _open = false;
     _headerDirty = false;
     _diagnostics.open = false;
-    return result;
+    return result.isOk() ? closeResult : result;
 }
 
 DbResult DatabaseFile::readPage(uint64_t pageId, DatabasePage& out) {
@@ -431,8 +477,7 @@ DbResult DatabaseFile::allocatePage(PageType type, uint64_t& outPageId) {
     _header.pageCount = newPageId + 1;
     _headerDirty = true;
     outPageId = newPageId;
-    refreshDiagnostics();
-    return DbResult::ok();
+    return refreshDiagnostics();
 }
 
 DbResult DatabaseFile::setPageCount(uint64_t pageCount) {
@@ -451,8 +496,7 @@ DbResult DatabaseFile::setPageCount(uint64_t pageCount) {
     }
     _header.pageCount = pageCount;
     _headerDirty = true;
-    refreshDiagnostics();
-    return DbResult::ok();
+    return refreshDiagnostics();
 }
 
 DbResult DatabaseFile::applyHeaderImage(const DatabaseHeader& image) {
@@ -475,8 +519,7 @@ DbResult DatabaseFile::applyHeaderImage(const DatabaseHeader& image) {
     _header.pageCount = image.pageCount;
     _header.rootPageId = image.rootPageId;
     _headerDirty = true;
-    refreshDiagnostics();
-    return DbResult::ok();
+    return refreshDiagnostics();
 }
 
 DbResult DatabaseFile::flush() {
@@ -499,7 +542,10 @@ DbResult DatabaseFile::flush() {
     if (!_file->flush()) {
         return fail(DbStatus::IoError, "failed to flush database file");
     }
-    refreshDiagnostics();
+    DbResult diagnosticsResult = refreshDiagnostics();
+    if (!diagnosticsResult.isOk()) {
+        return diagnosticsResult;
+    }
     return DbResult::ok();
 }
 

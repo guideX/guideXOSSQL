@@ -1,5 +1,6 @@
 #include "database_relational.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -135,15 +136,23 @@ DbResult Database::allocatePage(PageType, uint64_t&) {
                            "the committed page view cannot allocate pages");
 }
 
-DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem) {
-    _diagnostics.walPresent = fileSystem.exists(_walPath);
+DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
+                                     bool validateAllPages) {
+    DbResult lookup = fileSystem.exists(_walPath, _diagnostics.walPresent);
+    if (!lookup.isOk()) {
+        return DbResult::error(DbStatus::IoError,
+                               "WAL path lookup failed: " + lookup.describe());
+    }
     if (!_diagnostics.walPresent) {
         _diagnostics.walState = WalState::Absent;
         _nextTxId = 1;
-        return DbResult::ok();
+        return _file->validateOpenedPages(validateAllPages);
     }
 
     std::unique_ptr<IDatabaseFile> walFile = fileSystem.createFile();
+    if (!walFile) {
+        return DbResult::error(DbStatus::Internal, "file-system provider returned no WAL file");
+    }
     const FileOpenMode mode = _readOnly ? FileOpenMode::ReadOnly : FileOpenMode::ReadWrite;
     DbResult result = walFile->open(_walPath, mode, false);
     if (!result.isOk()) {
@@ -183,14 +192,38 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem) {
             _wal.reset();
             return DbResult::error(DbStatus::RecoveryFailed, result.message());
         }
-    } else if ((state == WalState::Incomplete || state == WalState::Clean) && !_readOnly) {
-        // Discard any incomplete tail and normalize the header.
+    } else if (state == WalState::Incomplete && !_readOnly) {
+        // Do not discard an incomplete WAL until the base file is independently
+        // valid. In particular, a partial page with no complete committed redo
+        // image is not evidence that its bytes may be dropped.
+        result = _file->validateOpenedPages(validateAllPages);
+        if (!result.isOk()) {
+            return result;
+        }
         result = _wal->checkpoint();
         if (!result.isOk()) {
             _wal.reset();
             return result;
         }
         _diagnostics.walState = WalState::Clean;
+    } else if (state == WalState::Clean && !_readOnly) {
+        // A clean checkpoint needs no rewrite. Avoid changing its bytes during
+        // ordinary reopen so the clean state is idempotent.
+        result = _file->validateOpenedPages(validateAllPages);
+        if (!result.isOk()) {
+            return result;
+        }
+    } else if (state == WalState::Incomplete || state == WalState::Clean) {
+        result = _file->validateOpenedPages(validateAllPages);
+        if (!result.isOk()) {
+            if (result.status() == DbStatus::Truncated ||
+                result.status() == DbStatus::CorruptHeader) {
+                return DbResult::error(DbStatus::RecoveryRequired,
+                                       "base file has an incomplete page extent; writable "
+                                       "recovery evidence is unavailable");
+            }
+            return result;
+        }
     }
     return DbResult::ok();
 }
@@ -204,7 +237,12 @@ DbResult Database::ensureWalOpen() {
     }
     IDatabaseFileSystem& filesystem = _fileSystem ? *_fileSystem : defaultFileSystem();
     std::unique_ptr<IDatabaseFile> walFile = filesystem.createFile();
-    const bool exists = filesystem.exists(_walPath);
+    bool exists = false;
+    DbResult lookup = filesystem.exists(_walPath, exists);
+    if (!lookup.isOk()) {
+        return DbResult::error(DbStatus::IoError,
+                               "WAL path lookup failed: " + lookup.describe());
+    }
     const FileOpenMode mode = exists ? FileOpenMode::ReadWrite : FileOpenMode::Create;
     DbResult result = walFile->open(_walPath, mode, mode == FileOpenMode::Create);
     if (!result.isOk()) {
@@ -221,6 +259,9 @@ DbResult Database::ensureWalOpen() {
 }
 
 DbResult Database::applyRecovery(const std::vector<WalTransaction>& transactions) {
+    DbResult result = validateRecoveryCoverage(transactions);
+    if (!result.isOk()) return result;
+
     uint64_t redone = 0;
     for (size_t i = 0; i < transactions.size(); ++i) {
         const WalTransaction& tx = transactions[i];
@@ -238,18 +279,75 @@ DbResult Database::applyRecovery(const std::vector<WalTransaction>& transactions
             ++redone;
         }
     }
-    DbResult result = _file->flush();
+    result = _file->flush();
     if (!result.isOk()) {
         return result;
     }
-    result = _wal->checkpoint();
+    result = _file->validateOpenedPages(true);
     if (!result.isOk()) {
         return result;
     }
-    _diagnostics.walState = WalState::Clean;
-    _diagnostics.recoveryRequired = false;
     _diagnostics.pagesRedone = redone;
     _diagnostics.lastRecoveryResult = "redo applied";
+    return DbResult::ok();
+}
+
+DbResult Database::validateRecoveryCoverage(
+    const std::vector<WalTransaction>& transactions) {
+    uint64_t fileSize = 0;
+    DbResult result = _file->getFileSize(fileSize);
+    if (!result.isOk()) return result;
+
+    uint64_t finalPageCount = _file->pageCount();
+    std::vector<uint64_t> pageImages;
+    for (size_t i = 0; i < transactions.size(); ++i) {
+        const WalTransaction& tx = transactions[i];
+        if (tx.hasHeaderImage) {
+            if (tx.headerImage.pageSize != _file->pageSize() ||
+                std::memcmp(tx.headerImage.databaseId, _file->header().databaseId, 16) != 0 ||
+                tx.headerImage.pageCount < finalPageCount) {
+                return DbResult::error(DbStatus::WalCorrupt,
+                                       "recovery header images are incompatible or regress page count");
+            }
+            finalPageCount = tx.headerImage.pageCount;
+        }
+        for (size_t j = 0; j < tx.pages.size(); ++j) {
+            pageImages.push_back(tx.pages[j].pageId);
+        }
+    }
+
+    uint64_t requiredBytes = 0;
+    if (!checkedMulU64(finalPageCount, static_cast<uint64_t>(_file->pageSize()),
+                       requiredBytes)) {
+        return DbResult::error(DbStatus::WalCorrupt,
+                               "recovery page count overflows the database extent");
+    }
+    if (fileSize % _file->pageSize() != 0 && requiredBytes < fileSize) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "partial tail lies beyond the WAL's logical database extent");
+    }
+
+    const uint64_t firstMissingPage = fileSize / _file->pageSize();
+    if (firstMissingPage == 0 && fileSize < _file->pageSize()) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "partial header page cannot be reconstructed from page images");
+    }
+    if (firstMissingPage < finalPageCount) {
+        const uint64_t missingCount = finalPageCount - firstMissingPage;
+        if (missingCount > pageImages.size()) {
+            return DbResult::error(DbStatus::RecoveryRequired,
+                                   "WAL does not contain every page needed to repair the tail");
+        }
+        for (uint64_t pageId = firstMissingPage; pageId < finalPageCount; ++pageId) {
+            if (std::find(pageImages.begin(), pageImages.end(), pageId) == pageImages.end()) {
+                return DbResult::error(DbStatus::RecoveryRequired,
+                                       "WAL is missing a page image required by the partial tail");
+            }
+        }
+    } else if (fileSize % _file->pageSize() != 0) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "partial trailing bytes are outside all committed pages");
+    }
     return DbResult::ok();
 }
 
@@ -267,7 +365,9 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
             return result;
         }
     } else {
-        DbResult result = DatabaseEngine::openDatabase(path, options, _file, &filesystem);
+        DatabaseOpenOptions storageOptions = options;
+        storageOptions.deferPageValidationForWalRecovery = true;
+        DbResult result = DatabaseEngine::openDatabase(path, storageOptions, _file, &filesystem);
         if (!result.isOk()) {
             return result;
         }
@@ -280,10 +380,15 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
     if (create) {
         // A freshly created database has a new identity; any sidecar WAL from a
         // previous occupant is stale and must not be replayed.
-        filesystem.remove(_walPath);
+        DbResult removeResult = filesystem.remove(_walPath);
+        if (!removeResult.isOk()) {
+            return DbResult::error(DbStatus::RecoveryFailed,
+                                   "failed to remove stale WAL sidecar: " +
+                                       removeResult.describe());
+        }
     }
 
-    DbResult result = openAndRecoverWal(filesystem);
+    DbResult result = openAndRecoverWal(filesystem, options.validateAllPages);
     if (!result.isOk()) {
         _wal.reset();
         _buffer.reset();
@@ -299,6 +404,19 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
         _file->close();
         _file.reset();
         return result;
+    }
+
+    if (!_readOnly && _diagnostics.walState == WalState::Committed) {
+        result = _wal->checkpoint();
+        if (!result.isOk()) {
+            _wal.reset();
+            _buffer.reset();
+            (void)_file->close();
+            _file.reset();
+            return result;
+        }
+        _diagnostics.walState = WalState::Clean;
+        _diagnostics.recoveryRequired = false;
     }
 
     _open = true;
@@ -367,16 +485,17 @@ DbResult Database::close() {
     _activeTx = nullptr;
     _buffer.reset();
     if (_wal) {
-        _wal->close();
+        DbResult walClosed = _wal->close();
         _wal.reset();
+        if (result.isOk() && !walClosed.isOk()) {
+            result = walClosed;
+        }
     }
     DbResult closed = _file->close();
     _file.reset();
     _open = false;
     _catalogDirty = false;
-    if (!result.isOk()) {
-        return result;
-    }
+    if (!result.isOk()) return result;
     return closed;
 }
 
@@ -396,7 +515,9 @@ DbResult Database::flush() {
     if (!result.isOk()) {
         return result;
     }
-    if (_wal && _wal->isOpen()) {
+    if (_wal && _wal->isOpen() &&
+        (_diagnostics.walState != WalState::Clean ||
+         _wal->bytesSinceCheckpoint() != 0)) {
         result = _wal->checkpoint();
         if (!result.isOk()) {
             return result;
@@ -1049,7 +1170,20 @@ void Database::refreshDiagnostics() {
     _diagnostics.transactionModifiedPages =
         _activeTx ? _activeTx->modifiedPageCount() : 0;
     _diagnostics.walPresent = (_wal != nullptr && _wal->isOpen());
-    _diagnostics.walBytes = _wal ? _wal->size() : 0;
+    if (_wal && _wal->isOpen()) {
+        uint64_t walBytes = 0;
+        DbResult sizeResult = _wal->getSize(walBytes);
+        if (sizeResult.isOk()) {
+            _diagnostics.walBytes = walBytes;
+        } else {
+            _diagnostics.walState = WalState::Corrupt;
+            _diagnostics.recoveryRequired = true;
+            _diagnostics.lastRecoveryResult =
+                "failed to query WAL size: " + sizeResult.describe();
+        }
+    } else {
+        _diagnostics.walBytes = 0;
+    }
 
     _diagnostics.tables.clear();
     const std::vector<Catalog::TableRecord>& tables = _catalog.tables();

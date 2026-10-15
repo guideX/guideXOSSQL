@@ -180,10 +180,10 @@ public:
                   bool truncateExisting) override {
         return _inner->open(path, mode, truncateExisting);
     }
-    void close() override { _inner->close(); }
+    DbResult close() override { return _inner->close(); }
     bool isOpen() const override { return _inner->isOpen(); }
     bool isReadOnly() const override { return _inner->isReadOnly(); }
-    uint64_t size() override { return _inner->size(); }
+    DbResult getSize(uint64_t& outSize) override { return _inner->getSize(outSize); }
 
     bool readAt(uint64_t offset, void* buffer, size_t length) override {
         return _inner->readAt(offset, buffer, length);
@@ -226,10 +226,13 @@ public:
     std::unique_ptr<IDatabaseFile> createFile() override {
         return std::unique_ptr<IDatabaseFile>(new BudgetFile(_state));
     }
-    bool exists(const std::string& path) override { return hostFileExists(path); }
-    bool remove(const std::string& path) override {
-        if (!hostFileExists(path)) return true;
-        return std::remove(path.c_str()) == 0;
+    DbResult exists(const std::string& path, bool& outExists) override {
+        HostFileSystem host;
+        return host.exists(path, outExists);
+    }
+    DbResult remove(const std::string& path) override {
+        HostFileSystem host;
+        return host.remove(path);
     }
 
 private:

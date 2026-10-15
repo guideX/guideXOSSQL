@@ -35,11 +35,15 @@ public:
     //   - otherwise creates/truncates it.
     virtual DbResult open(const std::string& path, FileOpenMode mode,
                           bool truncateExisting) = 0;
-    virtual void close() = 0;
+    // Close reports provider errors. Durability decisions must still use an
+    // explicit successful flush before close; callers may not infer success
+    // from object destruction.
+    virtual DbResult close() = 0;
     virtual bool isOpen() const = 0;
     virtual bool isReadOnly() const = 0;
 
-    virtual uint64_t size() = 0;
+    // A failed size query is distinct from a valid zero-byte file.
+    virtual DbResult getSize(uint64_t& outSize) = 0;
 
     // Positional reads/writes. Return false on short/failed I/O or overflow.
     virtual bool readAt(uint64_t offset, void* buffer, size_t length) = 0;
@@ -62,11 +66,12 @@ public:
     // Creates an unopened file object. The caller then calls open().
     virtual std::unique_ptr<IDatabaseFile> createFile() = 0;
 
-    virtual bool exists(const std::string& path) = 0;
+    // On success, outExists describes the directory entry. Lookup failures
+    // must be returned as errors and never treated as absence.
+    virtual DbResult exists(const std::string& path, bool& outExists) = 0;
 
-    // Removes a file if present. Returns true when the file is absent
-    // afterwards.
-    virtual bool remove(const std::string& path) = 0;
+    // Removes a file if present. Success means the path is absent afterwards.
+    virtual DbResult remove(const std::string& path) = 0;
 };
 
 // stdio-backed implementation used by hosted tests and the hosted server.
@@ -80,11 +85,11 @@ public:
 
     DbResult open(const std::string& path, FileOpenMode mode,
                   bool truncateExisting) override;
-    void close() override;
+    DbResult close() override;
     bool isOpen() const override { return _file != nullptr; }
     bool isReadOnly() const override { return _readOnly; }
 
-    uint64_t size() override;
+    DbResult getSize(uint64_t& outSize) override;
     bool readAt(uint64_t offset, void* buffer, size_t length) override;
     bool writeAt(uint64_t offset, const void* buffer, size_t length) override;
     bool truncateTo(uint64_t size) override;
@@ -105,8 +110,8 @@ bool hostFileExists(const std::string& path);
 class HostFileSystem : public IDatabaseFileSystem {
 public:
     std::unique_ptr<IDatabaseFile> createFile() override;
-    bool exists(const std::string& path) override;
-    bool remove(const std::string& path) override;
+    DbResult exists(const std::string& path, bool& outExists) override;
+    DbResult remove(const std::string& path) override;
 };
 
 IDatabaseFileSystem& defaultFileSystem();

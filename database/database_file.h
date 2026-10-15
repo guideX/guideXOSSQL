@@ -52,9 +52,14 @@ struct DatabaseCreateOptions {
 struct DatabaseOpenOptions {
     bool readOnly;
     bool validateAllPages;
+    // Relational SQL3 open defers page-length and page-content validation until
+    // after its WAL has been scanned. Low-level database opens keep this false.
+    bool deferPageValidationForWalRecovery;
     uint32_t bufferCapacity; // 0 => default buffer size
 
-    DatabaseOpenOptions() : readOnly(false), validateAllPages(false), bufferCapacity(0) {}
+    DatabaseOpenOptions()
+        : readOnly(false), validateAllPages(false),
+          deferPageValidationForWalRecovery(false), bufferCapacity(0) {}
 };
 
 class DatabaseFile : public PageAccess {
@@ -96,6 +101,10 @@ public:
     // Durability barrier: writes a dirty header, then flushes the file.
     DbResult flush();
 
+    // Validates the physical page extent and page contents after any WAL redo.
+    DbResult validateOpenedPages(bool validateAllPages);
+    DbResult getFileSize(uint64_t& outSize);
+
     // SQL3: updates the in-memory allocated page count and marks the header
     // dirty. Used by commit/recovery to publish transaction allocations before
     // committed page images are installed. Does not write to the file.
@@ -119,7 +128,7 @@ private:
     DbResult writeHeaderPage();
     DbResult validateBootstrap(const DatabasePage& root);
     bool computePageOffset(uint64_t pageId, uint64_t& outOffset) const;
-    void refreshDiagnostics();
+    DbResult refreshDiagnostics();
 
     std::unique_ptr<IDatabaseFile> _file;
     DatabaseHeader _header;

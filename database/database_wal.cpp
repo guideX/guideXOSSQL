@@ -82,7 +82,11 @@ DbResult WriteAheadLog::fail(DbStatus status, const std::string& message) {
 DbResult WriteAheadLog::open(std::unique_ptr<IDatabaseFile> file,
                              const uint8_t databaseId[16], uint32_t pageSize,
                              bool readOnly) {
-    close();
+    DbResult closeResult = close();
+    if (!closeResult.isOk()) {
+        return fail(DbStatus::IoError, "failed to close prior WAL handle: " +
+                                           closeResult.describe());
+    }
     if (!file || !file->isOpen()) {
         return fail(DbStatus::InvalidArgument, "WAL file must be open");
     }
@@ -97,7 +101,11 @@ DbResult WriteAheadLog::open(std::unique_ptr<IDatabaseFile> file,
     _lastTransactionId = 0;
     _bytesSinceCheckpoint = 0;
 
-    const uint64_t size = _file->size();
+    uint64_t size = 0;
+    DbResult sizeResult = _file->getSize(size);
+    if (!sizeResult.isOk()) {
+        return fail(DbStatus::IoError, "failed to query WAL size: " + sizeResult.describe());
+    }
     if (size < kWalHeaderSize) {
         if (_readOnly) {
             _writeOffset = size;
@@ -127,12 +135,14 @@ DbResult WriteAheadLog::open(std::unique_ptr<IDatabaseFile> file,
     return DbResult::ok();
 }
 
-void WriteAheadLog::close() {
+DbResult WriteAheadLog::close() {
+    DbResult result = DbResult::ok();
     if (_file) {
-        _file->close();
+        result = _file->close();
         _file.reset();
     }
     _writeOffset = 0;
+    return result;
 }
 
 DbResult WriteAheadLog::writeHeader(uint64_t generation, uint64_t lastTransactionId) {
@@ -230,8 +240,11 @@ DbResult WriteAheadLog::sync() {
     return DbResult::ok();
 }
 
-uint64_t WriteAheadLog::size() {
-    return _file ? _file->size() : 0;
+DbResult WriteAheadLog::getSize(uint64_t& outSize) {
+    if (!_file) {
+        return DbResult::error(DbStatus::NotOpen, "WAL is not open");
+    }
+    return _file->getSize(outSize);
 }
 
 DbResult WriteAheadLog::scan(WalState& outState,
@@ -246,7 +259,13 @@ DbResult WriteAheadLog::scan(WalState& outState,
         return DbResult::error(DbStatus::NotOpen, "WAL is not open");
     }
 
-    const uint64_t size = _file->size();
+    uint64_t size = 0;
+    DbResult sizeResult = _file->getSize(size);
+    if (!sizeResult.isOk()) {
+        outState = WalState::Corrupt;
+        outMessage = "failed to query WAL size";
+        return fail(DbStatus::IoError, outMessage + ": " + sizeResult.describe());
+    }
     if (size == 0) {
         outState = WalState::Clean;
         return DbResult::ok();

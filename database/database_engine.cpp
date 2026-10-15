@@ -1,6 +1,5 @@
 #include "database_engine.h"
 
-#include <cstdio>
 #include <utility>
 
 #include "database_endian.h"
@@ -21,18 +20,33 @@ DbResult DatabaseEngine::createDatabase(const std::string& path,
     }
 
     IDatabaseFileSystem& filesystem = fileSystem ? *fileSystem : defaultFileSystem();
-    const bool existedBefore = filesystem.exists(path);
+    bool existedBefore = false;
+    DbResult lookup = filesystem.exists(path, existedBefore);
+    if (!lookup.isOk()) {
+        return DbResult::error(DbStatus::IoError,
+                               "database path lookup failed: " + lookup.describe());
+    }
 
     std::unique_ptr<IDatabaseFile> file = filesystem.createFile();
+    if (!file) {
+        return DbResult::error(DbStatus::Internal, "file-system provider returned no file");
+    }
     DbResult result = file->open(path, FileOpenMode::Create, options.overwriteExisting);
     if (!result.isOk()) {
         return result;
     }
 
     result = DatabaseFile::create(std::move(file), options, out);
-    if (!result.isOk() && !existedBefore) {
-        // We created a partial file; do not leave a broken .gxdb behind.
-        std::remove(path.c_str());
+    if (!result.isOk()) {
+        // Create mode has already created or truncated the provider file. Do
+        // not leave a partial database behind even if the path existed empty
+        // or was deliberately overwritten.
+        DbResult cleanup = filesystem.remove(path);
+        if (!cleanup.isOk()) {
+            return DbResult::error(DbStatus::RecoveryFailed,
+                                   result.describe() + "; provider cleanup failed: " +
+                                       cleanup.describe());
+        }
     }
     return result;
 }
@@ -45,11 +59,20 @@ DbResult DatabaseEngine::openDatabase(const std::string& path,
         return DbResult::error(DbStatus::InvalidArgument, "empty database path");
     }
     IDatabaseFileSystem& filesystem = fileSystem ? *fileSystem : defaultFileSystem();
-    if (!filesystem.exists(path)) {
+    bool exists = false;
+    DbResult lookup = filesystem.exists(path, exists);
+    if (!lookup.isOk()) {
+        return DbResult::error(DbStatus::IoError,
+                               "database path lookup failed: " + lookup.describe());
+    }
+    if (!exists) {
         return DbResult::error(DbStatus::NotDatabase, "no such database file");
     }
 
     std::unique_ptr<IDatabaseFile> file = filesystem.createFile();
+    if (!file) {
+        return DbResult::error(DbStatus::Internal, "file-system provider returned no file");
+    }
     const FileOpenMode mode = options.readOnly ? FileOpenMode::ReadOnly
                                                : FileOpenMode::ReadWrite;
     DbResult result = file->open(path, mode, false);

@@ -125,7 +125,7 @@ public:
     // partially written header is replaced with a fresh clean header.
     DbResult open(std::unique_ptr<IDatabaseFile> file, const uint8_t databaseId[16],
                   uint32_t pageSize, bool readOnly);
-    void close();
+    DbResult close();
     bool isOpen() const { return _file != nullptr; }
     bool isReadOnly() const { return _readOnly; }
 
@@ -146,7 +146,7 @@ public:
     // Truncates to a fresh clean header (generation advanced) and syncs.
     DbResult checkpoint();
 
-    uint64_t size();
+    DbResult getSize(uint64_t& outSize);
     uint64_t bytesSinceCheckpoint() const { return _bytesSinceCheckpoint; }
     uint64_t generation() const { return _generation; }
     uint64_t lastTransactionId() const { return _lastTransactionId; }

@@ -131,6 +131,20 @@ void removeFile(const std::string& path) {
     std::remove(path.c_str());
 }
 
+bool appendPartialTail(const std::string& path, size_t length) {
+    HostDatabaseFile file;
+    if (!file.open(path, FileOpenMode::ReadWrite, false).isOk()) return false;
+    uint64_t size = 0;
+    if (!file.getSize(size).isOk()) return false;
+    std::vector<uint8_t> tail(length);
+    for (size_t i = 0; i < tail.size(); ++i) {
+        tail[i] = static_cast<uint8_t>(0xA5u ^ static_cast<uint8_t>(i * 17u));
+    }
+    const bool wrote = file.writeAt(size, tail.data(), tail.size()) && file.flush();
+    const DbResult closed = file.close();
+    return wrote && closed.isOk();
+}
+
 // ---------------------------------------------------------------------------
 // Byte-budgeted crash-injection backend.
 
@@ -140,12 +154,19 @@ struct BudgetState {
     bool exhausted;     // true once a write was cut short
     bool recording;     // record a boundary offset at the start of every write
     bool pendingCommitRecord;
+    bool failSize;
+    bool failLookup;
+    bool failRemove;
+    bool failClose;
+    uint32_t removeCalls;
     uint64_t durableCommitOffset;
     std::vector<uint64_t> boundaries;
 
     BudgetState()
         : budget(UINT64_MAX), written(0), exhausted(false), recording(false),
-          pendingCommitRecord(false), durableCommitOffset(UINT64_MAX) {}
+          pendingCommitRecord(false), failSize(false), failLookup(false),
+          failRemove(false), failClose(false), removeCalls(0),
+          durableCommitOffset(UINT64_MAX) {}
 
     void freeze() { budget = written; }
 };
@@ -159,10 +180,18 @@ public:
                   bool truncateExisting) override {
         return _inner->open(path, mode, truncateExisting);
     }
-    void close() override { _inner->close(); }
+    DbResult close() override {
+        DbResult result = _inner->close();
+        return _state->failClose
+            ? DbResult::error(DbStatus::IoError, "injected close failure") : result;
+    }
     bool isOpen() const override { return _inner->isOpen(); }
     bool isReadOnly() const override { return _inner->isReadOnly(); }
-    uint64_t size() override { return _inner->size(); }
+    DbResult getSize(uint64_t& outSize) override {
+        return _state->failSize
+            ? DbResult::error(DbStatus::IoError, "injected size failure")
+            : _inner->getSize(outSize);
+    }
 
     bool readAt(uint64_t offset, void* buffer, size_t length) override {
         return _inner->readAt(offset, buffer, length);
@@ -219,10 +248,21 @@ public:
     std::unique_ptr<IDatabaseFile> createFile() override {
         return std::unique_ptr<IDatabaseFile>(new BudgetFile(_state));
     }
-    bool exists(const std::string& path) override { return hostFileExists(path); }
-    bool remove(const std::string& path) override {
-        if (!hostFileExists(path)) return true;
-        return std::remove(path.c_str()) == 0;
+    DbResult exists(const std::string& path, bool& outExists) override {
+        if (_state->failLookup) {
+            outExists = false;
+            return DbResult::error(DbStatus::IoError, "injected lookup failure");
+        }
+        HostFileSystem host;
+        return host.exists(path, outExists);
+    }
+    DbResult remove(const std::string& path) override {
+        ++_state->removeCalls;
+        if (_state->failRemove) {
+            return DbResult::error(DbStatus::IoError, "injected remove failure");
+        }
+        HostFileSystem host;
+        return host.remove(path);
     }
 
 private:
@@ -327,6 +367,114 @@ bool verifySequential(const std::string& path, const std::string& table,
 
 std::string walPath(const std::string& dbPath) {
     return walPathFor(dbPath);
+}
+
+struct PartialTailFixture {
+    std::string path;
+    std::vector<uint8_t> databaseBytes;
+    std::vector<uint8_t> walBytes;
+    uint64_t expectedRows;
+    uint64_t oldPageCount;
+    uint64_t newPageCount;
+    bool indexed;
+};
+
+bool makePartialTailFixture(PartialTailFixture& fixture, bool indexed,
+                            int insertedRows = 500) {
+    fixture.path = uniquePath(indexed ? "partialindex" : "partialwal");
+    fixture.expectedRows = 20u + static_cast<uint64_t>(insertedRows);
+    fixture.indexed = indexed;
+    buildBase(fixture.path, "T", 20);
+
+    if (indexed) {
+        std::unique_ptr<Database> indexDb;
+        DbResult indexOpen = Database::open(fixture.path, DatabaseOpenOptions(), indexDb);
+        if (!indexOpen.isOk() || !indexDb) {
+            std::printf("partial fixture: indexed database open failed: %s\n",
+                        indexOpen.describe().c_str());
+            return false;
+        }
+        const Catalog::TableRecord* table = indexDb->catalog().findTable("T");
+        if (!table) { std::printf("partial fixture: indexed base table missing\n"); return false; }
+        uint32_t indexId = 0;
+        DbResult created = indexDb->createIndex(
+            IndexDefinition("T_ID_RECOVERY", table->tableId, 0, IndexKind::Ordinary), indexId);
+        DbResult indexFlush = created.isOk() ? indexDb->flush() : created;
+        DbResult indexClose = indexDb->close();
+        if (!created.isOk() || !indexFlush.isOk() || !indexClose.isOk()) {
+            std::printf("partial fixture: create index=%s flush=%s close=%s\n",
+                        created.describe().c_str(), indexFlush.describe().c_str(),
+                        indexClose.describe().c_str());
+            return false;
+        }
+    }
+
+    fixture.databaseBytes = readFileBytes(fixture.path);
+    std::shared_ptr<BudgetState> state(new BudgetState());
+    {
+        BudgetFileSystem fs(state);
+        std::unique_ptr<Database> db;
+        DbResult open = Database::open(fixture.path, DatabaseOpenOptions(), db, &fs);
+        if (!open.isOk() || !db) {
+            std::printf("partial fixture: provider open failed: %s\n", open.describe().c_str());
+            return false;
+        }
+        fixture.oldPageCount = db->diagnostics().pageCount;
+        std::unique_ptr<Transaction> tx;
+        DbResult begun = db->beginTransaction(tx);
+        if (!begun.isOk()) { std::printf("partial fixture: begin failed: %s\n", begun.describe().c_str()); return false; }
+        std::unique_ptr<Table> table;
+        DbResult tableOpen = tx->openTable("T", table);
+        if (!tableOpen.isOk()) { std::printf("partial fixture: transaction table open failed: %s\n", tableOpen.describe().c_str()); return false; }
+        for (int i = 0; i < insertedRows; ++i) {
+            DbResult inserted = table->insert(makeRow(20u + static_cast<uint64_t>(i)));
+            if (!inserted.isOk()) {
+                std::printf("partial fixture: insert %d failed: %s\n", i, inserted.describe().c_str());
+                return false;
+            }
+        }
+        DbResult committed = tx->commit();
+        if (!committed.isOk()) { std::printf("partial fixture: commit failed: %s\n", committed.describe().c_str()); return false; }
+        fixture.newPageCount = db->diagnostics().pageCount;
+        uint64_t walSize = 0;
+        DbResult walSizeResult = db->wal().getSize(walSize);
+        if (!walSizeResult.isOk() || walSize <= kWalHeaderSize) {
+            std::printf("partial fixture: WAL size invalid: %s, bytes=%llu\n",
+                        walSizeResult.describe().c_str(), static_cast<unsigned long long>(walSize));
+            return false;
+        }
+        state->freeze();
+        (void)db->close();
+    }
+    fixture.walBytes = readFileBytes(walPath(fixture.path));
+    if (fixture.walBytes.size() <= kWalHeaderSize ||
+        fixture.newPageCount <= fixture.oldPageCount) {
+        std::printf("partial fixture: wal=%zu oldPages=%llu newPages=%llu\n",
+                    fixture.walBytes.size(),
+                    static_cast<unsigned long long>(fixture.oldPageCount),
+                    static_cast<unsigned long long>(fixture.newPageCount));
+        return false;
+    }
+    // Install a deterministic crash image: the pre-transaction database plus
+    // a partial append, while retaining the durable committed WAL snapshot.
+    // Buffer eviction can persist some committed pages before close, which is
+    // valid; restoring this base makes the missing-page repair case explicit.
+    if (!writeFileBytes(fixture.path, fixture.databaseBytes)) {
+        std::printf("partial fixture: cannot restore pre-transaction database image\n");
+        return false;
+    }
+    if (!appendPartialTail(fixture.path, 97)) {
+        std::printf("partial fixture: cannot append partial page tail\n");
+        return false;
+    }
+    fixture.databaseBytes = readFileBytes(fixture.path);
+    return !fixture.databaseBytes.empty();
+}
+
+bool copyPartialTailFixture(const PartialTailFixture& fixture,
+                            const std::string& destination) {
+    return writeFileBytes(destination, fixture.databaseBytes) &&
+           writeFileBytes(walPath(destination), fixture.walBytes);
 }
 
 // Runs an explicit transaction inserting `insertCount` rows starting at `startId`.
@@ -1100,7 +1248,9 @@ void testCommittedWalRecovery() {
             CHECK_STATUS(t->insert(makeRow(static_cast<uint64_t>(30 + i))), DbStatus::Ok);
         }
         CHECK_STATUS(tx->commit(), DbStatus::Ok);
-        CHECK(db->wal().size() > kWalHeaderSize);
+        uint64_t walBytes = 0;
+        CHECK(db->wal().getSize(walBytes).isOk());
+        CHECK(walBytes > kWalHeaderSize);
         state->freeze();
         db->close();
     }
@@ -1120,6 +1270,189 @@ void testCommittedWalRecovery() {
     CHECK(verifySequential(path, "T", 70));
     removeFile(walPath(path));
     removeFile(path);
+}
+
+void testPartialTailRecoveryMatrix() {
+    std::printf("partial trailing-page recovery matrix\n");
+    PartialTailFixture fixture;
+    CHECK(makePartialTailFixture(fixture, false, 600));
+    if (fixture.path.empty() || fixture.walBytes.empty()) return;
+    CHECK(fixture.newPageCount > fixture.oldPageCount);
+
+    const std::vector<uint8_t> partialDatabase = readFileBytes(fixture.path);
+    const std::vector<uint8_t> committedWal = readFileBytes(walPath(fixture.path));
+    CHECK(partialDatabase.size() % kDefaultPageSize != 0);
+
+    // Read-only open reports recovery-required and does not modify either file.
+    {
+        DatabaseOpenOptions ro;
+        ro.readOnly = true;
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(fixture.path, ro, db), DbStatus::RecoveryRequired);
+        CHECK(!db);
+    }
+    CHECK(readFileBytes(fixture.path) == partialDatabase);
+    CHECK(readFileBytes(walPath(fixture.path)) == committedWal);
+
+    // Valid committed page images reconstruct the partial append. Reopen is
+    // idempotent after the WAL checkpoint.
+    {
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(fixture.path, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            CHECK(db->diagnostics().pagesRedone > 0);
+            CHECK(db->diagnostics().walState == WalState::Clean);
+            CHECK_STATUS(db->close(), DbStatus::Ok);
+        }
+    }
+    CHECK(verifySequential(fixture.path, "T", fixture.expectedRows));
+    const std::vector<uint8_t> recoveredDatabase = readFileBytes(fixture.path);
+    const std::vector<uint8_t> checkpointedWal = readFileBytes(walPath(fixture.path));
+    for (int reopen = 0; reopen < 2; ++reopen) {
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(fixture.path, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            CHECK(db->diagnostics().pagesRedone == 0);
+            CHECK_STATUS(db->close(), DbStatus::Ok);
+        }
+        CHECK(readFileBytes(fixture.path) == recoveredDatabase);
+        CHECK(readFileBytes(walPath(fixture.path)) == checkpointedWal);
+    }
+    removeFile(walPath(fixture.path));
+    removeFile(fixture.path);
+
+    // An unexplained partial extension without committed redo evidence is
+    // refused, with both files preserved byte-for-byte.
+    const std::string noCommit = uniquePath("partialnocommit");
+    buildBase(noCommit, "T", 5);
+    CHECK(appendPartialTail(noCommit, 73));
+    const std::vector<uint8_t> noCommitDb = readFileBytes(noCommit);
+    const std::vector<uint8_t> noCommitWal = readFileBytes(walPath(noCommit));
+    std::unique_ptr<Database> noCommitOpen;
+    const DbResult noCommitResult = Database::open(
+        noCommit, DatabaseOpenOptions(), noCommitOpen);
+    CHECK(noCommitResult.status() == DbStatus::CorruptHeader ||
+          noCommitResult.status() == DbStatus::Truncated);
+    CHECK(!noCommitOpen);
+    CHECK(readFileBytes(noCommit) == noCommitDb);
+    CHECK(readFileBytes(walPath(noCommit)) == noCommitWal);
+    removeFile(walPath(noCommit));
+    removeFile(noCommit);
+
+    // A truncated WAL with no complete committed transaction cannot authorize
+    // repairs to the base tail.
+    const std::string truncated = uniquePath("partialtruncatedwal");
+    CHECK(copyPartialTailFixture(fixture, truncated));
+    std::vector<uint8_t> truncatedWal = fixture.walBytes;
+    truncatedWal.resize(kWalHeaderSize + 5);
+    CHECK(writeFileBytes(walPath(truncated), truncatedWal));
+    const std::vector<uint8_t> truncatedDbSnapshot = readFileBytes(truncated);
+    std::unique_ptr<Database> truncatedOpen;
+    const DbResult truncatedResult = Database::open(
+        truncated, DatabaseOpenOptions(), truncatedOpen);
+    CHECK(truncatedResult.status() == DbStatus::CorruptHeader ||
+          truncatedResult.status() == DbStatus::Truncated);
+    CHECK(!truncatedOpen);
+    CHECK(readFileBytes(truncated) == truncatedDbSnapshot);
+    CHECK(readFileBytes(walPath(truncated)) == truncatedWal);
+    removeFile(walPath(truncated));
+    removeFile(truncated);
+
+    // A bad record checksum is corruption, not evidence that the tail can be
+    // ignored or that the WAL may be cleared.
+    const std::string corrupt = uniquePath("partialcorruptwal");
+    CHECK(copyPartialTailFixture(fixture, corrupt));
+    std::vector<uint8_t> corruptWal = fixture.walBytes;
+    CHECK(corruptWal.size() > kWalHeaderSize + wal_record_offset::TransactionId);
+    corruptWal[kWalHeaderSize + wal_record_offset::TransactionId] ^= 0x40u;
+    CHECK(writeFileBytes(walPath(corrupt), corruptWal));
+    const std::vector<uint8_t> corruptDbSnapshot = readFileBytes(corrupt);
+    std::unique_ptr<Database> corruptOpen;
+    CHECK_STATUS(Database::open(corrupt, DatabaseOpenOptions(), corruptOpen),
+                 DbStatus::WalCorrupt);
+    CHECK(!corruptOpen);
+    CHECK(readFileBytes(corrupt) == corruptDbSnapshot);
+    CHECK(readFileBytes(walPath(corrupt)) == corruptWal);
+    removeFile(walPath(corrupt));
+    removeFile(corrupt);
+
+    // Reusing another database's otherwise valid WAL fails UUID validation.
+    const std::string foreign = uniquePath("partialforeignwal");
+    buildBase(foreign, "T", 20);
+    CHECK(appendPartialTail(foreign, 73));
+    CHECK(writeFileBytes(walPath(foreign), fixture.walBytes));
+    const std::vector<uint8_t> foreignDbSnapshot = readFileBytes(foreign);
+    std::unique_ptr<Database> foreignOpen;
+    CHECK_STATUS(Database::open(foreign, DatabaseOpenOptions(), foreignOpen),
+                 DbStatus::WalDatabaseMismatch);
+    CHECK(!foreignOpen);
+    CHECK(readFileBytes(foreign) == foreignDbSnapshot);
+    CHECK(readFileBytes(walPath(foreign)) == fixture.walBytes);
+    removeFile(walPath(foreign));
+    removeFile(foreign);
+
+    // A header-only WAL represents an interrupted checkpoint with no redo
+    // records. It cannot justify erasing a partial page.
+    const std::string checkpoint = uniquePath("partialcheckpoint");
+    CHECK(copyPartialTailFixture(fixture, checkpoint));
+    std::vector<uint8_t> cleanWal(fixture.walBytes.begin(),
+                                  fixture.walBytes.begin() + kWalHeaderSize);
+    CHECK(writeFileBytes(walPath(checkpoint), cleanWal));
+    const std::vector<uint8_t> checkpointDbSnapshot = readFileBytes(checkpoint);
+    std::unique_ptr<Database> checkpointOpen;
+    const DbResult checkpointResult = Database::open(
+        checkpoint, DatabaseOpenOptions(), checkpointOpen);
+    CHECK(checkpointResult.status() == DbStatus::CorruptHeader ||
+          checkpointResult.status() == DbStatus::Truncated);
+    CHECK(!checkpointOpen);
+    CHECK(readFileBytes(checkpoint) == checkpointDbSnapshot);
+    CHECK(readFileBytes(walPath(checkpoint)) == cleanWal);
+    removeFile(walPath(checkpoint));
+    removeFile(checkpoint);
+
+    // Failure on the first recovery page write returns an error and preserves
+    // the original database and committed WAL.
+    const std::string failedRepair = uniquePath("partialrepairfail");
+    CHECK(copyPartialTailFixture(fixture, failedRepair));
+    const std::vector<uint8_t> failedDbSnapshot = readFileBytes(failedRepair);
+    const std::vector<uint8_t> failedWalSnapshot = readFileBytes(walPath(failedRepair));
+    std::shared_ptr<BudgetState> failedState(new BudgetState());
+    failedState->budget = 0;
+    BudgetFileSystem failedFs(failedState);
+    std::unique_ptr<Database> failedOpen;
+    CHECK_STATUS(Database::open(failedRepair, DatabaseOpenOptions(), failedOpen,
+                                &failedFs), DbStatus::RecoveryFailed);
+    CHECK(!failedOpen);
+    CHECK(readFileBytes(failedRepair) == failedDbSnapshot);
+    CHECK(readFileBytes(walPath(failedRepair)) == failedWalSnapshot);
+    removeFile(walPath(failedRepair));
+    removeFile(failedRepair);
+
+    // The same recovery path preserves heap/index consistency when committed
+    // WAL page images include index growth.
+    PartialTailFixture indexedFixture;
+    CHECK(makePartialTailFixture(indexedFixture, true, 600));
+    {
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(indexedFixture.path, DatabaseOpenOptions(), db),
+                     DbStatus::Ok);
+        if (db) {
+            std::unique_ptr<Table> table;
+            CHECK_STATUS(db->openTable("T", table), DbStatus::Ok);
+            if (table) CHECK(table->rowCount() == indexedFixture.expectedRows);
+            const Catalog::IndexRecord* index = db->catalog().findIndex("T_ID_RECOVERY");
+            CHECK(index != nullptr);
+            if (index) {
+                IndexValidation validation;
+                CHECK_STATUS(db->validateIndex(index->indexId, validation), DbStatus::Ok);
+                CHECK(validation.ok);
+            }
+            CHECK_STATUS(db->close(), DbStatus::Ok);
+        }
+    }
+    CHECK(verifySequential(indexedFixture.path, "T", indexedFixture.expectedRows));
+    removeFile(walPath(indexedFixture.path));
+    removeFile(indexedFixture.path);
 }
 
 void testIncompleteWalDiscard() {
@@ -1345,6 +1678,7 @@ void testWalTruncation() {
 
     // Build a committed WAL and remember the pre-state database bytes.
     const std::vector<uint8_t> baseBytes = readFileBytes(path);
+    const uint64_t initialWalSize = readFileBytes(walPath(path)).size();
     std::shared_ptr<BudgetState> state(new BudgetState());
     BudgetFileSystem fs(state);
     uint64_t commitEnd = 0;
@@ -1359,7 +1693,9 @@ void testWalTruncation() {
             CHECK_STATUS(t->insert(makeRow(static_cast<uint64_t>(20 + i))), DbStatus::Ok);
         }
         CHECK_STATUS(tx->commit(), DbStatus::Ok);
-        commitEnd = state->written;
+        // BudgetState counts writes issued by this test session. A clean WAL
+        // already has its fixed header before the measured transaction.
+        commitEnd = initialWalSize + state->written;
         state->freeze();
         db->close();
     }
@@ -1738,6 +2074,73 @@ void testReadOnlyRecoveryRequired() {
     removeFile(path);
 }
 
+void testProviderErrorChannels() {
+    std::printf("provider size, lookup, cleanup, and close errors\n");
+    const std::string path = uniquePath("providererrors");
+    buildBase(path, "T", 4);
+    const std::vector<uint8_t> before = readFileBytes(path);
+
+    std::shared_ptr<BudgetState> sizeState(new BudgetState());
+    sizeState->failSize = true;
+    BudgetFileSystem sizeFs(sizeState);
+    std::unique_ptr<Database> sizeOpen;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), sizeOpen, &sizeFs),
+                 DbStatus::IoError);
+    CHECK(!sizeOpen);
+    CHECK(readFileBytes(path) == before);
+
+    std::shared_ptr<BudgetState> lookupState(new BudgetState());
+    lookupState->failLookup = true;
+    BudgetFileSystem lookupFs(lookupState);
+    std::unique_ptr<Database> lookupOpen;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), lookupOpen, &lookupFs),
+                 DbStatus::IoError);
+    CHECK(!lookupOpen);
+    CHECK(readFileBytes(path) == before);
+
+    const std::string lookupCreate = uniquePath("providerlookupcreate");
+    std::unique_ptr<Database> lookupCreateDb;
+    CHECK_STATUS(Database::create(lookupCreate, DatabaseCreateOptions(),
+                                  lookupCreateDb, &lookupFs), DbStatus::IoError);
+    CHECK(!lookupCreateDb && !fileExists(lookupCreate));
+
+    // A failed initialization asks the injected provider to remove its partial
+    // database. Injected removal failure is visible and leaves forensic bytes.
+    const std::string cleanup = uniquePath("providercleanup");
+    std::shared_ptr<BudgetState> cleanupState(new BudgetState());
+    cleanupState->budget = 0;
+    cleanupState->failRemove = true;
+    BudgetFileSystem cleanupFs(cleanupState);
+    std::unique_ptr<Database> cleanupDb;
+    CHECK_STATUS(Database::create(cleanup, DatabaseCreateOptions(), cleanupDb,
+                                  &cleanupFs), DbStatus::RecoveryFailed);
+    CHECK(!cleanupDb && cleanupState->removeCalls == 1 && fileExists(cleanup));
+    removeFile(cleanup);
+
+    // A successful COMMIT is durably WAL-flushed before close. A later
+    // close-time error is reported, and reopening still recovers that commit.
+    std::shared_ptr<BudgetState> closeState(new BudgetState());
+    BudgetFileSystem closeFs(closeState);
+    std::unique_ptr<Database> closeDb;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), closeDb, &closeFs),
+                 DbStatus::Ok);
+    if (closeDb) {
+        std::unique_ptr<Transaction> tx;
+        CHECK_STATUS(closeDb->beginTransaction(tx), DbStatus::Ok);
+        std::unique_ptr<Table> table;
+        if (tx) {
+            CHECK_STATUS(tx->openTable("T", table), DbStatus::Ok);
+            if (table) CHECK_STATUS(table->insert(makeRow(4)), DbStatus::Ok);
+            CHECK_STATUS(tx->commit(), DbStatus::Ok);
+        }
+        closeState->failClose = true;
+        CHECK_STATUS(closeDb->close(), DbStatus::IoError);
+    }
+    CHECK(verifySequential(path, "T", 5));
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
 // ---------------------------------------------------------------------------
 // Stress.
 
@@ -1988,6 +2391,7 @@ int main() {
     testUncommittedNeverReachesDb();
     testDirtyBufferCoherence();
     testCommittedWalRecovery();
+    testPartialTailRecoveryMatrix();
     testIncompleteWalDiscard();
     testWalIntegrity();
     testForeignWalDifferentDatabase();
@@ -2002,6 +2406,7 @@ int main() {
     testCrashDuringCheckpoint();
     testRecoveryIdempotence();
     testReadOnlyRecoveryRequired();
+    testProviderErrorChannels();
     testRollbackStress();
     testTransactionLimits();
     testDiagnostics();

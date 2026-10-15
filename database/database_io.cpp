@@ -38,6 +38,23 @@ bool fileExists(const std::string& path) {
     return (info.st_mode & S_IFREG) != 0;
 }
 
+DbResult lookupPath(const std::string& path, bool& outExists) {
+    outExists = false;
+    if (path.empty()) {
+        return DbResult::error(DbStatus::InvalidArgument, "empty file path");
+    }
+    struct stat info;
+    if (stat(path.c_str(), &info) == 0) {
+        outExists = true;
+        return DbResult::ok();
+    }
+    if (errno == ENOENT) {
+        return DbResult::ok();
+    }
+    return DbResult::error(DbStatus::IoError,
+                           std::string("stat failed: ") + std::strerror(errno));
+}
+
 } // namespace
 
 bool hostFileExists(const std::string& path) {
@@ -48,15 +65,24 @@ std::unique_ptr<IDatabaseFile> HostFileSystem::createFile() {
     return std::unique_ptr<IDatabaseFile>(new HostDatabaseFile());
 }
 
-bool HostFileSystem::exists(const std::string& path) {
-    return fileExists(path);
+DbResult HostFileSystem::exists(const std::string& path, bool& outExists) {
+    return lookupPath(path, outExists);
 }
 
-bool HostFileSystem::remove(const std::string& path) {
-    if (!fileExists(path)) {
-        return true;
+DbResult HostFileSystem::remove(const std::string& path) {
+    bool exists = false;
+    DbResult lookup = lookupPath(path, exists);
+    if (!lookup.isOk()) {
+        return lookup;
     }
-    return std::remove(path.c_str()) == 0;
+    if (!exists) {
+        return DbResult::ok();
+    }
+    if (std::remove(path.c_str()) == 0) {
+        return DbResult::ok();
+    }
+    return DbResult::error(DbStatus::IoError,
+                           std::string("remove failed: ") + std::strerror(errno));
 }
 
 IDatabaseFileSystem& defaultFileSystem() {
@@ -67,17 +93,24 @@ IDatabaseFileSystem& defaultFileSystem() {
 HostDatabaseFile::HostDatabaseFile() : _file(nullptr), _readOnly(false) {}
 
 HostDatabaseFile::~HostDatabaseFile() {
-    close();
+    (void)close();
 }
 
 DbResult HostDatabaseFile::open(const std::string& path, FileOpenMode mode,
                                 bool truncateExisting) {
-    close();
+    DbResult closeResult = close();
+    if (!closeResult.isOk()) {
+        return closeResult;
+    }
     if (path.empty()) {
         return DbResult::error(DbStatus::InvalidArgument, "empty file path");
     }
 
-    const bool exists = fileExists(path);
+    bool exists = false;
+    DbResult lookup = lookupPath(path, exists);
+    if (!lookup.isOk()) {
+        return lookup;
+    }
 
     if (mode == FileOpenMode::Create) {
         if (exists && !truncateExisting) {
@@ -107,49 +140,63 @@ DbResult HostDatabaseFile::open(const std::string& path, FileOpenMode mode,
     return DbResult::ok();
 }
 
-void HostDatabaseFile::close() {
+DbResult HostDatabaseFile::close() {
+    int closeStatus = 0;
     if (_file != nullptr) {
-        std::fclose(_file);
+        closeStatus = std::fclose(_file);
         _file = nullptr;
     }
     _readOnly = false;
+    if (closeStatus != 0) {
+        return DbResult::error(DbStatus::IoError,
+                               std::string("fclose failed: ") + std::strerror(errno));
+    }
+    return DbResult::ok();
 }
 
-uint64_t HostDatabaseFile::size() {
+DbResult HostDatabaseFile::getSize(uint64_t& outSize) {
     if (_file == nullptr) {
-        return 0;
+        return DbResult::error(DbStatus::NotOpen, "file is not open");
     }
 #if defined(_WIN32)
     __int64 current = _ftelli64(_file);
     if (current < 0) {
-        return 0;
+        return DbResult::error(DbStatus::IoError, "failed to read current file position");
     }
     if (_fseeki64(_file, 0, SEEK_END) != 0) {
-        return 0;
+        return DbResult::error(DbStatus::IoError, "failed to seek to end of file");
     }
     __int64 end = _ftelli64(_file);
-    _fseeki64(_file, current, SEEK_SET);
-    return end < 0 ? 0 : static_cast<uint64_t>(end);
+    if (end < 0 || _fseeki64(_file, current, SEEK_SET) != 0) {
+        return DbResult::error(DbStatus::IoError, "failed to restore file position");
+    }
+    outSize = static_cast<uint64_t>(end);
 #else
     off_t current = ftello(_file);
     if (current < 0) {
-        return 0;
+        return DbResult::error(DbStatus::IoError, "failed to read current file position");
     }
     if (fseeko(_file, 0, SEEK_END) != 0) {
-        return 0;
+        return DbResult::error(DbStatus::IoError, "failed to seek to end of file");
     }
     off_t end = ftello(_file);
-    fseeko(_file, current, SEEK_SET);
-    return end < 0 ? 0 : static_cast<uint64_t>(end);
+    if (end < 0 || fseeko(_file, current, SEEK_SET) != 0) {
+        return DbResult::error(DbStatus::IoError, "failed to restore file position");
+    }
+    outSize = static_cast<uint64_t>(end);
 #endif
+    return DbResult::ok();
 }
 
 bool HostDatabaseFile::readAt(uint64_t offset, void* buffer, size_t length) {
-    if (_file == nullptr || buffer == nullptr) {
+    if (_file == nullptr || (buffer == nullptr && length != 0)) {
         return false;
     }
     if (length == 0) {
         return true;
+    }
+    if (static_cast<uint64_t>(length) > UINT64_MAX - offset) {
+        return false;
     }
     if (!seekTo(_file, offset)) {
         return false;
@@ -164,6 +211,9 @@ bool HostDatabaseFile::writeAt(uint64_t offset, const void* buffer, size_t lengt
     }
     if (length == 0) {
         return true;
+    }
+    if (buffer == nullptr || static_cast<uint64_t>(length) > UINT64_MAX - offset) {
+        return false;
     }
     if (!seekTo(_file, offset)) {
         return false;

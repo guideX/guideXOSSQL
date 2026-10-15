@@ -179,9 +179,11 @@ private:
     DbResult openImpl(const std::string& path, const DatabaseOpenOptions& options,
                       const DatabaseCreateOptions& createOptions, bool create,
                       IDatabaseFileSystem* fileSystem);
-    DbResult openAndRecoverWal(IDatabaseFileSystem& fileSystem);
+    DbResult openAndRecoverWal(IDatabaseFileSystem& fileSystem,
+                               bool validateAllPages);
     DbResult ensureWalOpen();
     DbResult applyRecovery(const std::vector<WalTransaction>& transactions);
+    DbResult validateRecoveryCoverage(const std::vector<WalTransaction>& transactions);
     void refreshDiagnostics();
 
     std::unique_ptr<DatabaseFile> _file;
