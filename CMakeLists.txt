@@ -137,6 +137,36 @@ else()
 endif()
 add_test(NAME database_native_io_test COMMAND database_native_io_test)
 
+# Keep the portable-runtime primitives independently buildable from the SQL
+# engine; the reference model and fault-injection allocator live in the test.
+add_executable(database_portable_runtime_test
+    database/portable/gx_allocator.cpp
+    database/portable/gx_allocator_hosted.cpp
+    database/portable/gx_array.cpp
+    database/portable/gx_owner.cpp
+    database/portable/gx_string.cpp
+    tests/gx_test_allocator.cpp
+    tests/database_portable_runtime_test.cpp
+)
+target_include_directories(database_portable_runtime_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+if(MSVC)
+    target_compile_options(database_portable_runtime_test PRIVATE /W4)
+else()
+    target_compile_options(database_portable_runtime_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_portable_runtime_test COMMAND database_portable_runtime_test)
+
+option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
+if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
+    target_compile_options(database_portable_runtime_test PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(database_portable_runtime_test PRIVATE
+        -fsanitize=address,undefined)
+endif()
+
 add_executable(gxdb_cli tools/gxdb_cli.cpp)
 target_link_libraries(gxdb_cli PRIVATE gxos_database)
 if(MSVC)
