@@ -12,7 +12,8 @@ $sources = @(
     "database/portable/gx_allocator.cpp",
     "database/portable/gx_array.cpp",
     "database/portable/gx_owner.cpp",
-    "database/portable/gx_string.cpp"
+    "database/portable/gx_string.cpp",
+    "database/portable/gx_wal_record.cpp"
 )
 $flags = @(
     "-std=c++14", "-ffreestanding", "-O2", "-Wall", "-Wextra",
@@ -22,7 +23,7 @@ $flags = @(
     "-mno-sse2", "-fno-pic", "-fno-pie", "-fno-PIC", "-fno-PIE",
     "-mno-stack-arg-probe", "-fno-stack-check", "-fno-stack-protector",
     "-D__x86_64__",
-    "-Idatabase/portable"
+    "-Idatabase/portable", "-Idatabase"
 )
 
 foreach ($source in $sources) {

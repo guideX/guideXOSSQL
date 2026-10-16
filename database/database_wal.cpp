@@ -4,6 +4,9 @@
 
 #include "database_checksum.h"
 #include "database_endian.h"
+#include "portable/gx_allocator_hosted.h"
+#include "portable/gx_array.h"
+#include "portable/gx_wal_record.h"
 
 namespace gxos {
 namespace db {
@@ -68,7 +71,16 @@ bool isKnownRecordType(uint8_t type) {
 
 WriteAheadLog::WriteAheadLog()
     : _file(), _readOnly(false), _pageSize(0), _generation(1), _lastTransactionId(0),
-      _writeOffset(0), _bytesSinceCheckpoint(0), _lastError() {
+      _writeOffset(0), _bytesSinceCheckpoint(0), _lastError(), _recordAllocator() {
+    std::memset(_databaseId, 0, sizeof(_databaseId));
+    gxHostedAllocatorInit(&_recordAllocator, kWalRecordPrefixSize +
+                                                 kMaxWalRecordPayload);
+}
+
+WriteAheadLog::WriteAheadLog(const GxAllocator& recordAllocator)
+    : _file(), _readOnly(false), _pageSize(0), _generation(1), _lastTransactionId(0),
+      _writeOffset(0), _bytesSinceCheckpoint(0), _lastError(),
+      _recordAllocator(recordAllocator) {
     std::memset(_databaseId, 0, sizeof(_databaseId));
 }
 
@@ -173,25 +185,33 @@ DbResult WriteAheadLog::appendRecord(uint8_t type, uint64_t transactionId,
         return fail(DbStatus::TransactionTooLarge, "WAL file size limit exceeded");
     }
 
-    std::vector<uint8_t> record(kWalRecordPrefixSize + payloadLength, 0);
-    uint8_t* prefix = record.data();
-    prefix[wal_record_offset::RecordType] = type;
-    prefix[wal_record_offset::Flags] = 0;
-    storeLe16(prefix + wal_record_offset::Reserved, 0);
-    storeLe32(prefix + wal_record_offset::PayloadLength, payloadLength);
-    storeLe64(prefix + wal_record_offset::TransactionId, transactionId);
-    if (payloadLength > 0 && payload != nullptr) {
-        std::memcpy(record.data() + kWalRecordPrefixSize, payload, payloadLength);
+    GxArray record = {};
+    const size_t maximumRecordBytes = kWalRecordPrefixSize + payloadLength;
+    GxStatus status = gxArrayInit(&record, &_recordAllocator, 1,
+                                  maximumRecordBytes);
+    if (status != GxStatus::Ok) {
+        return fail(DbStatus::NoSpace, "WAL record buffer initialization failed");
     }
-    const uint32_t crc = computeRecordCrc(prefix, record.data() + kWalRecordPrefixSize,
-                                          payloadLength);
-    storeLe32(prefix + wal_record_offset::RecordCrc32, crc);
+    status = gxWalRecordEncode(&record, type, transactionId, payload,
+                               payloadLength, kMaxWalRecordPayload);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&record);
+        const DbStatus dbStatus = status == GxStatus::Overflow
+                                      ? DbStatus::OutOfBounds
+                                      : status == GxStatus::InvalidArgument
+                                            ? DbStatus::InvalidArgument
+                                            : DbStatus::NoSpace;
+        return fail(dbStatus, "WAL record buffer allocation failed");
+    }
 
-    if (!_file->writeAt(_writeOffset, record.data(), record.size())) {
+    const size_t recordSize = gxArraySize(&record);
+    if (!_file->writeAt(_writeOffset, record.data, recordSize)) {
+        gxArrayDestroy(&record);
         return fail(DbStatus::IoError, "failed to append WAL record");
     }
-    _writeOffset += record.size();
-    _bytesSinceCheckpoint += record.size();
+    _writeOffset += recordSize;
+    _bytesSinceCheckpoint += recordSize;
+    gxArrayDestroy(&record);
     return DbResult::ok();
 }
 

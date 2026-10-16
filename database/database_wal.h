@@ -36,6 +36,7 @@
 #include "database_io.h"
 #include "database_page.h"
 #include "database_result.h"
+#include "portable/gx_allocator.h"
 
 namespace gxos {
 namespace db {
@@ -116,6 +117,7 @@ struct WalTransaction {
 class WriteAheadLog {
 public:
     WriteAheadLog();
+    explicit WriteAheadLog(const GxAllocator& recordAllocator);
     ~WriteAheadLog();
 
     WriteAheadLog(const WriteAheadLog&) = delete;
@@ -166,6 +168,7 @@ private:
     uint64_t _writeOffset;
     uint64_t _bytesSinceCheckpoint;
     DbResult _lastError;
+    GxAllocator _recordAllocator;
 };
 
 } // namespace db

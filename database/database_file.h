@@ -25,6 +25,7 @@
 #include "database_page.h"
 #include "database_pagestore.h"
 #include "database_result.h"
+#include "portable/gx_allocator.h"
 
 namespace gxos {
 namespace db {
@@ -56,10 +57,14 @@ struct DatabaseOpenOptions {
     // after its WAL has been scanned. Low-level database opens keep this false.
     bool deferPageValidationForWalRecovery;
     uint32_t bufferCapacity; // 0 => default buffer size
+    // Optional explicit allocator for WAL record scratch buffers. The
+    // allocator is copied; its context must outlive the open Database.
+    const GxAllocator* walRecordAllocator;
 
     DatabaseOpenOptions()
         : readOnly(false), validateAllPages(false),
-          deferPageValidationForWalRecovery(false), bufferCapacity(0) {}
+          deferPageValidationForWalRecovery(false), bufferCapacity(0),
+          walRecordAllocator(nullptr) {}
 };
 
 class DatabaseFile : public PageAccess {

@@ -20,6 +20,10 @@ add_library(gxos_database STATIC
     database/database_index.cpp
     database/database_heap.cpp
     database/database_wal.cpp
+    database/portable/gx_allocator.cpp
+    database/portable/gx_allocator_hosted.cpp
+    database/portable/gx_array.cpp
+    database/portable/gx_wal_record.cpp
     database/database_transaction.cpp
     database/database_relational.cpp
     database/database_sql_token.cpp
@@ -158,6 +162,22 @@ else()
     target_compile_options(database_portable_runtime_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_portable_runtime_test COMMAND database_portable_runtime_test)
+
+add_executable(database_wal_portable_test
+    tests/gx_test_allocator.cpp
+    tests/database_wal_portable_test.cpp
+)
+target_link_libraries(database_wal_portable_test PRIVATE gxos_database)
+target_include_directories(database_wal_portable_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+if(MSVC)
+    target_compile_options(database_wal_portable_test PRIVATE /W4)
+else()
+    target_compile_options(database_wal_portable_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_wal_portable_test COMMAND database_wal_portable_test)
 
 option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
 if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)

@@ -194,6 +194,8 @@ private:
     bool _open;
     bool _readOnly;
     bool _catalogDirty;
+    GxAllocator _walRecordAllocator;
+    bool _hasWalRecordAllocator;
     Transaction* _activeTx;
     uint64_t _nextTxId;
     uint64_t _dataEpoch;

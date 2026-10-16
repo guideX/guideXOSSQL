@@ -56,7 +56,8 @@ std::string describeDbValue(const DbValue& value) {
 
 Database::Database()
     : _file(), _buffer(), _wal(), _catalog(), _diagnostics(), _open(false),
-      _readOnly(false), _catalogDirty(false), _activeTx(nullptr), _nextTxId(1),
+      _readOnly(false), _catalogDirty(false), _walRecordAllocator(),
+      _hasWalRecordAllocator(false), _activeTx(nullptr), _nextTxId(1),
       _dataEpoch(0), _schemaGeneration(1), _walPath(), _fileSystem(nullptr) {}
 
 Database::~Database() {
@@ -159,7 +160,11 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
         return result;
     }
 
-    _wal.reset(new WriteAheadLog());
+    if (_hasWalRecordAllocator) {
+        _wal.reset(new WriteAheadLog(_walRecordAllocator));
+    } else {
+        _wal.reset(new WriteAheadLog());
+    }
     result = _wal->open(std::move(walFile), _file->header().databaseId,
                         _file->pageSize(), _readOnly);
     if (!result.isOk()) {
@@ -248,7 +253,11 @@ DbResult Database::ensureWalOpen() {
     if (!result.isOk()) {
         return result;
     }
-    _wal.reset(new WriteAheadLog());
+    if (_hasWalRecordAllocator) {
+        _wal.reset(new WriteAheadLog(_walRecordAllocator));
+    } else {
+        _wal.reset(new WriteAheadLog());
+    }
     result = _wal->open(std::move(walFile), _file->header().databaseId,
                         _file->pageSize(), false);
     if (!result.isOk()) {
@@ -356,6 +365,10 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
                             IDatabaseFileSystem* fileSystem) {
     IDatabaseFileSystem& filesystem = fileSystem ? *fileSystem : defaultFileSystem();
     _fileSystem = &filesystem;
+    _hasWalRecordAllocator = options.walRecordAllocator != nullptr;
+    if (_hasWalRecordAllocator) {
+        _walRecordAllocator = *options.walRecordAllocator;
+    }
     const uint32_t bufferCapacity =
         options.bufferCapacity != 0 ? options.bufferCapacity : kDefaultBufferCapacity;
 
