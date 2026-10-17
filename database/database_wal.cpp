@@ -1,6 +1,8 @@
 #include "database_wal.h"
 
 #include <cstring>
+#include <new>
+#include <utility>
 
 #include "database_checksum.h"
 #include "database_endian.h"
@@ -8,6 +10,7 @@
 #include "portable/gx_array.h"
 #include "portable/gx_wal_page_image.h"
 #include "portable/gx_wal_record.h"
+#include "portable/gx_wal_scan.h"
 
 namespace gxos {
 namespace db {
@@ -16,6 +19,11 @@ const uint8_t kWalMagic[8] = {'G', 'X', 'W', 'A', 'L', '\r', '\n', 0x1A};
 
 static_assert(kWalRecordPrefixSize == GX_WAL_RECORD_PREFIX_SIZE,
               "portable WAL record prefix must match SQL3 framing");
+static_assert(kWalRecordBegin == GX_WAL_SCAN_RECORD_BEGIN &&
+                  kWalRecordPageImage == GX_WAL_SCAN_RECORD_PAGE_IMAGE &&
+                  kWalRecordHeaderImage == GX_WAL_SCAN_RECORD_DB_HEADER &&
+                  kWalRecordCommit == GX_WAL_SCAN_RECORD_COMMIT,
+              "portable WAL scanner record ids must match SQL3 framing");
 static_assert(static_cast<uint32_t>(wal_page_offset::PageBytes) ==
                   static_cast<uint32_t>(GX_WAL_PAGE_IMAGE_HEADER_SIZE),
               "portable PAGE_IMAGE header must match SQL3 framing");
@@ -41,20 +49,6 @@ uint32_t computeHeaderCrc(const uint8_t* bytes) {
     return crc32Final(crc);
 }
 
-uint32_t computeRecordCrc(const uint8_t* prefix, const uint8_t* payload,
-                          uint32_t payloadLength) {
-    uint32_t crc = crc32Init();
-    crc = crc32Update(crc, prefix, wal_record_offset::RecordCrc32);
-    const uint8_t zero[4] = {0, 0, 0, 0};
-    crc = crc32Update(crc, zero, sizeof(zero));
-    crc = crc32Update(crc, prefix + wal_record_offset::RecordCrc32 + 4,
-                      kWalRecordPrefixSize - (wal_record_offset::RecordCrc32 + 4));
-    if (payloadLength > 0 && payload != nullptr) {
-        crc = crc32Update(crc, payload, payloadLength);
-    }
-    return crc32Final(crc);
-}
-
 void serializeWalHeader(uint8_t* out, uint32_t pageSize, const uint8_t dbId[16],
                         uint64_t generation, uint64_t lastTransactionId) {
     std::memset(out, 0, kWalHeaderSize);
@@ -69,9 +63,101 @@ void serializeWalHeader(uint8_t* out, uint32_t pageSize, const uint8_t dbId[16],
     storeLe32(out + wal_header_offset::HeaderCrc32, computeHeaderCrc(out));
 }
 
-bool isKnownRecordType(uint8_t type) {
-    return type == kWalRecordBegin || type == kWalRecordPageImage ||
-           type == kWalRecordHeaderImage || type == kWalRecordCommit;
+bool readWalBytes(void* context, uint64_t offset, uint8_t* buffer,
+                  size_t length) {
+    IDatabaseFile* file = static_cast<IDatabaseFile*>(context);
+    return file != nullptr && file->readAt(offset, buffer, length);
+}
+
+struct WalRecordScanContext {
+    uint32_t pageSize;
+    const uint8_t* databaseId;
+    bool haveTransaction;
+    WalTransaction current;
+    std::vector<WalTransaction>* transactions;
+    uint64_t maxCommittedId;
+    const char* errorMessage;
+
+    WalRecordScanContext(uint32_t pageSizeIn, const uint8_t databaseIdIn[16],
+                         std::vector<WalTransaction>* transactionsIn)
+        : pageSize(pageSizeIn), databaseId(databaseIdIn),
+          haveTransaction(false), current(), transactions(transactionsIn),
+          maxCommittedId(0), errorMessage(nullptr) {}
+};
+
+GxWalScanStatus visitWalRecord(void* opaque, uint8_t type, uint64_t txId,
+                               const uint8_t* payload,
+                               uint32_t payloadLength) {
+    WalRecordScanContext& context = *static_cast<WalRecordScanContext*>(opaque);
+    try {
+        if (type == kWalRecordBegin) {
+            if (context.haveTransaction) {
+                context.errorMessage = "nested WAL BEGIN record";
+                return GxWalScanStatus_Corrupt;
+            }
+            context.haveTransaction = true;
+            context.current = WalTransaction();
+            context.current.transactionId = txId;
+        } else if (type == kWalRecordPageImage) {
+            if (!context.haveTransaction ||
+                txId != context.current.transactionId) {
+                context.errorMessage = "WAL PAGE_IMAGE outside its transaction";
+                return GxWalScanStatus_Corrupt;
+            }
+            if (payloadLength != wal_page_offset::PageBytes + context.pageSize) {
+                context.errorMessage = "WAL PAGE_IMAGE payload size mismatch";
+                return GxWalScanStatus_Corrupt;
+            }
+            const uint64_t pageId = loadLe64(payload + wal_page_offset::PageId);
+            DatabasePage page;
+            DbResult parsed = DatabasePage::parse(
+                payload + wal_page_offset::PageBytes, context.pageSize, pageId,
+                page);
+            if (!parsed.isOk()) {
+                context.errorMessage = "WAL PAGE_IMAGE is not a valid page";
+                return GxWalScanStatus_Corrupt;
+            }
+            context.current.pages.push_back(std::move(page));
+        } else if (type == kWalRecordHeaderImage) {
+            if (!context.haveTransaction ||
+                txId != context.current.transactionId) {
+                context.errorMessage = "WAL DB_HEADER outside its transaction";
+                return GxWalScanStatus_Corrupt;
+            }
+            if (payloadLength != kHeaderSize) {
+                context.errorMessage = "WAL DB_HEADER payload size mismatch";
+                return GxWalScanStatus_Corrupt;
+            }
+            DatabaseHeader header;
+            DbResult parsed = DatabaseHeader::parse(payload, kHeaderSize, header);
+            if (!parsed.isOk()) {
+                context.errorMessage = "WAL DB_HEADER is not a valid header";
+                return GxWalScanStatus_Corrupt;
+            }
+            if (std::memcmp(header.databaseId, context.databaseId, 16) != 0) {
+                context.errorMessage = "WAL DB_HEADER identity does not match database";
+                return GxWalScanStatus_Foreign;
+            }
+            context.current.hasHeaderImage = true;
+            context.current.headerImage = header;
+        } else { // kWalRecordCommit
+            if (!context.haveTransaction ||
+                txId != context.current.transactionId) {
+                context.errorMessage = "WAL COMMIT outside its transaction";
+                return GxWalScanStatus_Corrupt;
+            }
+            context.transactions->push_back(std::move(context.current));
+            if (txId > context.maxCommittedId) {
+                context.maxCommittedId = txId;
+            }
+            context.current = WalTransaction();
+            context.haveTransaction = false;
+        }
+    } catch (const std::bad_alloc&) {
+        context.errorMessage = "WAL recovery transaction allocation failed";
+        return GxWalScanStatus_NoSpace;
+    }
+    return GxWalScanStatus_Ok;
 }
 
 } // namespace
@@ -328,7 +414,6 @@ DbResult WriteAheadLog::scan(WalState& outState,
     uint64_t size = 0;
     DbResult sizeResult = _file->getSize(size);
     if (!sizeResult.isOk()) {
-        outState = WalState::Corrupt;
         outMessage = "failed to query WAL size";
         return fail(DbStatus::IoError, outMessage + ": " + sizeResult.describe());
     }
@@ -349,161 +434,83 @@ DbResult WriteAheadLog::scan(WalState& outState,
         return DbResult::ok();
     }
 
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!_file->readAt(0, bytes.data(), bytes.size())) {
-        outState = WalState::Corrupt;
-        outMessage = "failed to read WAL";
+    uint8_t header[kWalHeaderSize];
+    if (!readWalBytes(_file.get(), 0, header, sizeof(header))) {
+        outMessage = "failed to read WAL header";
         return DbResult::error(DbStatus::IoError, outMessage);
     }
-
-    const uint8_t* data = bytes.data();
-    if (std::memcmp(data + wal_header_offset::Magic, kWalMagic, 8) != 0) {
+    if (std::memcmp(header + wal_header_offset::Magic, kWalMagic, 8) != 0) {
         outState = WalState::Corrupt;
         outMessage = "WAL signature mismatch";
         return DbResult::error(DbStatus::WalCorrupt, outMessage);
     }
-    const uint16_t version = loadLe16(data + wal_header_offset::FormatVersion);
+    const uint16_t version = loadLe16(header + wal_header_offset::FormatVersion);
     if (version != kWalFormatVersion) {
         outState = WalState::UnsupportedVersion;
         outMessage = "unsupported WAL format version";
         return DbResult::error(DbStatus::WalUnsupportedVersion, outMessage);
     }
-    const uint32_t pageSize = loadLe32(data + wal_header_offset::PageSize);
+    const uint32_t pageSize = loadLe32(header + wal_header_offset::PageSize);
     if (pageSize != _pageSize) {
         outState = WalState::Foreign;
         outMessage = "WAL page size does not match database";
         return DbResult::error(DbStatus::WalDatabaseMismatch, outMessage);
     }
-    if (std::memcmp(data + wal_header_offset::DatabaseId, _databaseId, 16) != 0) {
+    if (std::memcmp(header + wal_header_offset::DatabaseId, _databaseId, 16) != 0) {
         outState = WalState::Foreign;
         outMessage = "WAL database identity does not match database";
         return DbResult::error(DbStatus::WalDatabaseMismatch, outMessage);
     }
-    if (loadLe32(data + wal_header_offset::HeaderCrc32) != computeHeaderCrc(data)) {
+    if (loadLe32(header + wal_header_offset::HeaderCrc32) != computeHeaderCrc(header)) {
         outState = WalState::Corrupt;
         outMessage = "WAL header checksum mismatch";
         return DbResult::error(DbStatus::WalCorrupt, outMessage);
     }
-    _generation = loadLe64(data + wal_header_offset::Generation);
-    _lastTransactionId = loadLe64(data + wal_header_offset::LastTransactionId);
+    _generation = loadLe64(header + wal_header_offset::Generation);
+    _lastTransactionId = loadLe64(header + wal_header_offset::LastTransactionId);
 
-    size_t offset = kWalHeaderSize;
-    bool haveTx = false;
-    WalTransaction current;
-    bool incompleteTail = false;
-    uint64_t maxCommittedId = 0;
-
-    while (offset < bytes.size()) {
-        const size_t remaining = bytes.size() - offset;
-        if (remaining < kWalRecordPrefixSize) {
-            incompleteTail = true;
-            break;
+    static_assert(GX_WAL_SCAN_PREFIX_SIZE == kWalRecordPrefixSize,
+                  "portable WAL scanner prefix must match SQL3 framing");
+    static_assert(GX_WAL_SCAN_MAX_PAYLOAD == kMaxWalRecordPayload,
+                  "portable WAL scanner bound must match SQL3 policy");
+    WalRecordScanContext context(_pageSize, _databaseId, &outTransactions);
+    GxWalScanResult scanResult = {};
+    const GxWalScanStatus scanStatus = gxWalScanRecords(
+        kWalHeaderSize, size, kMaxWalFileBytes, kMaxWalRecordPayload,
+        readWalBytes, _file.get(), &_recordAllocator, visitWalRecord, &context,
+        &scanResult);
+    if (scanStatus != GxWalScanStatus_Ok) {
+        outTransactions.clear();
+        if (scanStatus == GxWalScanStatus_IoError) {
+            outMessage = "failed to read WAL record";
+            return DbResult::error(DbStatus::IoError, outMessage);
         }
-        const uint8_t* prefix = data + offset;
-        const uint8_t type = prefix[wal_record_offset::RecordType];
-        const uint32_t payloadLength = loadLe32(prefix + wal_record_offset::PayloadLength);
-        if (!isKnownRecordType(type)) {
+        if (scanStatus == GxWalScanStatus_NoSpace) {
+            outMessage = context.errorMessage ? context.errorMessage
+                                              : "WAL recovery scan allocation failed";
+            return DbResult::error(DbStatus::NoSpace, outMessage);
+        }
+        if (scanStatus == GxWalScanStatus_Foreign) {
+            outState = WalState::Foreign;
+            outMessage = context.errorMessage ? context.errorMessage
+                                              : "WAL database identity mismatch";
+            return DbResult::error(DbStatus::WalDatabaseMismatch, outMessage);
+        }
+        if (scanStatus == GxWalScanStatus_Corrupt) {
             outState = WalState::Corrupt;
-            outMessage = "unknown WAL record type";
+            outMessage = context.errorMessage ? context.errorMessage
+                                              : "invalid WAL record prefix or checksum";
             return DbResult::error(DbStatus::WalCorrupt, outMessage);
         }
-        if (payloadLength > kMaxWalRecordPayload) {
-            outState = WalState::Corrupt;
-            outMessage = "WAL record payload length exceeds maximum";
-            return DbResult::error(DbStatus::WalCorrupt, outMessage);
-        }
-        if (remaining < kWalRecordPrefixSize + static_cast<size_t>(payloadLength)) {
-            incompleteTail = true;
-            break;
-        }
-        const uint8_t* payload = prefix + kWalRecordPrefixSize;
-        const uint32_t storedCrc = loadLe32(prefix + wal_record_offset::RecordCrc32);
-        if (storedCrc != computeRecordCrc(prefix, payload, payloadLength)) {
-            outState = WalState::Corrupt;
-            outMessage = "WAL record checksum mismatch";
-            return DbResult::error(DbStatus::WalCorrupt, outMessage);
-        }
-        const uint64_t txId = loadLe64(prefix + wal_record_offset::TransactionId);
-
-        if (type == kWalRecordBegin) {
-            if (haveTx) {
-                outState = WalState::Corrupt;
-                outMessage = "nested WAL BEGIN record";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            haveTx = true;
-            current = WalTransaction();
-            current.transactionId = txId;
-        } else if (type == kWalRecordPageImage) {
-            if (!haveTx || txId != current.transactionId) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL PAGE_IMAGE outside its transaction";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            if (payloadLength != wal_page_offset::PageBytes + _pageSize) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL PAGE_IMAGE payload size mismatch";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            const uint64_t pageId = loadLe64(payload + wal_page_offset::PageId);
-            DatabasePage page;
-            DbResult parsed = DatabasePage::parse(payload + wal_page_offset::PageBytes,
-                                                  _pageSize, pageId, page);
-            if (!parsed.isOk()) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL PAGE_IMAGE is not a valid page: " + parsed.message();
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            current.pages.push_back(page);
-        } else if (type == kWalRecordHeaderImage) {
-            if (!haveTx || txId != current.transactionId) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL DB_HEADER outside its transaction";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            if (payloadLength != kHeaderSize) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL DB_HEADER payload size mismatch";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            DatabaseHeader header;
-            DbResult parsed = DatabaseHeader::parse(payload, kHeaderSize, header);
-            if (!parsed.isOk()) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL DB_HEADER is not a valid header: " + parsed.message();
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            if (std::memcmp(header.databaseId, _databaseId, 16) != 0) {
-                outState = WalState::Foreign;
-                outMessage = "WAL DB_HEADER identity does not match database";
-                return DbResult::error(DbStatus::WalDatabaseMismatch, outMessage);
-            }
-            current.hasHeaderImage = true;
-            current.headerImage = header;
-        } else { // kWalRecordCommit
-            if (!haveTx || txId != current.transactionId) {
-                outState = WalState::Corrupt;
-                outMessage = "WAL COMMIT outside its transaction";
-                return DbResult::error(DbStatus::WalCorrupt, outMessage);
-            }
-            outTransactions.push_back(current);
-            if (current.transactionId > maxCommittedId) {
-                maxCommittedId = current.transactionId;
-            }
-            current = WalTransaction();
-            haveTx = false;
-        }
-
-        offset += kWalRecordPrefixSize + static_cast<size_t>(payloadLength);
+        outMessage = "WAL scan rejected invalid input";
+        return DbResult::error(DbStatus::Internal, outMessage);
     }
 
-    if (haveTx) {
-        incompleteTail = true;
-    }
-    if (maxCommittedId > _lastTransactionId) {
-        _lastTransactionId = maxCommittedId;
+    if (context.maxCommittedId > _lastTransactionId) {
+        _lastTransactionId = context.maxCommittedId;
     }
 
+    const bool incompleteTail = scanResult.incompleteTail || context.haveTransaction;
     if (!outTransactions.empty()) {
         outState = WalState::Committed;
     } else if (incompleteTail) {

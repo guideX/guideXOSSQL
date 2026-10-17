@@ -535,6 +535,10 @@ void testProductionTransactionAllocationRecovery() {
     WalState state = WalState::Clean;
     std::vector<WalTransaction> recoveredTransactions;
     std::string message;
+    // The commit fault injection above targets the WAL writer's record buffer.
+    // Recovery scanning now uses the same allocator for its separate bounded
+    // payload scratch, so disable the writer fault before validating the tail.
+    gxArenaDisableFailure(&arena);
     CHECK(database->wal().scan(state, recoveredTransactions, message).isOk());
     CHECK(state == WalState::Incomplete);
     CHECK(recoveredTransactions.empty());

@@ -16,6 +16,7 @@ $sources = @(
     "database/database_checksum.cpp",
     "database/portable/gx_page_codec.cpp",
     "database/portable/gx_wal_record.cpp",
+    "database/portable/gx_wal_scan.cpp",
     "database/portable/gx_wal_page_image.cpp"
 )
 $flags = @(
