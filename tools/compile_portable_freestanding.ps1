@@ -12,6 +12,7 @@ $sources = @(
     "database/portable/gx_allocator.cpp",
     "database/portable/gx_array.cpp",
     "database/portable/gx_recovered_pages.cpp",
+    "database/portable/gx_page_cache.cpp",
     "database/portable/gx_owner.cpp",
     "database/portable/gx_string.cpp",
     "database/database_checksum.cpp",

@@ -417,6 +417,42 @@ DbResult DatabaseFile::readPage(uint64_t pageId, DatabasePage& out) {
     return DbResult::ok();
 }
 
+DbResult DatabaseFile::readPageImage(uint64_t pageId, uint8_t* image,
+                                     uint32_t imageSize) {
+    _lastError = DbResult::ok();
+    if (!_open) {
+        return fail(DbStatus::NotOpen, "database is not open");
+    }
+    if (pageId == kHeaderPageId) {
+        return fail(DbStatus::InvalidArgument, "page 0 is the header page");
+    }
+    if (pageId >= _header.pageCount) {
+        return fail(DbStatus::OutOfBounds, "page id outside allocated range");
+    }
+    if (image == nullptr || imageSize != _header.pageSize) {
+        return fail(DbStatus::InvalidArgument, "page image has an invalid extent");
+    }
+
+    uint64_t offset = 0;
+    if (!computePageOffset(pageId, offset)) {
+        return fail(DbStatus::OutOfBounds, "page offset overflow");
+    }
+    if (!_file->readAt(offset, image, imageSize)) {
+        return fail(DbStatus::IoError, "failed to read page image");
+    }
+
+    GxDatabasePageInfo info = {};
+    const GxStatus inspectStatus = gxDatabasePageInspect(
+        image, imageSize, pageId, &info);
+    if (inspectStatus != GxStatus::Ok) {
+        return fail(inspectStatus == GxStatus::CorruptData
+                        ? DbStatus::CorruptPage
+                        : DbStatus::InvalidArgument,
+                    "page image failed validation");
+    }
+    return DbResult::ok();
+}
+
 DbResult DatabaseFile::writePage(const DatabasePage& page) {
     _lastError = DbResult::ok();
     if (!_open) {

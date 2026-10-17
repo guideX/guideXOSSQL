@@ -178,6 +178,7 @@ DbResult Transaction::commit() {
     // 7. Publish committed page images into the committed view.
     result = _db.file().setPageCount(_nextPageId);
     if (!result.isOk()) {
+        _db._diagnostics.recoveryRequired = true;
         _db.finishTransaction(this, true);
         _active = false;
         return DbResult::error(DbStatus::CommitFailed, result.message());
@@ -185,6 +186,9 @@ DbResult Transaction::commit() {
     for (size_t i = 0; i < _order.size(); ++i) {
         result = _db.writePage(_pages[_order[i]]);
         if (!result.isOk()) {
+            // WAL COMMIT is already durable. Keep reads from the committed
+            // view blocked until reopening replays the retained WAL.
+            _db._diagnostics.recoveryRequired = true;
             _db.finishTransaction(this, true);
             _active = false;
             return DbResult::error(DbStatus::CommitFailed, result.message());

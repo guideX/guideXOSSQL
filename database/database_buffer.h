@@ -25,6 +25,7 @@
 #include "database_file.h"
 #include "database_page.h"
 #include "database_result.h"
+#include "portable/gx_page_cache.h"
 
 namespace gxos {
 namespace db {
@@ -35,18 +36,26 @@ struct BufferSlot {
     bool dirty;
     uint32_t pinCount;
     uint64_t lastUsed; // LRU clock
+    uint32_t cacheIndex;
+    bool materialized; // page bytes are valid only while the slot is pinned
 
     BufferSlot()
-        : pageId(0), dirty(false), pinCount(0), lastUsed(0) {}
+        : pageId(0), dirty(false), pinCount(0), lastUsed(0), cacheIndex(0),
+          materialized(false) {}
 };
 
 class BufferManager {
 public:
-    BufferManager(DatabaseFile& file, uint32_t capacity);
+    BufferManager(DatabaseFile& file, uint32_t capacity,
+                  const GxAllocator* allocator = nullptr);
     ~BufferManager();
 
     BufferManager(const BufferManager&) = delete;
     BufferManager& operator=(const BufferManager&) = delete;
+
+    // Initializes bounded portable cache metadata and stable hosted page-view
+    // slots. Allocation failures are returned before the manager is published.
+    DbResult init();
 
     // Returns a pinned slot holding `pageId`, reading it from the file on a
     // cache miss. The caller MUST call unpin() exactly once. On failure the
@@ -65,31 +74,39 @@ public:
     // committed cache. Never used for uncommitted data.
     DbResult installPage(uint64_t pageId, const DatabasePage& page);
 
-    void markDirty(BufferSlot& slot);
-    void unpin(BufferSlot& slot);
+    DbResult markDirty(BufferSlot& slot);
+    DbResult unpin(BufferSlot& slot);
 
     // Writes all dirty slots, then flushes the underlying file (header +
     // durability barrier). Read-only databases are not written.
     DbResult flush();
 
     uint32_t capacity() const { return _capacity; }
-    uint32_t residentCount() const { return _resident; }
-    uint32_t dirtyCount() const { return _dirty; }
+    uint32_t residentCount() const { return static_cast<uint32_t>(_cache.resident); }
+    uint32_t dirtyCount() const { return static_cast<uint32_t>(_cache.dirtyCount); }
     uint32_t pinnedCount() const { return _pinned; }
+    const GxPageCacheStats& cacheStats() const { return _cache.stats; }
+    size_t cacheMemoryBytes() const;
+    size_t cacheMemoryPeakBytes() const;
 
 private:
-    BufferSlot* findSlot(uint64_t pageId);
-    uint32_t findEmptySlot() const;
-    DbResult loadIntoSlot(BufferSlot& slot, uint64_t pageId);
-    DbResult evictOne();
+    DbResult flushVictim(size_t index);
+    DbResult materialize(size_t index);
+    DbResult encodeSlot(size_t index);
+    DbResult allocateCandidate(uint8_t** outImage);
+    DbResult chooseTarget(size_t& outIndex);
+    void discardMaterialized(BufferSlot& slot);
+    void syncSlot(BufferSlot& slot, const GxPageCacheEntry& entry);
 
     DatabaseFile& _file;
     uint32_t _capacity;
-    uint32_t _resident;
-    uint32_t _dirty;
     uint32_t _pinned;
-    uint64_t _clock;
+    GxAllocator _allocator;
+    GxPageCache _cache;
     BufferSlot* _slots;
+    size_t _slotBytes;
+    uint32_t _slotsConstructed;
+    bool _initialized;
 };
 
 } // namespace db

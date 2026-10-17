@@ -870,6 +870,7 @@ void testBufferManagerDirect() {
     }
 
     BufferManager buf(file, 2);
+    CHECK_STATUS(buf.init(), DbStatus::Ok);
     CHECK(buf.capacity() == 2);
 
     // Cache hit: pinning the same page twice returns the same slot.
@@ -879,8 +880,8 @@ void testBufferManagerDirect() {
     CHECK_STATUS(buf.pinPage(p[0], aAgain), DbStatus::Ok);
     CHECK(aAgain == a);
     CHECK(buf.residentCount() == 1);
-    buf.unpin(*a);
-    buf.unpin(*aAgain);
+    CHECK_STATUS(buf.unpin(*a), DbStatus::Ok);
+    CHECK_STATUS(buf.unpin(*aAgain), DbStatus::Ok);
 
     // Eviction: with p0,p1 resident, pinning p2 evicts the LRU (p0).
     BufferSlot* b = nullptr;
@@ -888,8 +889,8 @@ void testBufferManagerDirect() {
     BufferSlot* c = nullptr;
     CHECK_STATUS(buf.pinPage(p[2], c), DbStatus::Ok);
     CHECK(buf.residentCount() == 2);
-    buf.unpin(*b);
-    buf.unpin(*c);
+    CHECK_STATUS(buf.unpin(*b), DbStatus::Ok);
+    CHECK_STATUS(buf.unpin(*c), DbStatus::Ok);
 
     // Pinning: a pinned page is never evicted; exhausting pins fails.
     BufferSlot* d = nullptr;
@@ -898,31 +899,31 @@ void testBufferManagerDirect() {
     CHECK_STATUS(buf.pinPage(p[2], e), DbStatus::Ok);
     BufferSlot* f = nullptr;
     CHECK_STATUS(buf.pinPage(p[3], f), DbStatus::Internal);
-    buf.unpin(*d);
-    buf.unpin(*e);
+    CHECK_STATUS(buf.unpin(*d), DbStatus::Ok);
+    CHECK_STATUS(buf.unpin(*e), DbStatus::Ok);
 
     // Dirty eviction: a dirty page is written back when evicted.
     BufferSlot* g = nullptr;
     CHECK_STATUS(buf.pinPage(p[1], g), DbStatus::Ok);
-    buf.markDirty(*g);
+    CHECK_STATUS(buf.markDirty(*g), DbStatus::Ok);
     CHECK(buf.dirtyCount() == 1);
-    buf.unpin(*g);
+    CHECK_STATUS(buf.unpin(*g), DbStatus::Ok);
     BufferSlot* g2 = nullptr;
     CHECK_STATUS(buf.pinPage(p[2], g2), DbStatus::Ok);
-    buf.unpin(*g2);
+    CHECK_STATUS(buf.unpin(*g2), DbStatus::Ok);
     BufferSlot* h = nullptr;
     CHECK_STATUS(buf.pinPage(p[3], h), DbStatus::Ok);
     CHECK(buf.dirtyCount() == 0);
-    buf.unpin(*h);
+    CHECK_STATUS(buf.unpin(*h), DbStatus::Ok);
 
     // Flush writes all dirty pages.
     BufferSlot* i = nullptr;
     CHECK_STATUS(buf.pinPage(p[1], i), DbStatus::Ok);
-    buf.markDirty(*i);
+    CHECK_STATUS(buf.markDirty(*i), DbStatus::Ok);
     CHECK(buf.dirtyCount() == 1);
     CHECK_STATUS(buf.flush(), DbStatus::Ok);
     CHECK(buf.dirtyCount() == 0);
-    buf.unpin(*i);
+    CHECK_STATUS(buf.unpin(*i), DbStatus::Ok);
 
     CHECK_STATUS(db->close(), DbStatus::Ok);
     std::remove(path.c_str());

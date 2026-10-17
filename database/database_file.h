@@ -37,13 +37,17 @@ struct DatabaseCreateOptions {
     uint8_t databaseId[16];
     uint64_t creationTimeUnixNanos; // 0 => use current time
     uint32_t bufferCapacity;        // 0 => default buffer size
+    // Optional allocator for committed page-cache descriptors and images.
+    // The allocator is copied; its context must outlive the Database.
+    const GxAllocator* pageCacheAllocator;
 
     DatabaseCreateOptions()
         : pageSize(kDefaultPageSize),
           overwriteExisting(false),
           generateDatabaseId(true),
           creationTimeUnixNanos(0),
-          bufferCapacity(0) {
+          bufferCapacity(0),
+          pageCacheAllocator(nullptr) {
         for (int i = 0; i < 16; ++i) {
             databaseId[i] = 0;
         }
@@ -57,6 +61,9 @@ struct DatabaseOpenOptions {
     // after its WAL has been scanned. Low-level database opens keep this false.
     bool deferPageValidationForWalRecovery;
     uint32_t bufferCapacity; // 0 => default buffer size
+    // Optional allocator for committed page-cache descriptors and images.
+    // The allocator is copied; its context must outlive the open Database.
+    const GxAllocator* pageCacheAllocator;
     // Optional explicit allocator for WAL scan scratch, retained page images,
     // and recovery coverage scratch. The allocator is copied; its context must
     // outlive the open Database.
@@ -65,7 +72,7 @@ struct DatabaseOpenOptions {
     DatabaseOpenOptions()
         : readOnly(false), validateAllPages(false),
           deferPageValidationForWalRecovery(false), bufferCapacity(0),
-          walRecordAllocator(nullptr) {}
+          pageCacheAllocator(nullptr), walRecordAllocator(nullptr) {}
 };
 
 class DatabaseFile : public PageAccess {
@@ -97,6 +104,12 @@ public:
 
     // Reads a full page. Page 0 (the header page) is not readable here.
     DbResult readPage(uint64_t pageId, DatabasePage& out) override;
+
+    // Reads and validates one full serialized page into caller-owned storage.
+    // This is used by the portable committed-page cache to avoid a temporary
+    // hosted vector and to keep failed reads out of resident entries.
+    DbResult readPageImage(uint64_t pageId, uint8_t* image,
+                           uint32_t imageSize);
 
     // Overwrites an already-allocated page (1 <= pageId < pageCount).
     DbResult writePage(const DatabasePage& page) override;

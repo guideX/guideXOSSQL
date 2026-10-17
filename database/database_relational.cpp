@@ -114,13 +114,23 @@ DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
+    if (_diagnostics.recoveryRequired) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "committed page publication requires WAL recovery");
+    }
     BufferSlot* slot = nullptr;
     DbResult result = _buffer->pinPage(pageId, slot);
     if (!result.isOk()) {
         return result;
     }
-    out = slot->page;
-    _buffer->unpin(*slot);
+    try {
+        out = slot->page;
+    } catch (const std::bad_alloc&) {
+        (void)_buffer->unpin(*slot);
+        return DbResult::error(DbStatus::NoSpace, "page copy allocation failed");
+    }
+    result = _buffer->unpin(*slot);
+    if (!result.isOk()) return result;
     return DbResult::ok();
 }
 
@@ -452,7 +462,22 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
         }
     }
 
-    _buffer.reset(new BufferManager(*_file, bufferCapacity));
+    try {
+        _buffer.reset(new BufferManager(*_file, bufferCapacity,
+                                        options.pageCacheAllocator));
+    } catch (const std::bad_alloc&) {
+        (void)_file->close();
+        _file.reset();
+        return DbResult::error(DbStatus::NoSpace,
+                               "buffer manager allocation failed");
+    }
+    DbResult bufferResult = _buffer->init();
+    if (!bufferResult.isOk()) {
+        _buffer.reset();
+        (void)_file->close();
+        _file.reset();
+        return bufferResult;
+    }
     _readOnly = options.readOnly;
     _walPath = walPathFor(path);
 
@@ -526,9 +551,11 @@ DbResult Database::create(const std::string& path, const DatabaseCreateOptions& 
     std::memcpy(createOptions.databaseId, options.databaseId, 16);
     createOptions.creationTimeUnixNanos = options.creationTimeUnixNanos;
     createOptions.bufferCapacity = options.bufferCapacity;
+    createOptions.pageCacheAllocator = options.pageCacheAllocator;
 
     DatabaseOpenOptions createOpen;
     createOpen.bufferCapacity = options.bufferCapacity;
+    createOpen.pageCacheAllocator = options.pageCacheAllocator;
     DbResult result = db->openImpl(path, createOpen, createOptions, true, fileSystem);
     if (!result.isOk()) {
         return result;
@@ -589,6 +616,10 @@ DbResult Database::flush() {
     }
     if (_readOnly) {
         return DbResult::ok();
+    }
+    if (_diagnostics.recoveryRequired) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "committed WAL must be replayed before checkpoint");
     }
     if (_activeTx != nullptr) {
         return DbResult::error(DbStatus::TransactionAlreadyActive,
