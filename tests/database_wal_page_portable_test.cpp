@@ -426,10 +426,14 @@ void testProductionWalBytesAndRecoveryStates() {
     CHECK(validReader.scan(state, transactions, message).isOk());
     CHECK(state == WalState::Committed);
     CHECK(transactions.size() == 1);
-    CHECK(transactions[0].pages.size() == 3);
-    CHECK(transactions[0].pages[0].pageId == 1);
-    CHECK(transactions[0].pages[1].pageId == 2);
-    CHECK(transactions[0].pages[2].pageId == kMaxPageCount - 1);
+    CHECK(gxRecoveredPagesCount(&transactions[0].pages) == 3);
+    const GxRecoveredPage* recoveredPage =
+        gxRecoveredPagesFirst(&transactions[0].pages);
+    CHECK(recoveredPage && recoveredPage->pageId == 1);
+    recoveredPage = gxRecoveredPageNext(recoveredPage);
+    CHECK(recoveredPage && recoveredPage->pageId == 2);
+    recoveredPage = gxRecoveredPageNext(recoveredPage);
+    CHECK(recoveredPage && recoveredPage->pageId == kMaxPageCount - 1);
     validReader.close();
 
     std::vector<uint8_t> corrupted = validBytes;

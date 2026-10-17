@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "database_endian.h"
 #include "database_engine.h"
@@ -58,7 +59,8 @@ Database::Database()
     : _file(), _buffer(), _wal(), _catalog(), _diagnostics(), _open(false),
       _readOnly(false), _catalogDirty(false), _walRecordAllocator(),
       _hasWalRecordAllocator(false), _activeTx(nullptr), _nextTxId(1),
-      _dataEpoch(0), _schemaGeneration(1), _walPath(), _fileSystem(nullptr) {}
+      _transactionIdsExhausted(false), _dataEpoch(0), _schemaGeneration(1),
+      _walPath(), _fileSystem(nullptr) {}
 
 Database::~Database() {
     if (_open) {
@@ -139,6 +141,7 @@ DbResult Database::allocatePage(PageType, uint64_t&) {
 
 DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
                                      bool validateAllPages) {
+    try {
     DbResult lookup = fileSystem.exists(_walPath, _diagnostics.walPresent);
     if (!lookup.isOk()) {
         return DbResult::error(DbStatus::IoError,
@@ -147,6 +150,7 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
     if (!_diagnostics.walPresent) {
         _diagnostics.walState = WalState::Absent;
         _nextTxId = 1;
+        _transactionIdsExhausted = false;
         return _file->validateOpenedPages(validateAllPages);
     }
 
@@ -183,7 +187,13 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
         return result;
     }
 
-    _nextTxId = _wal->lastTransactionId() + 1;
+    if (_wal->lastTransactionId() == UINT64_MAX) {
+        _nextTxId = UINT64_MAX;
+        _transactionIdsExhausted = true;
+    } else {
+        _nextTxId = _wal->lastTransactionId() + 1;
+        _transactionIdsExhausted = false;
+    }
 
     if (state == WalState::Committed) {
         if (_readOnly) {
@@ -195,6 +205,13 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
         result = applyRecovery(transactions);
         if (!result.isOk()) {
             _wal.reset();
+            if (result.status() == DbStatus::NoSpace ||
+                result.status() == DbStatus::TransactionTooLarge ||
+                result.status() == DbStatus::IoError ||
+                result.status() == DbStatus::RecoveryRequired ||
+                result.status() == DbStatus::WalCorrupt) {
+                return result;
+            }
             return DbResult::error(DbStatus::RecoveryFailed, result.message());
         }
     } else if (state == WalState::Incomplete && !_readOnly) {
@@ -231,6 +248,9 @@ DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
         }
     }
     return DbResult::ok();
+    } catch (const std::bad_alloc&) {
+        return DbResult(DbStatus::NoSpace, std::string());
+    }
 }
 
 DbResult Database::ensureWalOpen() {
@@ -268,37 +288,35 @@ DbResult Database::ensureWalOpen() {
 }
 
 DbResult Database::applyRecovery(const std::vector<WalTransaction>& transactions) {
-    DbResult result = validateRecoveryCoverage(transactions);
-    if (!result.isOk()) return result;
+    try {
+        DbResult result = validateRecoveryCoverage(transactions);
+        if (!result.isOk()) return result;
 
-    uint64_t redone = 0;
-    for (size_t i = 0; i < transactions.size(); ++i) {
-        const WalTransaction& tx = transactions[i];
-        if (tx.hasHeaderImage) {
-            DbResult result = _file->applyHeaderImage(tx.headerImage);
-            if (!result.isOk()) {
-                return result;
+        uint64_t redone = 0;
+        for (size_t i = 0; i < transactions.size(); ++i) {
+            const WalTransaction& tx = transactions[i];
+            if (tx.hasHeaderImage) {
+                result = _file->applyHeaderImage(tx.headerImage);
+                if (!result.isOk()) return result;
+            }
+            for (const GxRecoveredPage* page = gxRecoveredPagesFirst(&tx.pages);
+                 page; page = gxRecoveredPageNext(page)) {
+                result = _file->writePageImage(
+                    page->pageId, gxRecoveredPageImage(page), pageSize());
+                if (!result.isOk()) return result;
+                ++redone;
             }
         }
-        for (size_t j = 0; j < tx.pages.size(); ++j) {
-            DbResult result = _file->writePage(tx.pages[j]);
-            if (!result.isOk()) {
-                return result;
-            }
-            ++redone;
-        }
+        result = _file->flush();
+        if (!result.isOk()) return result;
+        result = _file->validateOpenedPages(true);
+        if (!result.isOk()) return result;
+        _diagnostics.pagesRedone = redone;
+        _diagnostics.lastRecoveryResult = "redo applied";
+        return DbResult::ok();
+    } catch (const std::bad_alloc&) {
+        return DbResult::error(DbStatus::NoSpace, "alloc failed");
     }
-    result = _file->flush();
-    if (!result.isOk()) {
-        return result;
-    }
-    result = _file->validateOpenedPages(true);
-    if (!result.isOk()) {
-        return result;
-    }
-    _diagnostics.pagesRedone = redone;
-    _diagnostics.lastRecoveryResult = "redo applied";
-    return DbResult::ok();
 }
 
 DbResult Database::validateRecoveryCoverage(
@@ -308,7 +326,7 @@ DbResult Database::validateRecoveryCoverage(
     if (!result.isOk()) return result;
 
     uint64_t finalPageCount = _file->pageCount();
-    std::vector<uint64_t> pageImages;
+    uint64_t retainedPageCount = 0;
     for (size_t i = 0; i < transactions.size(); ++i) {
         const WalTransaction& tx = transactions[i];
         if (tx.hasHeaderImage) {
@@ -320,15 +338,18 @@ DbResult Database::validateRecoveryCoverage(
             }
             finalPageCount = tx.headerImage.pageCount;
         }
-        for (size_t j = 0; j < tx.pages.size(); ++j) {
-            pageImages.push_back(tx.pages[j].pageId);
+        const size_t count = gxRecoveredPagesCount(&tx.pages);
+        if (count > static_cast<size_t>(UINT64_MAX - retainedPageCount)) {
+            return DbResult::error(DbStatus::TransactionTooLarge,
+                                   "retained WAL page count overflows");
         }
+        retainedPageCount += static_cast<uint64_t>(count);
     }
 
     uint64_t requiredBytes = 0;
     if (!checkedMulU64(finalPageCount, static_cast<uint64_t>(_file->pageSize()),
                        requiredBytes)) {
-        return DbResult::error(DbStatus::WalCorrupt,
+        return DbResult::error(DbStatus::TransactionTooLarge,
                                "recovery page count overflows the database extent");
     }
     if (fileSize % _file->pageSize() != 0 && requiredBytes < fileSize) {
@@ -343,15 +364,60 @@ DbResult Database::validateRecoveryCoverage(
     }
     if (firstMissingPage < finalPageCount) {
         const uint64_t missingCount = finalPageCount - firstMissingPage;
-        if (missingCount > pageImages.size()) {
+        if (missingCount > retainedPageCount) {
             return DbResult::error(DbStatus::RecoveryRequired,
                                    "WAL does not contain every page needed to repair the tail");
         }
-        for (uint64_t pageId = firstMissingPage; pageId < finalPageCount; ++pageId) {
-            if (std::find(pageImages.begin(), pageImages.end(), pageId) == pageImages.end()) {
-                return DbResult::error(DbStatus::RecoveryRequired,
-                                       "WAL is missing a page image required by the partial tail");
+
+        const uint64_t bitmapBytes64 = missingCount / 8 +
+                                       (missingCount % 8 != 0 ? 1 : 0);
+        if (bitmapBytes64 > static_cast<uint64_t>(static_cast<size_t>(-1))) {
+            return DbResult::error(DbStatus::TransactionTooLarge,
+                                   "recovery coverage bitmap exceeds addressable memory");
+        }
+        const GxAllocator& allocator = _wal->recoveryAllocator();
+        void* bitmapAllocation = nullptr;
+        const GxStatus allocStatus = gxAllocatorAllocate(
+            &allocator, static_cast<size_t>(bitmapBytes64), 1,
+            &bitmapAllocation);
+        if (allocStatus != GxStatus::Ok) {
+            const DbStatus status =
+                allocStatus == GxStatus::OutOfMemory
+                    ? DbStatus::NoSpace
+                    : allocStatus == GxStatus::ResourceLimit ||
+                              allocStatus == GxStatus::Overflow
+                          ? DbStatus::TransactionTooLarge
+                          : DbStatus::Internal;
+            return DbResult::error(status, "recovery coverage allocation failed");
+        }
+        uint8_t* coverage = static_cast<uint8_t*>(bitmapAllocation);
+        for (size_t i = 0; i < static_cast<size_t>(bitmapBytes64); ++i) {
+            coverage[i] = 0;
+        }
+        for (size_t i = 0; i < transactions.size(); ++i) {
+            const WalTransaction& tx = transactions[i];
+            for (const GxRecoveredPage* page = gxRecoveredPagesFirst(&tx.pages);
+                 page; page = gxRecoveredPageNext(page)) {
+                if (page->pageId >= firstMissingPage &&
+                    page->pageId < finalPageCount) {
+                    const uint64_t offset = page->pageId - firstMissingPage;
+                    coverage[static_cast<size_t>(offset / 8)] |=
+                        static_cast<uint8_t>(1u << (offset % 8));
+                }
             }
+        }
+        bool complete = true;
+        for (uint64_t bit = 0; bit < missingCount; ++bit) {
+            if ((coverage[static_cast<size_t>(bit / 8)] &
+                 static_cast<uint8_t>(1u << (bit % 8))) == 0) {
+                complete = false;
+                break;
+            }
+        }
+        gxAllocatorFree(&allocator, bitmapAllocation);
+        if (!complete) {
+            return DbResult::error(DbStatus::RecoveryRequired,
+                                   "WAL is missing a page image required by the partial tail");
         }
     } else if (fileSize % _file->pageSize() != 0) {
         return DbResult::error(DbStatus::RecoveryRequired,
@@ -410,7 +476,12 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
         return result;
     }
 
-    result = _catalog.load(*this, _file->rootPageId(), _file->pageSize(), _file->pageCount());
+    try {
+        result = _catalog.load(*this, _file->rootPageId(), _file->pageSize(),
+                               _file->pageCount());
+    } catch (const std::bad_alloc&) {
+        result = DbResult(DbStatus::NoSpace, std::string());
+    }
     if (!result.isOk()) {
         _wal.reset();
         _buffer.reset();
@@ -555,6 +626,10 @@ DbResult Database::beginTransaction(std::unique_ptr<Transaction>& out) {
         return DbResult::error(DbStatus::TransactionAlreadyActive,
                                "a writer transaction is already active");
     }
+    if (_transactionIdsExhausted) {
+        return DbResult::error(DbStatus::TransactionTooLarge,
+                               "transaction identifier space is exhausted");
+    }
 
     DbResult walResult = ensureWalOpen();
     if (!walResult.isOk()) {
@@ -571,7 +646,14 @@ DbResult Database::beginTransaction(std::unique_ptr<Transaction>& out) {
     }
 
     const uint64_t basePageCount = _file->pageCount();
-    std::unique_ptr<Transaction> tx(new Transaction(*this, _nextTxId++, basePageCount));
+    const uint64_t transactionId = _nextTxId;
+    std::unique_ptr<Transaction> tx(
+        new Transaction(*this, transactionId, basePageCount));
+    if (transactionId == UINT64_MAX) {
+        _transactionIdsExhausted = true;
+    } else {
+        _nextTxId = transactionId + 1;
+    }
     _activeTx = tx.get();
     out = std::move(tx);
     refreshDiagnostics();

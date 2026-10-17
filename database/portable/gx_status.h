@@ -7,7 +7,8 @@ enum class GxStatus {
     OutOfMemory,
     ResourceLimit,
     Overflow,
-    UnsupportedAlignment
+    UnsupportedAlignment,
+    CorruptData
 };
 
 #endif

@@ -45,6 +45,37 @@ uint32_t computePageCrc(const uint8_t* bytes, uint32_t pageSize) {
 
 } // namespace
 
+GxStatus gxDatabasePageInspect(const uint8_t* image, uint32_t pageSize,
+                               uint64_t expectedPageId,
+                               GxDatabasePageInfo* outInfo) {
+    if (!image || !outInfo ||
+        !gxos::db::isSupportedPageSize(pageSize)) {
+        return GxStatus::InvalidArgument;
+    }
+
+    const uint64_t pageId = gxos::db::loadLe64(
+        image + gxos::db::page_offset::PageId);
+    const uint32_t payloadSize = gxos::db::loadLe32(
+        image + gxos::db::page_offset::PayloadSize);
+    if (pageId != expectedPageId ||
+        payloadSize > pageSize - gxos::db::kPageHeaderSize ||
+        gxos::db::loadLe32(image + gxos::db::page_offset::PageCrc32) !=
+            computePageCrc(image, pageSize)) {
+        return GxStatus::CorruptData;
+    }
+
+    GxDatabasePageInfo info;
+    info.pageId = pageId;
+    info.pageType = gxos::db::loadLe16(
+        image + gxos::db::page_offset::PageType);
+    info.flags = gxos::db::loadLe16(image + gxos::db::page_offset::Flags);
+    info.payloadSize = payloadSize;
+    info.generation = gxos::db::loadLe32(
+        image + gxos::db::page_offset::Generation);
+    *outInfo = info;
+    return GxStatus::Ok;
+}
+
 GxStatus gxDatabasePageEncode(uint8_t* output, uint32_t pageSize,
                               uint64_t pageId, uint16_t pageType,
                               uint16_t flags, uint32_t generation,

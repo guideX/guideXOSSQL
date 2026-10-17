@@ -22,7 +22,8 @@ typedef enum GxWalScanStatus {
     GxWalScanStatus_Corrupt,
     GxWalScanStatus_Foreign,
     GxWalScanStatus_NoSpace,
-    GxWalScanStatus_Overflow
+    GxWalScanStatus_Overflow,
+    GxWalScanStatus_ResourceLimit
 } GxWalScanStatus;
 
 typedef bool (*GxWalReadAt)(void* context, uint64_t offset, uint8_t* buffer,

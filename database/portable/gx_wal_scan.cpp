@@ -69,6 +69,9 @@ GxWalScanStatus mapAllocatorStatus(GxStatus status) {
     if (status == GxStatus::InvalidArgument) {
         return GxWalScanStatus_InvalidArgument;
     }
+    if (status == GxStatus::ResourceLimit || status == GxStatus::Overflow) {
+        return GxWalScanStatus_ResourceLimit;
+    }
     return GxWalScanStatus_NoSpace;
 }
 

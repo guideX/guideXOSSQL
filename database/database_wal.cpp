@@ -6,9 +6,12 @@
 
 #include "database_checksum.h"
 #include "database_endian.h"
+#include "database_transaction.h"
 #include "portable/gx_allocator_hosted.h"
 #include "portable/gx_array.h"
+#include "portable/gx_page_codec.h"
 #include "portable/gx_wal_page_image.h"
+#include "portable/gx_recovered_pages.h"
 #include "portable/gx_wal_record.h"
 #include "portable/gx_wal_scan.h"
 
@@ -27,6 +30,8 @@ static_assert(kWalRecordBegin == GX_WAL_SCAN_RECORD_BEGIN &&
 static_assert(static_cast<uint32_t>(wal_page_offset::PageBytes) ==
                   static_cast<uint32_t>(GX_WAL_PAGE_IMAGE_HEADER_SIZE),
               "portable PAGE_IMAGE header must match SQL3 framing");
+static_assert(GX_RECOVERED_PAGES_SQL3_MAX_COUNT == kMaxTransactionPages,
+              "portable recovered-page bound must match SQL3 transaction policy");
 
 std::string walPathFor(const std::string& databasePath) {
     const size_t slash = databasePath.find_last_of("/\\");
@@ -72,18 +77,37 @@ bool readWalBytes(void* context, uint64_t offset, uint8_t* buffer,
 struct WalRecordScanContext {
     uint32_t pageSize;
     const uint8_t* databaseId;
+    GxAllocator pageAllocator;
     bool haveTransaction;
+    uint32_t pageImageRecords;
     WalTransaction current;
     std::vector<WalTransaction>* transactions;
     uint64_t maxCommittedId;
     const char* errorMessage;
 
     WalRecordScanContext(uint32_t pageSizeIn, const uint8_t databaseIdIn[16],
+                         const GxAllocator& pageAllocatorIn,
                          std::vector<WalTransaction>* transactionsIn)
         : pageSize(pageSizeIn), databaseId(databaseIdIn),
-          haveTransaction(false), current(), transactions(transactionsIn),
+          pageAllocator(pageAllocatorIn), haveTransaction(false),
+          pageImageRecords(0), current(), transactions(transactionsIn),
           maxCommittedId(0), errorMessage(nullptr) {}
 };
+
+GxWalScanStatus mapRetainedPageStatus(GxStatus status) {
+    if (status == GxStatus::OutOfMemory ||
+        status == GxStatus::UnsupportedAlignment) {
+        return GxWalScanStatus_NoSpace;
+    }
+    if (status == GxStatus::ResourceLimit || status == GxStatus::Overflow) {
+        return GxWalScanStatus_ResourceLimit;
+    }
+    if (status == GxStatus::CorruptData ||
+        status == GxStatus::InvalidArgument) {
+        return GxWalScanStatus_Corrupt;
+    }
+    return GxWalScanStatus_InvalidArgument;
+}
 
 GxWalScanStatus visitWalRecord(void* opaque, uint8_t type, uint64_t txId,
                                const uint8_t* payload,
@@ -98,6 +122,17 @@ GxWalScanStatus visitWalRecord(void* opaque, uint8_t type, uint64_t txId,
             context.haveTransaction = true;
             context.current = WalTransaction();
             context.current.transactionId = txId;
+            const GxStatus initStatus = gxRecoveredPagesInit(
+                &context.current.pages, &context.pageAllocator, context.pageSize,
+                kMaxTransactionPages,
+                static_cast<size_t>(kMaxWalFileBytes - kWalHeaderSize));
+            if (initStatus != GxStatus::Ok) {
+                context.errorMessage = "WAL recovery page collection initialization failed";
+                return initStatus == GxStatus::ResourceLimit
+                           ? GxWalScanStatus_ResourceLimit
+                           : GxWalScanStatus_InvalidArgument;
+            }
+            context.pageImageRecords = 0;
         } else if (type == kWalRecordPageImage) {
             if (!context.haveTransaction ||
                 txId != context.current.transactionId) {
@@ -108,16 +143,25 @@ GxWalScanStatus visitWalRecord(void* opaque, uint8_t type, uint64_t txId,
                 context.errorMessage = "WAL PAGE_IMAGE payload size mismatch";
                 return GxWalScanStatus_Corrupt;
             }
-            const uint64_t pageId = loadLe64(payload + wal_page_offset::PageId);
-            DatabasePage page;
-            DbResult parsed = DatabasePage::parse(
-                payload + wal_page_offset::PageBytes, context.pageSize, pageId,
-                page);
-            if (!parsed.isOk()) {
-                context.errorMessage = "WAL PAGE_IMAGE is not a valid page";
-                return GxWalScanStatus_Corrupt;
+            if (context.pageImageRecords >= kMaxTransactionPages) {
+                context.errorMessage = "WAL transaction exceeds the page-image limit";
+                return GxWalScanStatus_ResourceLimit;
             }
-            context.current.pages.push_back(std::move(page));
+            const uint64_t pageId = loadLe64(payload + wal_page_offset::PageId);
+            const GxStatus retainStatus = gxRecoveredPagesRetain(
+                &context.current.pages, pageId,
+                payload + wal_page_offset::PageBytes, context.pageSize);
+            if (retainStatus != GxStatus::Ok) {
+                context.errorMessage =
+                    retainStatus == GxStatus::OutOfMemory
+                        ? "WAL recovered-page allocation failed"
+                        : retainStatus == GxStatus::ResourceLimit ||
+                                  retainStatus == GxStatus::Overflow
+                              ? "WAL transaction exceeds the retained-page limit"
+                              : "WAL PAGE_IMAGE is not a valid page";
+                return mapRetainedPageStatus(retainStatus);
+            }
+            ++context.pageImageRecords;
         } else if (type == kWalRecordHeaderImage) {
             if (!context.haveTransaction ||
                 txId != context.current.transactionId) {
@@ -152,6 +196,7 @@ GxWalScanStatus visitWalRecord(void* opaque, uint8_t type, uint64_t txId,
             }
             context.current = WalTransaction();
             context.haveTransaction = false;
+            context.pageImageRecords = 0;
         }
     } catch (const std::bad_alloc&) {
         context.errorMessage = "WAL recovery transaction allocation failed";
@@ -406,6 +451,7 @@ DbResult WriteAheadLog::scan(WalState& outState,
     outMessage.clear();
     outState = WalState::Clean;
 
+    try {
     if (!_file) {
         outState = WalState::Absent;
         return DbResult::error(DbStatus::NotOpen, "WAL is not open");
@@ -473,7 +519,8 @@ DbResult WriteAheadLog::scan(WalState& outState,
                   "portable WAL scanner prefix must match SQL3 framing");
     static_assert(GX_WAL_SCAN_MAX_PAYLOAD == kMaxWalRecordPayload,
                   "portable WAL scanner bound must match SQL3 policy");
-    WalRecordScanContext context(_pageSize, _databaseId, &outTransactions);
+    WalRecordScanContext context(_pageSize, _databaseId, _recordAllocator,
+                                 &outTransactions);
     GxWalScanResult scanResult = {};
     const GxWalScanStatus scanStatus = gxWalScanRecords(
         kWalHeaderSize, size, kMaxWalFileBytes, kMaxWalRecordPayload,
@@ -489,6 +536,11 @@ DbResult WriteAheadLog::scan(WalState& outState,
             outMessage = context.errorMessage ? context.errorMessage
                                               : "WAL recovery scan allocation failed";
             return DbResult::error(DbStatus::NoSpace, outMessage);
+        }
+        if (scanStatus == GxWalScanStatus_ResourceLimit) {
+            outMessage = context.errorMessage ? context.errorMessage
+                                              : "WAL recovery exceeds SQL3 limits";
+            return DbResult::error(DbStatus::TransactionTooLarge, outMessage);
         }
         if (scanStatus == GxWalScanStatus_Foreign) {
             outState = WalState::Foreign;
@@ -520,6 +572,12 @@ DbResult WriteAheadLog::scan(WalState& outState,
         outState = WalState::Clean;
     }
     return DbResult::ok();
+    } catch (const std::bad_alloc&) {
+        outTransactions.clear();
+        outMessage.clear();
+        outState = WalState::Clean;
+        return DbResult(DbStatus::NoSpace, std::string());
+    }
 }
 
 DbResult WriteAheadLog::checkpoint() {

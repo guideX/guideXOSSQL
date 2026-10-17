@@ -1,9 +1,11 @@
 #include "database_file.h"
 
 #include <cstring>
+#include <new>
 #include <utility>
 
 #include "database_endian.h"
+#include "portable/gx_page_codec.h"
 
 namespace gxos {
 namespace db {
@@ -374,7 +376,11 @@ DbResult DatabaseFile::close() {
     }
     DbResult result = DbResult::ok();
     if (!_readOnly && _headerDirty) {
-        result = flush();
+        try {
+            result = flush();
+        } catch (const std::bad_alloc&) {
+            result = DbResult(DbStatus::NoSpace, std::string());
+        }
     }
     DbResult closeResult = _file->close();
     _open = false;
@@ -435,6 +441,43 @@ DbResult DatabaseFile::writePage(const DatabasePage& page) {
     }
     if (!_file->writeAt(offset, bytes.data(), bytes.size())) {
         return fail(DbStatus::IoError, "failed to write page");
+    }
+    return DbResult::ok();
+}
+
+DbResult DatabaseFile::writePageImage(uint64_t pageId, const uint8_t* image,
+                                      uint32_t imageSize) {
+    _lastError = DbResult::ok();
+    if (!_open) {
+        return fail(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return fail(DbStatus::ReadOnly, "database opened read-only");
+    }
+    if (pageId == kHeaderPageId || pageId >= _header.pageCount) {
+        return fail(DbStatus::OutOfBounds, "page id outside allocated range");
+    }
+    if (image == nullptr || imageSize != _header.pageSize) {
+        return fail(DbStatus::InvalidArgument,
+                    "recovery page image has an invalid extent");
+    }
+
+    GxDatabasePageInfo info = {};
+    const GxStatus inspectStatus = gxDatabasePageInspect(
+        image, imageSize, pageId, &info);
+    if (inspectStatus != GxStatus::Ok) {
+        return fail(inspectStatus == GxStatus::CorruptData
+                        ? DbStatus::CorruptPage
+                        : DbStatus::InvalidArgument,
+                    "recovery page image failed validation");
+    }
+
+    uint64_t offset = 0;
+    if (!computePageOffset(pageId, offset)) {
+        return fail(DbStatus::OutOfBounds, "page offset overflow");
+    }
+    if (!_file->writeAt(offset, image, imageSize)) {
+        return fail(DbStatus::IoError, "failed to write recovered page image");
     }
     return DbResult::ok();
 }

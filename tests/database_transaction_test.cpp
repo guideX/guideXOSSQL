@@ -1421,7 +1421,7 @@ void testPartialTailRecoveryMatrix() {
     BudgetFileSystem failedFs(failedState);
     std::unique_ptr<Database> failedOpen;
     CHECK_STATUS(Database::open(failedRepair, DatabaseOpenOptions(), failedOpen,
-                                &failedFs), DbStatus::RecoveryFailed);
+                                &failedFs), DbStatus::IoError);
     CHECK(!failedOpen);
     CHECK(readFileBytes(failedRepair) == failedDbSnapshot);
     CHECK(readFileBytes(walPath(failedRepair)) == failedWalSnapshot);

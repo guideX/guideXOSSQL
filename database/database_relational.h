@@ -198,6 +198,7 @@ private:
     bool _hasWalRecordAllocator;
     Transaction* _activeTx;
     uint64_t _nextTxId;
+    bool _transactionIdsExhausted;
     uint64_t _dataEpoch;
     uint64_t _schemaGeneration;
     std::string _walPath;

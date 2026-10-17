@@ -37,6 +37,7 @@
 #include "database_page.h"
 #include "database_result.h"
 #include "portable/gx_allocator.h"
+#include "portable/gx_recovered_pages.h"
 
 namespace gxos {
 namespace db {
@@ -109,9 +110,35 @@ struct WalTransaction {
     uint64_t transactionId;
     bool hasHeaderImage;
     DatabaseHeader headerImage;
-    std::vector<DatabasePage> pages;
+    GxRecoveredPageCollection pages;
 
-    WalTransaction() : transactionId(0), hasHeaderImage(false) {}
+    WalTransaction() : transactionId(0), hasHeaderImage(false), pages() {}
+    ~WalTransaction() { gxRecoveredPagesDestroy(&pages); }
+
+    WalTransaction(WalTransaction&& other) noexcept
+        : transactionId(other.transactionId),
+          hasHeaderImage(other.hasHeaderImage), headerImage(other.headerImage),
+          pages() {
+        (void)gxRecoveredPagesMove(&pages, &other.pages);
+        other.transactionId = 0;
+        other.hasHeaderImage = false;
+    }
+
+    WalTransaction& operator=(WalTransaction&& other) noexcept {
+        if (this != &other) {
+            gxRecoveredPagesDestroy(&pages);
+            transactionId = other.transactionId;
+            hasHeaderImage = other.hasHeaderImage;
+            headerImage = other.headerImage;
+            (void)gxRecoveredPagesMove(&pages, &other.pages);
+            other.transactionId = 0;
+            other.hasHeaderImage = false;
+        }
+        return *this;
+    }
+
+    WalTransaction(const WalTransaction&) = delete;
+    WalTransaction& operator=(const WalTransaction&) = delete;
 };
 
 class WriteAheadLog {
@@ -152,6 +179,7 @@ public:
     uint64_t bytesSinceCheckpoint() const { return _bytesSinceCheckpoint; }
     uint64_t generation() const { return _generation; }
     uint64_t lastTransactionId() const { return _lastTransactionId; }
+    const GxAllocator& recoveryAllocator() const { return _recordAllocator; }
 
 private:
     DbResult appendEncodedRecord(const uint8_t* bytes, size_t recordSize);

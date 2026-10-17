@@ -57,8 +57,9 @@ struct DatabaseOpenOptions {
     // after its WAL has been scanned. Low-level database opens keep this false.
     bool deferPageValidationForWalRecovery;
     uint32_t bufferCapacity; // 0 => default buffer size
-    // Optional explicit allocator for WAL record scratch buffers. The
-    // allocator is copied; its context must outlive the open Database.
+    // Optional explicit allocator for WAL scan scratch, retained page images,
+    // and recovery coverage scratch. The allocator is copied; its context must
+    // outlive the open Database.
     const GxAllocator* walRecordAllocator;
 
     DatabaseOpenOptions()
@@ -99,6 +100,11 @@ public:
 
     // Overwrites an already-allocated page (1 <= pageId < pageCount).
     DbResult writePage(const DatabasePage& page) override;
+
+    // SQL3 recovery redo for a validated, allocator-owned serialized page
+    // image. Writes exact bytes without a temporary hosted page/vector.
+    DbResult writePageImage(uint64_t pageId, const uint8_t* image,
+                            uint32_t imageSize);
 
     // Appends a new page. Returns its id in `outPageId`.
     DbResult allocatePage(PageType type, uint64_t& outPageId) override;

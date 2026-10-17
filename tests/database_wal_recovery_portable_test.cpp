@@ -202,6 +202,16 @@ bool sameBytes(const std::vector<uint8_t>& left, const uint8_t* right,
            (length == 0 || std::memcmp(left.data(), right, length) == 0);
 }
 
+const GxRecoveredPage* pageAt(const GxRecoveredPageCollection& pages,
+                              size_t index) {
+    const GxRecoveredPage* page = gxRecoveredPagesFirst(&pages);
+    while (page && index != 0) {
+        page = gxRecoveredPageNext(page);
+        --index;
+    }
+    return page;
+}
+
 void testGoldenBeginAndExactDecodedRecords() {
     // Golden SQL3 BEGIN(1), independently fixed to the P2 CRC vector.
     const uint8_t golden[] = {
@@ -307,15 +317,23 @@ void testProductionRecoveryEquivalence() {
         CHECK(transactions[0].transactionId == 41);
         CHECK(transactions[0].hasHeaderImage);
         CHECK(transactions[0].headerImage.pageCount == 3);
-        CHECK(transactions[0].pages.size() == 1);
-        CHECK(transactions[0].pages[0].pageId == 2);
-        CHECK(transactions[0].pages[0].payload == makePage(2, 0x24).payload);
+        CHECK(gxRecoveredPagesCount(&transactions[0].pages) == 1);
+        const GxRecoveredPage* firstPage = pageAt(transactions[0].pages, 0);
+        DatabasePage decodedFirst;
+        CHECK(firstPage && DatabasePage::parse(gxRecoveredPageImage(firstPage),
+                                               kPageSize, 2, decodedFirst).isOk());
+        CHECK(firstPage && firstPage->pageId == 2);
+        CHECK(decodedFirst.payload == makePage(2, 0x24).payload);
         CHECK(transactions[1].transactionId == 42);
         CHECK(transactions[1].hasHeaderImage);
         CHECK(transactions[1].headerImage.pageCount == 4);
-        CHECK(transactions[1].pages.size() == 1);
-        CHECK(transactions[1].pages[0].pageId == 3);
-        CHECK(transactions[1].pages[0].payload == makePage(3, 0x57).payload);
+        CHECK(gxRecoveredPagesCount(&transactions[1].pages) == 1);
+        const GxRecoveredPage* secondPage = pageAt(transactions[1].pages, 0);
+        DatabasePage decodedSecond;
+        CHECK(secondPage && DatabasePage::parse(gxRecoveredPageImage(secondPage),
+                                                kPageSize, 3, decodedSecond).isOk());
+        CHECK(secondPage && secondPage->pageId == 3);
+        CHECK(decodedSecond.payload == makePage(3, 0x57).payload);
     }
     CHECK(reader->lastTransactionId() == 42);
 }
@@ -438,6 +456,9 @@ void testAllocationFailureAndRetry() {
     CHECK(reader->scan(state, transactions, message).isOk());
     CHECK(state == WalState::Committed);
     CHECK(transactions.size() == 1);
+    CHECK(transactions.size() == 1 &&
+          arena.outstanding == gxRecoveredPagesCount(&transactions[0].pages));
+    transactions.clear();
     CHECK(arena.outstanding == 0);
     CHECK(arena.invalidFrees == 0);
     CHECK(arena.successfulAllocations == arena.freeCalls);
@@ -473,8 +494,10 @@ void testPayloadScratchGrowthFailure() {
         CHECK(transactions[0].transactionId == 69);
         CHECK(transactions[0].hasHeaderImage);
         CHECK(transactions[1].transactionId == 70);
-        CHECK(transactions[1].pages.size() == 1);
+        CHECK(gxRecoveredPagesCount(&transactions[1].pages) == 1);
     }
+    CHECK(arena.outstanding == 1);
+    transactions.clear();
     CHECK(arena.outstanding == 0);
     CHECK(arena.invalidFrees == 0);
     CHECK(arena.successfulAllocations == arena.freeCalls);
