@@ -5,6 +5,12 @@
 
 #include "gx_array.h"
 
+enum {
+    GX_WAL_RECORD_PREFIX_SIZE = 20,
+    GX_WAL_RECORD_CRC_OFFSET = 16,
+    GX_WAL_PAGE_IMAGE_HEADER_SIZE = 12
+};
+
 // Encodes one SQL3 WAL record into an initialized byte-record array. The
 // prefix is the existing 20-byte format. The output is unchanged if validation
 // or reserve fails; after reserve, encoding cannot fail. For compatibility,

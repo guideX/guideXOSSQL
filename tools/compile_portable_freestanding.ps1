@@ -13,7 +13,10 @@ $sources = @(
     "database/portable/gx_array.cpp",
     "database/portable/gx_owner.cpp",
     "database/portable/gx_string.cpp",
-    "database/portable/gx_wal_record.cpp"
+    "database/database_checksum.cpp",
+    "database/portable/gx_page_codec.cpp",
+    "database/portable/gx_wal_record.cpp",
+    "database/portable/gx_wal_page_image.cpp"
 )
 $flags = @(
     "-std=c++14", "-ffreestanding", "-O2", "-Wall", "-Wextra",
@@ -43,8 +46,13 @@ if ($nm) {
         if ($LASTEXITCODE -ne 0) {
             throw "Could not inspect unresolved symbols in $($object.Name)."
         }
+        # The checksum's established function-local CRC table uses the
+        # guard entry points implemented by the Server kernel C++ runtime.
         $forbiddenRuntime = $undefinedSymbols | Where-Object {
-            $_ -cmatch 'std::|bad_alloc|__cxa_|__gxx_personality|typeinfo|__dynamic_cast|_ZTI|_ZTV|malloc|calloc|realloc|free|memcpy|memmove|memset|printf|iostream'
+            $_ -cmatch 'std::|bad_alloc|__gxx_personality|typeinfo|__dynamic_cast|_ZTI|_ZTV|malloc|calloc|realloc|free|memcpy|memmove|memset|printf|iostream' -or
+            (($_ -cmatch '__cxa_') -and
+             -not ($object.Name -eq "database_checksum.o" -and
+                   $_ -cmatch '__cxa_guard_(acquire|release)'))
         }
         if ($forbiddenRuntime) {
             throw "Unexpected hosted/runtime symbol in $($object.Name): $forbiddenRuntime"

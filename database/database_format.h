@@ -16,7 +16,7 @@
 // Page 0 is the database header page. Pages 1..pageCount-1 are ordinary pages
 // carrying a fixed page header followed by an opaque payload.
 
-#include <cstdint>
+#include <stdint.h>
 
 namespace gxos {
 namespace db {

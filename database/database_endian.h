@@ -7,8 +7,8 @@
 // reinterpreted. Overflow-checked helpers are used for every file offset,
 // size and page-count calculation derived from untrusted input.
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
 #include "database_format.h"
 

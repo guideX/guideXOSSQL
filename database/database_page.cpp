@@ -4,6 +4,7 @@
 
 #include "database_checksum.h"
 #include "database_endian.h"
+#include "portable/gx_page_codec.h"
 
 namespace gxos {
 namespace db {
@@ -46,20 +47,14 @@ DbResult DatabasePage::serialize(std::vector<uint8_t>& out, uint32_t pageSize) c
         return DbResult::error(DbStatus::InvalidArgument, "payload exceeds page capacity");
     }
 
-    out.assign(pageSize, 0);
-
-    storeLe64(out.data() + page_offset::PageId, pageId);
-    storeLe16(out.data() + page_offset::PageType, static_cast<uint16_t>(type));
-    storeLe16(out.data() + page_offset::Flags, flags);
-    storeLe32(out.data() + page_offset::PayloadSize,
-              static_cast<uint32_t>(payload.size()));
-    storeLe32(out.data() + page_offset::Generation, generation);
-    if (!payload.empty()) {
-        std::memcpy(out.data() + kPageHeaderSize, payload.data(), payload.size());
+    out.resize(pageSize);
+    const GxStatus encodeStatus = gxDatabasePageEncode(
+        out.data(), pageSize, pageId, static_cast<uint16_t>(type), flags,
+        generation, payload.empty() ? nullptr : payload.data(), payload.size());
+    if (encodeStatus != GxStatus::Ok) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "database page encoding rejected its input");
     }
-
-    const uint32_t crc = computePageCrc(out.data(), pageSize);
-    storeLe32(out.data() + page_offset::PageCrc32, crc);
     return DbResult::ok();
 }
 

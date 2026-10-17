@@ -12,8 +12,8 @@ uint32_t crc32Final(uint32_t state);
 
 namespace {
 
-const size_t kWalRecordPrefixBytes = 20;
-const size_t kWalRecordCrcOffset = 16;
+const size_t kWalRecordPrefixBytes = GX_WAL_RECORD_PREFIX_SIZE;
+const size_t kWalRecordCrcOffset = GX_WAL_RECORD_CRC_OFFSET;
 
 void copyBytes(uint8_t* destination, const uint8_t* source, size_t length) {
     for (size_t i = 0; i < length; ++i) destination[i] = source[i];

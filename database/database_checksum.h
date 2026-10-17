@@ -10,8 +10,8 @@
 // against deliberate tampering: an attacker who rewrites a page can recompute
 // the checksum.
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
 namespace gxos {
 namespace db {

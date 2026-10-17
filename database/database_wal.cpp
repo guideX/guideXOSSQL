@@ -6,12 +6,19 @@
 #include "database_endian.h"
 #include "portable/gx_allocator_hosted.h"
 #include "portable/gx_array.h"
+#include "portable/gx_wal_page_image.h"
 #include "portable/gx_wal_record.h"
 
 namespace gxos {
 namespace db {
 
 const uint8_t kWalMagic[8] = {'G', 'X', 'W', 'A', 'L', '\r', '\n', 0x1A};
+
+static_assert(kWalRecordPrefixSize == GX_WAL_RECORD_PREFIX_SIZE,
+              "portable WAL record prefix must match SQL3 framing");
+static_assert(static_cast<uint32_t>(wal_page_offset::PageBytes) ==
+                  static_cast<uint32_t>(GX_WAL_PAGE_IMAGE_HEADER_SIZE),
+              "portable PAGE_IMAGE header must match SQL3 framing");
 
 std::string walPathFor(const std::string& databasePath) {
     const size_t slash = databasePath.find_last_of("/\\");
@@ -181,7 +188,10 @@ DbResult WriteAheadLog::appendRecord(uint8_t type, uint64_t transactionId,
     if (payloadLength > kMaxWalRecordPayload) {
         return fail(DbStatus::TransactionTooLarge, "WAL record payload exceeds maximum");
     }
-    if (_writeOffset + kWalRecordPrefixSize + payloadLength > kMaxWalFileBytes) {
+    const uint64_t recordSize =
+        static_cast<uint64_t>(kWalRecordPrefixSize) + payloadLength;
+    if (_writeOffset > kMaxWalFileBytes ||
+        recordSize > kMaxWalFileBytes - _writeOffset) {
         return fail(DbStatus::TransactionTooLarge, "WAL file size limit exceeded");
     }
 
@@ -204,14 +214,27 @@ DbResult WriteAheadLog::appendRecord(uint8_t type, uint64_t transactionId,
         return fail(dbStatus, "WAL record buffer allocation failed");
     }
 
-    const size_t recordSize = gxArraySize(&record);
-    if (!_file->writeAt(_writeOffset, record.data, recordSize)) {
-        gxArrayDestroy(&record);
+    DbResult appendResult = appendEncodedRecord(record.data,
+                                                gxArraySize(&record));
+    gxArrayDestroy(&record);
+    return appendResult;
+}
+
+DbResult WriteAheadLog::appendEncodedRecord(const uint8_t* bytes,
+                                            size_t recordSize) {
+    if (!_file || _readOnly) {
+        return fail(DbStatus::ReadOnly, "WAL is not writable");
+    }
+    if (bytes == nullptr || recordSize < kWalRecordPrefixSize ||
+        _writeOffset > kMaxWalFileBytes ||
+        recordSize > kMaxWalFileBytes - _writeOffset) {
+        return fail(DbStatus::TransactionTooLarge, "WAL file size limit exceeded");
+    }
+    if (!_file->writeAt(_writeOffset, bytes, recordSize)) {
         return fail(DbStatus::IoError, "failed to append WAL record");
     }
     _writeOffset += recordSize;
     _bytesSinceCheckpoint += recordSize;
-    gxArrayDestroy(&record);
     return DbResult::ok();
 }
 
@@ -220,19 +243,42 @@ DbResult WriteAheadLog::appendBegin(uint64_t transactionId) {
 }
 
 DbResult WriteAheadLog::appendPageImage(uint64_t transactionId, const DatabasePage& page) {
-    std::vector<uint8_t> bytes;
-    DbResult result = page.serialize(bytes, _pageSize);
-    if (!result.isOk()) {
-        return result;
+    if (!_file || _readOnly) {
+        return fail(DbStatus::ReadOnly, "WAL is not writable");
     }
-    std::vector<uint8_t> payload(wal_page_offset::PageBytes + bytes.size(), 0);
-    storeLe16(payload.data() + wal_page_offset::PageType,
-              static_cast<uint16_t>(page.type));
-    storeLe16(payload.data() + wal_page_offset::Reserved, 0);
-    storeLe64(payload.data() + wal_page_offset::PageId, page.pageId);
-    std::memcpy(payload.data() + wal_page_offset::PageBytes, bytes.data(), bytes.size());
-    return appendRecord(kWalRecordPageImage, transactionId, payload.data(),
-                        static_cast<uint32_t>(payload.size()));
+    if (!isSupportedPageSize(_pageSize)) {
+        return fail(DbStatus::InvalidArgument, "unsupported WAL page size");
+    }
+
+    GxArray record = {};
+    const size_t maximumRecordBytes = kWalRecordPrefixSize +
+                                      wal_page_offset::PageBytes +
+                                      static_cast<size_t>(_pageSize);
+    GxStatus status = gxArrayInit(&record, &_recordAllocator, 1,
+                                  maximumRecordBytes);
+    if (status != GxStatus::Ok) {
+        return fail(DbStatus::NoSpace, "WAL page-image buffer initialization failed");
+    }
+    status = gxWalPageImageRecordEncode(
+        &record, transactionId, page.pageId, static_cast<uint16_t>(page.type),
+        page.flags, page.generation,
+        page.payload.empty() ? nullptr : page.payload.data(), page.payload.size(),
+        _pageSize, kMaxWalRecordPayload);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&record);
+        const DbStatus dbStatus = status == GxStatus::Overflow
+                                      ? DbStatus::OutOfBounds
+                                      : status == GxStatus::InvalidArgument
+                                            ? DbStatus::InvalidArgument
+                                            : status == GxStatus::ResourceLimit
+                                                  ? DbStatus::TransactionTooLarge
+                                                  : DbStatus::NoSpace;
+        return fail(dbStatus, "WAL page-image encoding failed");
+    }
+    DbResult appendResult = appendEncodedRecord(record.data,
+                                                gxArraySize(&record));
+    gxArrayDestroy(&record);
+    return appendResult;
 }
 
 DbResult WriteAheadLog::appendHeaderImage(uint64_t transactionId,

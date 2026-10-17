@@ -154,6 +154,7 @@ public:
     uint64_t lastTransactionId() const { return _lastTransactionId; }
 
 private:
+    DbResult appendEncodedRecord(const uint8_t* bytes, size_t recordSize);
     DbResult appendRecord(uint8_t type, uint64_t transactionId, const uint8_t* payload,
                           uint32_t payloadLength);
     DbResult writeHeader(uint64_t generation, uint64_t lastTransactionId);
