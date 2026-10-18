@@ -50,7 +50,8 @@ BufferManager::BufferManager(DatabaseFile& file, uint32_t capacity,
                              const GxAllocator* allocator)
     : _file(file), _capacity(capacity == 0 ? 1 : capacity), _pinned(0),
       _allocator(), _cache(), _slots(nullptr), _slotBytes(0),
-      _slotsConstructed(0), _initialized(false) {
+      _slotsConstructed(0), _initialized(false),
+      _useHostedAllocator(allocator == nullptr) {
     if (allocator) _allocator = *allocator;
 }
 
@@ -73,12 +74,17 @@ DbResult BufferManager::init() {
         return DbResult::error(DbStatus::InvalidArgument,
                                "buffer manager is already initialized");
     }
-    if (_allocator.allocate == nullptr || _allocator.deallocate == nullptr) {
+    if (_useHostedAllocator) {
         GxStatus hostedStatus = gxHostedAllocatorInit(
             &_allocator, static_cast<size_t>(-1));
         if (hostedStatus != GxStatus::Ok) {
             return cacheStatus(hostedStatus, "page-cache allocator setup failed");
         }
+    } else if (_allocator.allocate == nullptr ||
+               _allocator.deallocate == nullptr) {
+        return DbResult::error(
+            DbStatus::InvalidArgument,
+            "page-cache allocator must provide allocate and deallocate callbacks");
     }
     if (_capacity > static_cast<size_t>(-1) / sizeof(BufferSlot)) {
         return DbResult::error(DbStatus::TransactionTooLarge,

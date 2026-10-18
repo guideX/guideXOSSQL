@@ -46,6 +46,8 @@ struct BufferSlot {
 
 class BufferManager {
 public:
+    // A null allocator selects the hosted allocator. A supplied allocator is
+    // copied by value, while its context remains borrowed through destruction.
     BufferManager(DatabaseFile& file, uint32_t capacity,
                   const GxAllocator* allocator = nullptr);
     ~BufferManager();
@@ -107,6 +109,7 @@ private:
     size_t _slotBytes;
     uint32_t _slotsConstructed;
     bool _initialized;
+    bool _useHostedAllocator;
 };
 
 } // namespace db

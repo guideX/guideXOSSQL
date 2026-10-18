@@ -279,6 +279,28 @@ void testPortableEntryInitializationFailures() {
     CHECK(arena.outstanding == 0);
     gxArenaDisableFailure(&arena);
 
+    // An explicitly supplied but incomplete allocator is a configuration
+    // error. It must not be replaced by the hosted allocator.
+    GxAllocator incompleteAllocator = {};
+    incompleteAllocator.maxAllocation = static_cast<size_t>(-1);
+    incompleteAllocator.maxAlignment = 8;
+    {
+        BufferManager cache(*file, 2, &incompleteAllocator);
+        CHECK_STATUS(cache.init(), DbStatus::InvalidArgument);
+        CHECK(cache.residentCount() == 0);
+    }
+
+    // Resource limits from the selected production allocator reach the SQL
+    // caller and leave no partially initialized cache allocation behind.
+    GxAllocator limitedAllocator = allocator;
+    limitedAllocator.maxAllocation = 1;
+    {
+        BufferManager cache(*file, 2, &limitedAllocator);
+        CHECK_STATUS(cache.init(), DbStatus::TransactionTooLarge);
+    }
+    CHECK(arena.outstanding == 0);
+    CHECK(arena.invalidFrees == 0);
+
     CHECK_STATUS(file->close(), DbStatus::Ok);
     (void)pageId;
 }
@@ -303,6 +325,9 @@ void testBufferManagerOwnershipEvictionAndIoFailures() {
         BufferManager cache(*file, 2, &allocator);
         CHECK_STATUS(cache.init(), DbStatus::Ok);
         CHECK(cache.capacity() == 2);
+        const size_t allocationsAfterInit = arena.outstanding;
+        CHECK_STATUS(cache.init(), DbStatus::InvalidArgument);
+        CHECK(arena.outstanding == allocationsAfterInit);
 
         // Repeated allocation failure never publishes a partial miss.
         for (int attempt = 0; attempt < 2; ++attempt) {
