@@ -1,0 +1,126 @@
+param(
+    [string]$Compiler = "g++",
+    [string]$ServerKernelRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "guideXOSServer_NATIVE_DB_STORAGE\kernel"),
+    [string]$OutputDirectory = (Join-Path $env:TEMP "guideXOSSql-NDB1R4P9")
+)
+
+$ErrorActionPreference = "Stop"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$outputRoot = [IO.Path]::GetFullPath(
+    $(if ([IO.Path]::IsPathRooted($OutputDirectory)) {
+        $OutputDirectory
+    } else {
+        Join-Path $repoRoot $OutputDirectory
+    }))
+$repoPrefix = [IO.Path]::GetFullPath($repoRoot).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+if ($outputRoot.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputDirectory must be outside the SQL checkout: $outputRoot"
+}
+if (Test-Path -LiteralPath $outputRoot) {
+    if (Get-ChildItem -LiteralPath $outputRoot -Force | Select-Object -First 1) {
+        throw "OutputDirectory must be fresh and empty; refusing to overwrite: $outputRoot"
+    }
+} else {
+    New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+}
+if (-not (Test-Path -LiteralPath (Join-Path $ServerKernelRoot "arch\amd64\Makefile.arch"))) {
+    throw "ServerKernelRoot does not contain the AMD64 target configuration: $ServerKernelRoot"
+}
+$serverKernelRoot = [IO.Path]::GetFullPath($ServerKernelRoot)
+$serverRoot = Split-Path -Parent $serverKernelRoot
+
+$sources = @(
+    "database/database_format.cpp",
+    "database/database_checksum.cpp",
+    "database/database_io.cpp",
+    "database/database_native_io.cpp",
+    "database/database_header.cpp",
+    "database/database_page.cpp",
+    "database/database_file.cpp",
+    "database/database_engine.cpp",
+    "database/database_buffer.cpp",
+    "database/database_catalog.cpp",
+    "database/database_index.cpp",
+    "database/database_heap.cpp",
+    "database/database_wal.cpp",
+    "database/portable/gx_allocator.cpp",
+    "database/portable/gx_allocator_hosted.cpp",
+    "database/portable/gx_array.cpp",
+    "database/portable/gx_recovered_pages.cpp",
+    "database/portable/gx_page_cache.cpp",
+    "database/portable/gx_page_codec.cpp",
+    "database/portable/gx_wal_record.cpp",
+    "database/portable/gx_wal_scan.cpp",
+    "database/portable/gx_wal_page_image.cpp",
+    "database/portable/gx_transaction_pages.cpp",
+    "database/portable/gx_transaction_page_index.cpp",
+    "database/portable/gx_transaction_page_overlay.cpp",
+    "database/database_transaction.cpp",
+    "database/database_relational.cpp",
+    "database/database_sql_token.cpp",
+    "database/database_sql_tokenizer.cpp",
+    "database/database_sql_parser.cpp",
+    "database/database_sql_expr.cpp",
+    "database/database_sql.cpp"
+)
+
+# Mirrors kernel/arch/amd64/Makefile.arch and the common CFLAGS in
+# kernel/Makefile, with only SQL's repository include roots substituted.
+$flags = @(
+    "-std=c++14", "-ffreestanding", "-O2", "-Wall", "-Wextra",
+    "-fno-exceptions", "-fno-rtti", "-nostdlib", "-nostdinc++",
+    "-fno-builtin", "-DGXOS_BARE_METAL", "-m64", "-mcmodel=large",
+    "-mno-red-zone", "-mno-mmx", "-mno-sse", "-mno-sse2",
+    "-fno-pic", "-fno-pie", "-fno-PIC", "-fno-PIE",
+    "-mno-stack-arg-probe", "-fno-stack-check", "-fno-stack-protector",
+    "-D__x86_64__", "-I$serverKernelRoot", "-I$serverRoot",
+    "-I$(Join-Path $serverKernelRoot 'core\include')",
+    "-I$(Join-Path $serverKernelRoot 'arch\amd64\include')",
+    "-Idatabase/portable", "-Idatabase",
+    "-fdiagnostics-color=never", "-H"
+)
+
+$compilerCommand = Get-Command -Name $Compiler -ErrorAction Stop
+$nmCommand = Get-Command -Name "nm" -ErrorAction SilentlyContinue
+$summary = [Collections.Generic.List[string]]::new()
+$summary.Add("Source`tCompile`tFirstDiagnostic`tUndefinedSymbols")
+$sources | Set-Content -LiteralPath (Join-Path $outputRoot "production-sources.txt") -Encoding utf8
+
+Push-Location $repoRoot
+try {
+    foreach ($source in $sources) {
+        $sourcePath = Join-Path $repoRoot $source
+        $stem = $source -replace '[\\/:]', '__' -replace '\.cpp$', ''
+        $objectPath = Join-Path $outputRoot ($stem + ".o")
+        $logPath = Join-Path $outputRoot ($stem + ".compile.log")
+        $compileOutput = @(& $compilerCommand.Source @flags "-c" $sourcePath "-o" $objectPath 2>&1)
+        $compileExit = $LASTEXITCODE
+        $compileOutput | Set-Content -LiteralPath $logPath -Encoding utf8
+        $compileResult = if ($compileExit -eq 0) { "PASS" } else { "FAIL" }
+        $firstDiagnostic = ""
+        if ($compileExit -ne 0) {
+            $errorLine = Select-String -LiteralPath $logPath `
+                -Pattern 'fatal error:| error:|undefined reference' |
+                Select-Object -First 1
+            if ($errorLine) { $firstDiagnostic = $errorLine.Line.Trim() }
+        }
+
+        $undefined = ""
+        if ($compileExit -eq 0 -and $nmCommand) {
+            $nmOutput = @(& $nmCommand.Source "-u" "-C" $objectPath 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "nm failed for $source; see $outputRoot"
+            }
+            $nmOutput | Set-Content -LiteralPath (Join-Path $outputRoot ($stem + ".symbols.txt")) -Encoding utf8
+            $undefined = (($nmOutput | ForEach-Object { ([string]$_).Trim() }) -join " | ")
+        }
+        $summary.Add("$source`t$compileResult`t$firstDiagnostic`t$undefined")
+    }
+} finally {
+    Pop-Location
+}
+
+$summaryPath = Join-Path $outputRoot "qualification.tsv"
+$summary | Set-Content -LiteralPath $summaryPath -Encoding utf8
+Get-Content -LiteralPath $summaryPath
+Write-Output "Artifacts: $outputRoot"
