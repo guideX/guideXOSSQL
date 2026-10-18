@@ -31,7 +31,7 @@
 //   u16 flags (bit0 unique, bit1 primary key), u16 formatVersion,
 //   u64 entryCount, u32 nameLength, name bytes.
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 

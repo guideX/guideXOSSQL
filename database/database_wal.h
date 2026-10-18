@@ -26,7 +26,7 @@
 //
 // See docs/SQL3_WAL_TRANSACTIONS.md for the exact byte layout.
 
-#include <cstdint>
+#include <stdint.h>
 #include <memory>
 #include <string>
 #include <vector>

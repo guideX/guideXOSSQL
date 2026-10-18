@@ -7,8 +7,8 @@
 // truncated sequences and stray continuation bytes. No normalization is
 // performed; bytes are compared verbatim (case-sensitive).
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
 namespace gxos {
 namespace db {

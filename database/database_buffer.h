@@ -20,7 +20,7 @@
 //     still applies to every page that enters the cache.
 //   * No threads and no background flushing.
 
-#include <cstdint>
+#include <stdint.h>
 
 #include "database_file.h"
 #include "database_page.h"

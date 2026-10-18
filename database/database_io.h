@@ -8,8 +8,8 @@
 // page logic. All operations are positional (readAt/writeAt) so the storage
 // layer never depends on hidden file cursor state.
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 #include <cstdio>
 #include <memory>
 #include <string>

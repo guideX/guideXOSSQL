@@ -93,8 +93,19 @@ try {
         $stem = $source -replace '[\\/:]', '__' -replace '\.cpp$', ''
         $objectPath = Join-Path $outputRoot ($stem + ".o")
         $logPath = Join-Path $outputRoot ($stem + ".compile.log")
-        $compileOutput = @(& $compilerCommand.Source @flags "-c" $sourcePath "-o" $objectPath 2>&1)
-        $compileExit = $LASTEXITCODE
+        # Windows PowerShell 5.1 turns native stderr into ErrorRecords. With
+        # ErrorActionPreference=Stop, the normal -H include trace terminates
+        # this script before the compiler's exit code and diagnostics can be
+        # recorded. Capture native output under Continue, then restore Stop for
+        # the script's own PowerShell operations.
+        $savedErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $compileOutput = @(& $compilerCommand.Source @flags "-c" $sourcePath "-o" $objectPath 2>&1)
+            $compileExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $savedErrorActionPreference
+        }
         $compileOutput | Set-Content -LiteralPath $logPath -Encoding utf8
         $compileResult = if ($compileExit -eq 0) { "PASS" } else { "FAIL" }
         $firstDiagnostic = ""
@@ -107,8 +118,15 @@ try {
 
         $undefined = ""
         if ($compileExit -eq 0 -and $nmCommand) {
-            $nmOutput = @(& $nmCommand.Source "-u" "-C" $objectPath 2>&1)
-            if ($LASTEXITCODE -ne 0) {
+            $savedErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $nmOutput = @(& $nmCommand.Source "-u" "-C" $objectPath 2>&1)
+                $nmExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $savedErrorActionPreference
+            }
+            if ($nmExit -ne 0) {
                 throw "nm failed for $source; see $outputRoot"
             }
             $nmOutput | Set-Content -LiteralPath (Join-Path $outputRoot ($stem + ".symbols.txt")) -Encoding utf8

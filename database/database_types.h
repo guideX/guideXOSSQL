@@ -21,7 +21,7 @@
 // column must already have exactly that column's type (or be NULL for a
 // nullable column).
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 

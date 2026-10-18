@@ -23,7 +23,7 @@
 //     lower bound; search remains correct because lower bounds never decrease.
 //   * The root page id is owned by the durable catalog index record.
 
-#include <cstdint>
+#include <stdint.h>
 #include <set>
 #include <string>
 #include <vector>

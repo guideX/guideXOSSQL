@@ -17,7 +17,7 @@
 // The relational API is the execution target for the future SQL layer. It
 // deliberately contains no parser, planner or SQL token concepts.
 
-#include <cstdint>
+#include <stdint.h>
 #include <memory>
 #include <string>
 #include <vector>

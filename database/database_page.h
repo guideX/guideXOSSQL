@@ -2,8 +2,8 @@
 // guideXOS SQL -- Phase SQL1
 // Fixed-size database page serialization, parsing and integrity checking.
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 #include <vector>
 
 #include "database_format.h"

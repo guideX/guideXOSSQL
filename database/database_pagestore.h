@@ -16,7 +16,7 @@
 // buffer cache (falling back to the file); writes install committed page images
 // into the cache.
 
-#include <cstdint>
+#include <stdint.h>
 
 #include "database_page.h"
 #include "database_result.h"

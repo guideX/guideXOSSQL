@@ -21,7 +21,7 @@
 // Rollback discards the overlay and restores the catalog snapshot without
 // touching the .gxdb.
 
-#include <cstdint>
+#include <stdint.h>
 #include <memory>
 #include <string>
 #include <vector>

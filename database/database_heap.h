@@ -22,7 +22,7 @@
 //   variable-length table (u32 byte length per non-null Text/Blob, ordinal order),
 //   variable payload (concatenated bytes).
 
-#include <cstdint>
+#include <stdint.h>
 #include <memory>
 #include <vector>
 

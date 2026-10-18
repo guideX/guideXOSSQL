@@ -14,7 +14,7 @@
 // This module depends only on the AST, the schema and the value model. It has
 // no page, heap, catalog, WAL or transaction concepts.
 
-#include <cstddef>
+#include <stddef.h>
 #include <vector>
 
 #include "database_schema.h"

@@ -2,8 +2,8 @@
 // guideXOS SQL -- Phase SQL1
 // Database header (page 0) serialization, parsing and validation.
 
-#include <cstddef>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 #include <string>
 
 #include "database_format.h"

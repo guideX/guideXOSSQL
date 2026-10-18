@@ -14,7 +14,7 @@
 // The AST contains no page, heap, WAL or catalog concepts. It is the only
 // output of the parser and the only input to the executor.
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 

@@ -3,7 +3,7 @@
 // Read-only diagnostics describing an opened (or inspected) database.
 // Intended for later Database Manager / Developer Studio tooling. No GUI here.
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 

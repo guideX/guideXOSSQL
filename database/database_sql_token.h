@@ -7,7 +7,7 @@
 // except for DbType (so a type keyword can be mapped to a concrete column
 // type). It contains no page, WAL or catalog concepts.
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 

@@ -13,7 +13,7 @@
 //     those are ignored on reopen and overwritten by the next allocation.
 //     Full WAL / crash-atomic transactions are deferred to a later phase.
 
-#include <cstdint>
+#include <stdint.h>
 #include <memory>
 #include <string>
 #include <vector>

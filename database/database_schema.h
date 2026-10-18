@@ -10,7 +10,7 @@
 //     "USERS" are three distinct identifiers. This rule is deterministic and
 //     does not inherit host-filesystem case semantics.
 
-#include <cstdint>
+#include <stdint.h>
 #include <string>
 #include <vector>
 
