@@ -29,6 +29,7 @@ add_library(gxos_database STATIC
     database/portable/gx_wal_record.cpp
     database/portable/gx_wal_scan.cpp
     database/portable/gx_wal_page_image.cpp
+    database/portable/gx_transaction_pages.cpp
     database/database_transaction.cpp
     database/database_relational.cpp
     database/database_sql_token.cpp
@@ -247,6 +248,20 @@ else()
     target_compile_options(database_ndb1r4p6_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p6_test COMMAND database_ndb1r4p6_test)
+
+add_executable(database_ndb1r4p7_test
+    tests/database_ndb1r4p7_test.cpp
+)
+target_link_libraries(database_ndb1r4p7_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p7_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p7_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p7_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p7_test COMMAND database_ndb1r4p7_test)
 
 option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
 if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)

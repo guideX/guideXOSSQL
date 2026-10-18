@@ -162,6 +162,8 @@ public:
     // reach the durability point.
     DbResult appendBegin(uint64_t transactionId);
     DbResult appendPageImage(uint64_t transactionId, const DatabasePage& page);
+    DbResult appendPageImageImage(uint64_t transactionId, uint64_t pageId,
+                                  const uint8_t* image, size_t imageSize);
     DbResult appendHeaderImage(uint64_t transactionId, const DatabaseHeader& header);
     DbResult appendCommit(uint64_t transactionId);
     DbResult sync();

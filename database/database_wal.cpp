@@ -412,6 +412,48 @@ DbResult WriteAheadLog::appendPageImage(uint64_t transactionId, const DatabasePa
     return appendResult;
 }
 
+DbResult WriteAheadLog::appendPageImageImage(uint64_t transactionId,
+                                             uint64_t pageId,
+                                             const uint8_t* image,
+                                             size_t imageSize) {
+    if (!_file || _readOnly) {
+        return fail(DbStatus::ReadOnly, "WAL is not writable");
+    }
+    if (!isSupportedPageSize(_pageSize)) {
+        return fail(DbStatus::InvalidArgument, "unsupported WAL page size");
+    }
+
+    GxArray record = {};
+    const size_t maximumRecordBytes = kWalRecordPrefixSize +
+                                      wal_page_offset::PageBytes +
+                                      static_cast<size_t>(_pageSize);
+    GxStatus status = gxArrayInit(&record, &_recordAllocator, 1,
+                                  maximumRecordBytes);
+    if (status != GxStatus::Ok) {
+        return fail(DbStatus::NoSpace, "WAL page-image buffer initialization failed");
+    }
+    status = gxWalPageImageRecordEncodeImage(
+        &record, transactionId, pageId, image, imageSize, _pageSize,
+        kMaxWalRecordPayload);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&record);
+        const DbStatus dbStatus = status == GxStatus::Overflow
+                                      ? DbStatus::OutOfBounds
+                                      : status == GxStatus::InvalidArgument
+                                            ? DbStatus::InvalidArgument
+                                            : status == GxStatus::ResourceLimit
+                                                  ? DbStatus::TransactionTooLarge
+                                                  : status == GxStatus::CorruptData
+                                                        ? DbStatus::CorruptPage
+                                                        : DbStatus::NoSpace;
+        return fail(dbStatus, "WAL page-image encoding failed");
+    }
+    DbResult appendResult = appendEncodedRecord(record.data,
+                                                gxArraySize(&record));
+    gxArrayDestroy(&record);
+    return appendResult;
+}
+
 DbResult WriteAheadLog::appendHeaderImage(uint64_t transactionId,
                                           const DatabaseHeader& header) {
     uint8_t payload[kHeaderSize];

@@ -58,7 +58,8 @@ std::string describeDbValue(const DbValue& value) {
 Database::Database()
     : _file(), _buffer(), _wal(), _catalog(), _diagnostics(), _open(false),
       _readOnly(false), _catalogDirty(false), _walRecordAllocator(),
-      _hasWalRecordAllocator(false), _activeTx(nullptr), _nextTxId(1),
+      _hasWalRecordAllocator(false), _transactionPageAllocator(),
+      _hasTransactionPageAllocator(false), _activeTx(nullptr), _nextTxId(1),
       _transactionIdsExhausted(false), _dataEpoch(0), _schemaGeneration(1),
       _walPath(), _fileSystem(nullptr) {}
 
@@ -445,6 +446,13 @@ DbResult Database::openImpl(const std::string& path, const DatabaseOpenOptions& 
     if (_hasWalRecordAllocator) {
         _walRecordAllocator = *options.walRecordAllocator;
     }
+    const GxAllocator* transactionAllocator = create
+        ? createOptions.transactionPageAllocator
+        : options.transactionPageAllocator;
+    _hasTransactionPageAllocator = transactionAllocator != nullptr;
+    if (_hasTransactionPageAllocator) {
+        _transactionPageAllocator = *transactionAllocator;
+    }
     const uint32_t bufferCapacity =
         options.bufferCapacity != 0 ? options.bufferCapacity : kDefaultBufferCapacity;
 
@@ -552,10 +560,12 @@ DbResult Database::create(const std::string& path, const DatabaseCreateOptions& 
     createOptions.creationTimeUnixNanos = options.creationTimeUnixNanos;
     createOptions.bufferCapacity = options.bufferCapacity;
     createOptions.pageCacheAllocator = options.pageCacheAllocator;
+    createOptions.transactionPageAllocator = options.transactionPageAllocator;
 
     DatabaseOpenOptions createOpen;
     createOpen.bufferCapacity = options.bufferCapacity;
     createOpen.pageCacheAllocator = options.pageCacheAllocator;
+    createOpen.transactionPageAllocator = options.transactionPageAllocator;
     DbResult result = db->openImpl(path, createOpen, createOptions, true, fileSystem);
     if (!result.isOk()) {
         return result;
@@ -678,8 +688,18 @@ DbResult Database::beginTransaction(std::unique_ptr<Transaction>& out) {
 
     const uint64_t basePageCount = _file->pageCount();
     const uint64_t transactionId = _nextTxId;
-    std::unique_ptr<Transaction> tx(
-        new Transaction(*this, transactionId, basePageCount));
+    std::unique_ptr<Transaction> tx;
+    try {
+        tx.reset(new Transaction(*this, transactionId, basePageCount,
+                                 _hasTransactionPageAllocator
+                                     ? &_transactionPageAllocator
+                                     : nullptr));
+    } catch (const std::bad_alloc&) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "transaction object allocation failed");
+    }
+    DbResult ownerInit = tx->init();
+    if (!ownerInit.isOk()) return ownerInit;
     if (transactionId == UINT64_MAX) {
         _transactionIdsExhausted = true;
     } else {

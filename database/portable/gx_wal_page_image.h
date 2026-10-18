@@ -18,4 +18,14 @@ GxStatus gxWalPageImageRecordEncode(GxArray* output, uint64_t transactionId,
                                     uint32_t pageSize,
                                     uint32_t maximumWalPayload);
 
+// Encodes the existing PAGE_IMAGE framing around an already validated SQL
+// database page image. The image remains owned by the transaction overlay.
+GxStatus gxWalPageImageRecordEncodeImage(GxArray* output,
+                                         uint64_t transactionId,
+                                         uint64_t pageId,
+                                         const uint8_t* pageImage,
+                                         size_t pageImageLength,
+                                         uint32_t pageSize,
+                                         uint32_t maximumWalPayload);
+
 #endif

@@ -2841,7 +2841,11 @@ bool SqlEngine::executeCreateIndex(const SqlCreateIndexAst& ast,
     const bool explicitTransaction = (_tx != nullptr);
     TransactionSavepoint savepoint;
     if (explicitTransaction) {
-        _tx->beginStatement(savepoint);
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, ast.index.line, ast.index.column);
+            return false;
+        }
     }
     uint32_t indexId = 0;
     DbResult result = _db.createIndex(def, indexId);
@@ -3618,7 +3622,11 @@ bool SqlEngine::applyMutationPlan(Table* table, ExecContext& ctx,
     const bool explicitTransaction = (_tx != nullptr);
     TransactionSavepoint savepoint;
     if (explicitTransaction) {
-        _tx->beginStatement(savepoint);
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, line, column);
+            return false;
+        }
     }
 
     DbResult result = table->applyMutations(plan);
@@ -3907,7 +3915,11 @@ bool SqlEngine::executeDropIndex(const SqlDropIndexAst& ast, SqlStatementResult&
     const bool explicitTransaction = (_tx != nullptr);
     TransactionSavepoint savepoint;
     if (explicitTransaction) {
-        _tx->beginStatement(savepoint);
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, ast.index.line, ast.index.column);
+            return false;
+        }
     }
     DbResult result = _db.dropIndex(ast.index.name);
     if (!result.isOk()) {
@@ -3929,7 +3941,11 @@ bool SqlEngine::executeDropTable(const SqlDropTableAst& ast, SqlStatementResult&
     const bool explicitTransaction = (_tx != nullptr);
     TransactionSavepoint savepoint;
     if (explicitTransaction) {
-        _tx->beginStatement(savepoint);
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, ast.table.line, ast.table.column);
+            return false;
+        }
     }
     DbResult result = _db.dropTable(ast.table.name);
     if (!result.isOk()) {
@@ -3983,7 +3999,11 @@ bool SqlEngine::executeAlterTableAddColumn(const SqlAlterTableAddColumnAst& ast,
     const bool explicitTransaction = (_tx != nullptr);
     TransactionSavepoint savepoint;
     if (explicitTransaction) {
-        _tx->beginStatement(savepoint);
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, ast.table.line, ast.table.column);
+            return false;
+        }
     }
     DbResult result = _db.alterTableAddColumn(ast.table.name, col);
     if (!result.isOk()) {

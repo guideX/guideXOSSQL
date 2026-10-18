@@ -42,6 +42,53 @@ uint32_t computeRecordCrc(const uint8_t* record, size_t payloadLength) {
 
 } // namespace
 
+GxStatus gxWalPageImageRecordEncodeImage(GxArray* output,
+                                         uint64_t transactionId,
+                                         uint64_t pageId,
+                                         const uint8_t* pageImage,
+                                         size_t pageImageLength,
+                                         uint32_t pageSize,
+                                         uint32_t maximumWalPayload) {
+    if (output == 0 || !output->initialized || output->elementSize != 1 ||
+        !gxos::db::isSupportedPageSize(pageSize) || pageId == 0 ||
+        pageId >= gxos::db::kMaxPageCount || pageImage == 0 ||
+        pageImageLength != pageSize) {
+        return GxStatus::InvalidArgument;
+    }
+    GxDatabasePageInfo info = {};
+    const GxStatus inspect = gxDatabasePageInspect(pageImage, pageSize, pageId,
+                                                   &info);
+    if (inspect != GxStatus::Ok) return inspect;
+
+    const size_t payloadLength = GX_WAL_PAGE_IMAGE_HEADER_SIZE +
+                                 static_cast<size_t>(pageSize);
+    if (payloadLength > maximumWalPayload) return GxStatus::ResourceLimit;
+    if (payloadLength > static_cast<size_t>(-1) - GX_WAL_RECORD_PREFIX_SIZE) {
+        return GxStatus::Overflow;
+    }
+    const size_t recordLength = GX_WAL_RECORD_PREFIX_SIZE + payloadLength;
+    if (recordLength > output->maximum) return GxStatus::ResourceLimit;
+
+    const GxStatus reserveStatus = gxArrayReserve(output, recordLength);
+    if (reserveStatus != GxStatus::Ok) return reserveStatus;
+    uint8_t* record = output->data;
+    fillZero(record, recordLength);
+    uint8_t* walPayload = record + GX_WAL_RECORD_PREFIX_SIZE;
+    storeLe16(walPayload, info.pageType);
+    storeLe16(walPayload + 2, 0);
+    storeLe64(walPayload + 4, pageId);
+    for (size_t i = 0; i < pageSize; ++i) {
+        walPayload[GX_WAL_PAGE_IMAGE_HEADER_SIZE + i] = pageImage[i];
+    }
+    record[0] = 2;
+    storeLe32(record + 4, static_cast<uint32_t>(payloadLength));
+    storeLe64(record + 8, transactionId);
+    storeLe32(record + GX_WAL_RECORD_CRC_OFFSET,
+              computeRecordCrc(record, payloadLength));
+    output->size = recordLength;
+    return GxStatus::Ok;
+}
+
 GxStatus gxWalPageImageRecordEncode(GxArray* output, uint64_t transactionId,
                                     uint64_t pageId, uint16_t pageType,
                                     uint16_t pageFlags,

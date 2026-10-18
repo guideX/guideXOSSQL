@@ -40,6 +40,9 @@ struct DatabaseCreateOptions {
     // Optional allocator for committed page-cache descriptors and images.
     // The allocator is copied; its context must outlive the Database.
     const GxAllocator* pageCacheAllocator;
+    // Optional allocator for bounded transaction-owned serialized page images.
+    // The allocator is copied; its context must outlive the Database.
+    const GxAllocator* transactionPageAllocator;
 
     DatabaseCreateOptions()
         : pageSize(kDefaultPageSize),
@@ -47,7 +50,7 @@ struct DatabaseCreateOptions {
           generateDatabaseId(true),
           creationTimeUnixNanos(0),
           bufferCapacity(0),
-          pageCacheAllocator(nullptr) {
+          pageCacheAllocator(nullptr), transactionPageAllocator(nullptr) {
         for (int i = 0; i < 16; ++i) {
             databaseId[i] = 0;
         }
@@ -68,11 +71,15 @@ struct DatabaseOpenOptions {
     // and recovery coverage scratch. The allocator is copied; its context must
     // outlive the open Database.
     const GxAllocator* walRecordAllocator;
+    // Optional allocator for bounded transaction-owned serialized page images.
+    // The allocator is copied; its context must outlive the Database.
+    const GxAllocator* transactionPageAllocator;
 
     DatabaseOpenOptions()
         : readOnly(false), validateAllPages(false),
           deferPageValidationForWalRecovery(false), bufferCapacity(0),
-          pageCacheAllocator(nullptr), walRecordAllocator(nullptr) {}
+          pageCacheAllocator(nullptr), walRecordAllocator(nullptr),
+          transactionPageAllocator(nullptr) {}
 };
 
 class DatabaseFile : public PageAccess {

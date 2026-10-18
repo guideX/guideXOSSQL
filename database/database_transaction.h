@@ -31,6 +31,7 @@
 #include "database_pagestore.h"
 #include "database_result.h"
 #include "database_schema.h"
+#include "portable/gx_transaction_pages.h"
 
 namespace gxos {
 namespace db {
@@ -48,19 +49,24 @@ const uint32_t kMaxTransactionPages = 4096;
 // UPDATE/DELETE statement atomic inside an already-active explicit
 // transaction, without exposing SAVEPOINT syntax. It is not a durable concept.
 struct TransactionSavepoint {
-    std::map<uint64_t, DatabasePage> pages;
-    std::vector<uint64_t> order;
+    std::map<uint64_t, size_t> pageIndexes;
+    GxTransactionPages pageImages;
     Catalog catalog;
     uint64_t nextPageId;
     bool catalogChanged;
 
     TransactionSavepoint()
-        : pages(), order(), catalog(), nextPageId(0), catalogChanged(false) {}
+        : pageIndexes(), pageImages(), catalog(), nextPageId(0),
+          catalogChanged(false) {}
+    ~TransactionSavepoint() { gxTransactionPagesDestroy(&pageImages); }
+    TransactionSavepoint(const TransactionSavepoint&) = delete;
+    TransactionSavepoint& operator=(const TransactionSavepoint&) = delete;
 };
 
 class Transaction : public PageAccess {
 public:
-    Transaction(Database& db, uint64_t id, uint64_t basePageCount);
+    Transaction(Database& db, uint64_t id, uint64_t basePageCount,
+                const GxAllocator* pageAllocator = nullptr);
     ~Transaction();
 
     Transaction(const Transaction&) = delete;
@@ -72,6 +78,7 @@ public:
     DbResult readPage(uint64_t pageId, DatabasePage& out) override;
     DbResult writePage(const DatabasePage& page) override;
     DbResult allocatePage(PageType type, uint64_t& outPageId) override;
+    DbResult init();
 
     DbResult createTable(const TableDefinition& def, uint32_t& outTableId);
     DbResult createIndex(const IndexDefinition& def, uint32_t& outIndexId);
@@ -83,12 +90,15 @@ public:
     // Statement-level atomicity inside an active transaction (SQL5). Snapshot
     // the overlay + catalog before a mutation statement, restore it if the
     // statement fails, or release it once the statement succeeds.
-    void beginStatement(TransactionSavepoint& out);
-    void rollbackStatement(const TransactionSavepoint& savepoint);
+    DbResult beginStatement(TransactionSavepoint& out);
+    void rollbackStatement(TransactionSavepoint& savepoint);
     void releaseStatement(const TransactionSavepoint& savepoint);
 
     uint64_t id() const { return _id; }
-    uint32_t modifiedPageCount() const { return static_cast<uint32_t>(_pages.size()); }
+    uint32_t modifiedPageCount() const {
+        return static_cast<uint32_t>(gxTransactionPagesCount(&_pageImages));
+    }
+    const GxTransactionPageStats& pageStats() const { return _pageImages.stats; }
     bool isActive() const { return _active; }
     void markCatalogChanged() { _catalogChanged = true; }
     uint64_t finalPageCount() const { return _nextPageId; }
@@ -99,8 +109,9 @@ private:
     uint64_t _id;
     uint64_t _basePageCount;
     uint64_t _nextPageId;
-    std::map<uint64_t, DatabasePage> _pages;
-    std::vector<uint64_t> _order;
+    GxAllocator _pageAllocator;
+    GxTransactionPages _pageImages;
+    std::map<uint64_t, size_t> _pageIndexes;
     Catalog _catalogSnapshot;
     bool _catalogChanged;
     bool _active;

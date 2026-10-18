@@ -196,6 +196,8 @@ private:
     bool _catalogDirty;
     GxAllocator _walRecordAllocator;
     bool _hasWalRecordAllocator;
+    GxAllocator _transactionPageAllocator;
+    bool _hasTransactionPageAllocator;
     Transaction* _activeTx;
     uint64_t _nextTxId;
     bool _transactionIdsExhausted;
