@@ -22,7 +22,6 @@
 // touching the .gxdb.
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,7 +30,7 @@
 #include "database_pagestore.h"
 #include "database_result.h"
 #include "database_schema.h"
-#include "portable/gx_transaction_pages.h"
+#include "portable/gx_transaction_page_overlay.h"
 
 namespace gxos {
 namespace db {
@@ -49,16 +48,15 @@ const uint32_t kMaxTransactionPages = 4096;
 // UPDATE/DELETE statement atomic inside an already-active explicit
 // transaction, without exposing SAVEPOINT syntax. It is not a durable concept.
 struct TransactionSavepoint {
-    std::map<uint64_t, size_t> pageIndexes;
-    GxTransactionPages pageImages;
+    GxTransactionPageOverlay pageOverlay;
     Catalog catalog;
     uint64_t nextPageId;
     bool catalogChanged;
 
     TransactionSavepoint()
-        : pageIndexes(), pageImages(), catalog(), nextPageId(0),
+        : pageOverlay(), catalog(), nextPageId(0),
           catalogChanged(false) {}
-    ~TransactionSavepoint() { gxTransactionPagesDestroy(&pageImages); }
+    ~TransactionSavepoint() { gxTransactionPageOverlayDestroy(&pageOverlay); }
     TransactionSavepoint(const TransactionSavepoint&) = delete;
     TransactionSavepoint& operator=(const TransactionSavepoint&) = delete;
 };
@@ -96,9 +94,18 @@ public:
 
     uint64_t id() const { return _id; }
     uint32_t modifiedPageCount() const {
-        return static_cast<uint32_t>(gxTransactionPagesCount(&_pageImages));
+        return static_cast<uint32_t>(gxTransactionPageOverlayCount(&_pageOverlay));
     }
-    const GxTransactionPageStats& pageStats() const { return _pageImages.stats; }
+    const GxTransactionPageStats& pageStats() const {
+        return _pageOverlay.pages.stats;
+    }
+    const GxTransactionPageIndexStats& pageIndexStats() const {
+        return _pageOverlay.index.stats;
+    }
+    size_t pageIndexCapacity() const { return _pageOverlay.index.capacity; }
+    size_t pageIndexAllocationBytes() const {
+        return _pageOverlay.index.allocationBytes;
+    }
     bool isActive() const { return _active; }
     void markCatalogChanged() { _catalogChanged = true; }
     uint64_t finalPageCount() const { return _nextPageId; }
@@ -110,8 +117,7 @@ private:
     uint64_t _basePageCount;
     uint64_t _nextPageId;
     GxAllocator _pageAllocator;
-    GxTransactionPages _pageImages;
-    std::map<uint64_t, size_t> _pageIndexes;
+    GxTransactionPageOverlay _pageOverlay;
     Catalog _catalogSnapshot;
     bool _catalogChanged;
     bool _active;

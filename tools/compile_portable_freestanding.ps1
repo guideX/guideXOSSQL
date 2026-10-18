@@ -20,7 +20,9 @@ $sources = @(
     "database/portable/gx_wal_record.cpp",
     "database/portable/gx_wal_scan.cpp",
     "database/portable/gx_wal_page_image.cpp",
-    "database/portable/gx_transaction_pages.cpp"
+    "database/portable/gx_transaction_pages.cpp",
+    "database/portable/gx_transaction_page_index.cpp",
+    "database/portable/gx_transaction_page_overlay.cpp"
 )
 $flags = @(
     "-std=c++14", "-ffreestanding", "-O2", "-Wall", "-Wextra",

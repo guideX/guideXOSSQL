@@ -37,17 +37,26 @@ Transaction::Transaction(Database& db, uint64_t id, uint64_t basePageCount,
                          const GxAllocator* pageAllocator)
     : _db(db), _id(id), _basePageCount(basePageCount), _nextPageId(basePageCount),
       _pageAllocator(pageAllocator ? *pageAllocator : GxAllocator()),
-      _pageImages(), _pageIndexes(), _catalogSnapshot(db.catalog()),
+      _pageOverlay(), _catalogSnapshot(db.catalog()),
       _catalogChanged(false), _active(true) {}
 
 Transaction::~Transaction() {
-    gxTransactionPagesDestroy(&_pageImages);
+    gxTransactionPageOverlayDestroy(&_pageOverlay);
 }
 
 DbResult Transaction::init() {
     if (!_pageAllocator.allocate || !_pageAllocator.deallocate) {
         size_t maximumAllocation = static_cast<size_t>(kMaxTransactionPages) *
                                    sizeof(GxTransactionPageEntry);
+        size_t indexCapacity = 0;
+        size_t indexBytes = 0;
+        const GxStatus indexSizeStatus = gxTransactionPageIndexStorageSize(
+            kMaxTransactionPages, &indexCapacity, &indexBytes);
+        if (indexSizeStatus != GxStatus::Ok) {
+            return transactionPageStatus(indexSizeStatus,
+                                         "transaction page index size overflow");
+        }
+        if (maximumAllocation < indexBytes) maximumAllocation = indexBytes;
         if (maximumAllocation < pageSize()) maximumAllocation = pageSize();
         const GxStatus hostedStatus = gxHostedAllocatorInit(
             &_pageAllocator, maximumAllocation);
@@ -56,11 +65,11 @@ DbResult Transaction::init() {
                                          "transaction page allocator initialization failed");
         }
     }
-    const GxStatus status = gxTransactionPagesInit(
-        &_pageImages, &_pageAllocator, pageSize(), kMaxTransactionPages);
+    const GxStatus status = gxTransactionPageOverlayInit(
+        &_pageOverlay, &_pageAllocator, pageSize(), kMaxTransactionPages);
     if (status != GxStatus::Ok) {
         return transactionPageStatus(status,
-                                     "transaction page-owner table allocation failed");
+                                     "transaction page overlay allocation failed");
     }
     return DbResult::ok();
 }
@@ -76,10 +85,21 @@ DbResult Transaction::readPage(uint64_t pageId, DatabasePage& out) {
     if (pageId == kHeaderPageId) {
         return DbResult::error(DbStatus::InvalidArgument, "page 0 is the header page");
     }
-    std::map<uint64_t, size_t>::const_iterator it = _pageIndexes.find(pageId);
-    if (it != _pageIndexes.end()) {
-        const GxTransactionPageEntry* entry =
-            gxTransactionPagesAt(&_pageImages, it->second);
+    bool found = false;
+    size_t ownerIndex = 0;
+    const GxStatus lookupStatus = gxTransactionPageOverlayFind(
+        &_pageOverlay, pageId, &found, &ownerIndex);
+    if (lookupStatus == GxStatus::CorruptData) {
+        return DbResult::error(DbStatus::Internal,
+                               "transaction page-owner index is inconsistent");
+    }
+    if (lookupStatus != GxStatus::Ok) {
+        return transactionPageStatus(lookupStatus,
+                                     "transaction page lookup failed");
+    }
+    if (found) {
+        const GxTransactionPageEntry* entry = gxTransactionPageOverlayAt(
+            &_pageOverlay, ownerIndex);
         if (!entry || entry->pageId != pageId || !entry->image) {
             return DbResult::error(DbStatus::Internal,
                                    "transaction page-owner index is inconsistent");
@@ -104,46 +124,21 @@ DbResult Transaction::writePage(const DatabasePage& page) {
     if (page.pageId == kHeaderPageId) {
         return DbResult::error(DbStatus::InvalidArgument, "page 0 is the header page");
     }
-    std::map<uint64_t, size_t>::iterator it = _pageIndexes.find(page.pageId);
-    if (it != _pageIndexes.end()) {
-        const GxStatus status = gxTransactionPagesReplacePage(
-            &_pageImages, it->second, page.pageId,
-            static_cast<uint16_t>(page.type), page.flags, page.generation,
-            page.payload.empty() ? nullptr : page.payload.data(),
-            page.payload.size());
-        if (status != GxStatus::Ok) {
-            return transactionPageStatus(status,
-                                         "transaction page replacement failed");
-        }
-        return DbResult::ok();
-    }
-    if (gxTransactionPagesCount(&_pageImages) >= kMaxTransactionPages) {
-        return DbResult::error(DbStatus::TransactionTooLarge,
-                               "transaction modified page limit exceeded");
-    }
-    size_t index = 0;
-    const GxStatus appendStatus = gxTransactionPagesAppendPage(
-        &_pageImages, page.pageId, static_cast<uint16_t>(page.type),
+    bool replaced = false;
+    const GxStatus status = gxTransactionPageOverlayStage(
+        &_pageOverlay, page.pageId, static_cast<uint16_t>(page.type),
         page.flags, page.generation,
         page.payload.empty() ? nullptr : page.payload.data(),
-        page.payload.size(), &index);
-    if (appendStatus != GxStatus::Ok) {
-        return transactionPageStatus(appendStatus,
+        page.payload.size(), &replaced);
+    if (status == GxStatus::CorruptData) {
+        return DbResult::error(DbStatus::Internal,
+                               "transaction page-owner index is inconsistent");
+    }
+    if (status != GxStatus::Ok) {
+        return transactionPageStatus(status,
                                      "transaction page staging failed");
     }
-    try {
-        const std::pair<std::map<uint64_t, size_t>::iterator, bool> inserted =
-            _pageIndexes.emplace(page.pageId, index);
-        if (!inserted.second) {
-            (void)gxTransactionPagesPopLast(&_pageImages, index);
-            return DbResult::error(DbStatus::Internal,
-                                   "transaction page id was staged twice");
-        }
-    } catch (const std::bad_alloc&) {
-        (void)gxTransactionPagesPopLast(&_pageImages, index);
-        return DbResult::error(DbStatus::NoSpace,
-                               "transaction page lookup allocation failed");
-    }
+    (void)replaced;
     return DbResult::ok();
 }
 
@@ -154,7 +149,7 @@ DbResult Transaction::allocatePage(PageType type, uint64_t& outPageId) {
     if (_nextPageId >= kMaxPageCount) {
         return DbResult::error(DbStatus::NoSpace, "database reached the page count limit");
     }
-    if (gxTransactionPagesCount(&_pageImages) >= kMaxTransactionPages) {
+    if (gxTransactionPageOverlayCount(&_pageOverlay) >= kMaxTransactionPages) {
         return DbResult::error(DbStatus::TransactionTooLarge,
                                "transaction modified page limit exceeded");
     }
@@ -235,9 +230,9 @@ DbResult Transaction::commit() {
     }
 
     // 3. PAGE_IMAGE records.
-    for (size_t i = 0; i < gxTransactionPagesCount(&_pageImages); ++i) {
+    for (size_t i = 0; i < gxTransactionPageOverlayCount(&_pageOverlay); ++i) {
         const GxTransactionPageEntry* entry =
-            gxTransactionPagesAt(&_pageImages, i);
+            gxTransactionPageOverlayAt(&_pageOverlay, i);
         if (!entry || !entry->image) {
             rollback();
             return DbResult::error(DbStatus::Internal,
@@ -284,9 +279,9 @@ DbResult Transaction::commit() {
         _active = false;
         return DbResult::error(DbStatus::CommitFailed, result.message());
     }
-    for (size_t i = 0; i < gxTransactionPagesCount(&_pageImages); ++i) {
+    for (size_t i = 0; i < gxTransactionPageOverlayCount(&_pageOverlay); ++i) {
         const GxTransactionPageEntry* entry =
-            gxTransactionPagesAt(&_pageImages, i);
+            gxTransactionPageOverlayAt(&_pageOverlay, i);
         DatabasePage page;
         try {
             if (!entry || !entry->image) {
@@ -317,23 +312,22 @@ DbResult Transaction::commit() {
 }
 
 DbResult Transaction::beginStatement(TransactionSavepoint& out) {
-    gxTransactionPagesDestroy(&out.pageImages);
-    out.pageIndexes.clear();
-    const GxStatus cloneStatus = gxTransactionPagesClone(
-        &out.pageImages, &_pageImages);
+    gxTransactionPageOverlayDestroy(&out.pageOverlay);
+    const GxStatus cloneStatus = gxTransactionPageOverlayClone(
+        &out.pageOverlay, &_pageOverlay);
     if (cloneStatus != GxStatus::Ok) {
         if (cloneStatus == GxStatus::OutOfMemory ||
             cloneStatus == GxStatus::UnsupportedAlignment) {
-            incrementSaturated(&_pageImages.stats.allocationFailures);
+            incrementSaturated(&_pageOverlay.pages.stats.allocationFailures);
         }
         return transactionPageStatus(cloneStatus,
                                      "statement page snapshot allocation failed");
     }
     try {
-        out.pageIndexes = _pageIndexes;
         out.catalog = _db.catalog();
     } catch (const std::bad_alloc&) {
-        incrementSaturated(&_pageImages.stats.allocationFailures);
+        incrementSaturated(&_pageOverlay.pages.stats.allocationFailures);
+        gxTransactionPageOverlayDestroy(&out.pageOverlay);
         return DbResult::error(DbStatus::NoSpace,
                                "statement snapshot allocation failed");
     }
@@ -345,12 +339,13 @@ DbResult Transaction::beginStatement(TransactionSavepoint& out) {
 void Transaction::rollbackStatement(TransactionSavepoint& savepoint) {
     // The snapshot has already paid every allocation cost. Swap/move restores
     // the prior statement state without a fallible allocation.
-    const GxTransactionPageStats observed = _pageImages.stats;
-    (void)gxTransactionPagesMove(&_pageImages, &savepoint.pageImages);
-    const size_t restoredBytes = _pageImages.stats.currentBytes;
-    _pageImages.stats = observed;
-    _pageImages.stats.currentBytes = restoredBytes;
-    _pageIndexes.swap(savepoint.pageIndexes);
+    const GxTransactionPageStats observedPages = _pageOverlay.pages.stats;
+    const GxTransactionPageIndexStats observedIndex = _pageOverlay.index.stats;
+    (void)gxTransactionPageOverlayMove(&_pageOverlay, &savepoint.pageOverlay);
+    const size_t restoredBytes = _pageOverlay.pages.stats.currentBytes;
+    _pageOverlay.pages.stats = observedPages;
+    _pageOverlay.pages.stats.currentBytes = restoredBytes;
+    _pageOverlay.index.stats = observedIndex;
     _db.catalog() = savepoint.catalog;
     _nextPageId = savepoint.nextPageId;
     _catalogChanged = savepoint.catalogChanged;
@@ -363,8 +358,7 @@ DbResult Transaction::rollback() {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
     _db.catalog() = _catalogSnapshot;
-    gxTransactionPagesClear(&_pageImages);
-    _pageIndexes.clear();
+    gxTransactionPageOverlayClear(&_pageOverlay);
     _catalogChanged = false;
     _db.finishTransaction(this, false);
     _active = false;

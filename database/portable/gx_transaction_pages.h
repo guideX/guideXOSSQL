@@ -60,8 +60,8 @@ GxStatus gxTransactionPagesReplacePage(GxTransactionPages* pages,
                                        const uint8_t* payload,
                                        size_t payloadSize);
 
-// Removes only the last appended entry. Used to undo publication when the
-// hosted page-id lookup index could not allocate its map node.
+// Removes only the last appended entry. Used to undo publication if the paired
+// page-id lookup index rejects the newly appended entry.
 GxStatus gxTransactionPagesPopLast(GxTransactionPages* pages,
                                    size_t expectedIndex);
 void gxTransactionPagesClear(GxTransactionPages* pages);
