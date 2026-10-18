@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <new>
 #include <set>
 #include <utility>
 
@@ -11,6 +12,7 @@
 #include "database_index.h"
 #include "database_page.h"
 #include "database_transaction.h"
+#include "portable/gx_heap_page_builder.h"
 
 namespace gxos {
 namespace db {
@@ -46,6 +48,49 @@ struct HeapPageInfo {
     uint32_t slotCount;
     uint32_t rowAreaEnd;
 };
+
+struct HeapRowSlot {
+    uint32_t oldSlot;
+    std::vector<uint8_t> oldBytes;
+    std::vector<uint8_t> newBytes;
+};
+
+GxStatus heapRowAt(const void* context, size_t index,
+                   const uint8_t** outBytes, size_t* outLength) {
+    if (!context || !outBytes || !outLength) return GxStatus::InvalidArgument;
+    const std::vector<HeapRowSlot>* rows =
+        static_cast<const std::vector<HeapRowSlot>*>(context);
+    if (index >= rows->size()) return GxStatus::InvalidArgument;
+    const std::vector<uint8_t>& bytes = (*rows)[index].newBytes;
+    *outBytes = bytes.empty() ? nullptr : bytes.data();
+    *outLength = bytes.size();
+    return GxStatus::Ok;
+}
+
+DbResult heapPackingStatus(GxStatus status) {
+    switch (status) {
+    case GxStatus::Ok:
+        return DbResult::ok();
+    case GxStatus::InvalidArgument:
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "heap page preparation rejected its input");
+    case GxStatus::OutOfMemory:
+        return DbResult::error(DbStatus::NoSpace,
+                               "heap page preparation allocation failed");
+    case GxStatus::ResourceLimit:
+    case GxStatus::Overflow:
+        return DbResult::error(DbStatus::TransactionTooLarge,
+                               "heap page preparation exceeds its bound");
+    case GxStatus::CorruptData:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "heap page preparation received an invalid row");
+    case GxStatus::UnsupportedAlignment:
+        return DbResult::error(DbStatus::Internal,
+                               "heap page preparation allocator alignment failed");
+    }
+    return DbResult::error(DbStatus::Internal,
+                           "heap page preparation failed unexpectedly");
+}
 
 DbResult readHeapPage(const DatabasePage& page, uint32_t pageSize, HeapPageInfo& out) {
     if (page.type != PageType::Data) {
@@ -234,29 +279,36 @@ DbResult validateRowValues(const std::vector<ColumnDefinition>& cols,
     return DbResult::ok();
 }
 
-// Rewrites `page` so it holds exactly `rows` in order, preserving the header's
-// next-page link. The caller must have checked that the rows fit.
-DbResult packHeapPage(DatabasePage& page,
-                      const std::vector<std::vector<uint8_t> >& rows, uint64_t nextPageId,
-                      uint32_t capacity) {
-    page.payload.assign(capacity, 0);
-    uint32_t offset = kHeapHeaderSize;
-    for (size_t i = 0; i < rows.size(); ++i) {
-        const uint32_t length = static_cast<uint32_t>(rows[i].size());
-        const uint32_t slotOffset = capacity - 8u * (static_cast<uint32_t>(i) + 1u);
-        if (offset > slotOffset || length > slotOffset - offset) {
-            return DbResult::error(DbStatus::NoSpace, "heap page rows do not fit");
-        }
-        if (length > 0) {
-            std::memcpy(page.payload.data() + offset, rows[i].data(), length);
-        }
-        storeLe32(page.payload.data() + slotOffset, offset);
-        storeLe32(page.payload.data() + slotOffset + 4, length);
-        offset += length;
+// Prepares a complete replacement through the portable page builder, then
+// stages the hosted vector transfer before changing the existing page. The
+// scratch allocator is database-scoped and is not retained by the page.
+DbResult packHeapPage(DatabasePage& page, const GxHeapPageRowSource& rows,
+                      uint64_t nextPageId, uint32_t pageSize,
+                      const GxAllocator& allocator) {
+    const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    GxArray prepared = {};
+    GxStatus status = gxArrayInit(&prepared, &allocator, 1, capacity);
+    if (status != GxStatus::Ok) return heapPackingStatus(status);
+
+    status = gxHeapPagePrepare(&prepared, pageSize, nextPageId, &rows);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&prepared);
+        return heapPackingStatus(status);
     }
-    writeHeapHeader(page.payload, nextPageId, static_cast<uint32_t>(rows.size()), offset);
+
+    try {
+        std::vector<uint8_t> hostedPayload;
+        hostedPayload.assign(prepared.data, prepared.data + capacity);
+        page.payload.swap(hostedPayload);
+    } catch (const std::bad_alloc&) {
+        gxArrayDestroy(&prepared);
+        return DbResult::error(DbStatus::NoSpace,
+                               "heap page hosted payload transfer failed");
+    }
+
     page.type = PageType::Data;
     page.payloadSize = capacity;
+    gxArrayDestroy(&prepared);
     return DbResult::ok();
 }
 
@@ -1315,12 +1367,7 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
             return result;
         }
 
-        struct RowSlot {
-            uint32_t oldSlot;
-            std::vector<uint8_t> oldBytes;
-            std::vector<uint8_t> newBytes;
-        };
-        std::vector<RowSlot> finalRows;
+        std::vector<HeapRowSlot> finalRows;
         size_t entryIndex = 0;
         for (uint32_t slot = 0; slot < info.slotCount; ++slot) {
             if (entryIndex < entries.size() && entries[entryIndex].slot < slot) {
@@ -1351,7 +1398,7 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
                 deletedRows.push_back(removed);
                 continue;
             }
-            RowSlot rowSlot;
+            HeapRowSlot rowSlot;
             rowSlot.oldSlot = slot;
             rowSlot.oldBytes = oldBytes;
             rowSlot.newBytes = (entry != nullptr) ? entry->encoded : oldBytes;
@@ -1373,10 +1420,7 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
             }
             used += need;
         }
-        std::vector<std::vector<uint8_t> > kept;
-        kept.reserve(keep);
         for (size_t i = 0; i < keep; ++i) {
-            kept.push_back(finalRows[i].newBytes);
             const RowLocator oldLocator(pageId, finalRows[i].oldSlot);
             const RowLocator newLocator(pageId, static_cast<uint32_t>(i));
             if (oldLocator.slot != newLocator.slot ||
@@ -1397,7 +1441,12 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
             relocations.push_back(relocation);
         }
 
-        result = packHeapPage(page, kept, info.nextPageId, capacity);
+        GxHeapPageRowSource pageRows = {};
+        pageRows.context = &finalRows;
+        pageRows.rowCount = keep;
+        pageRows.rowAt = heapRowAt;
+        result = packHeapPage(page, pageRows, info.nextPageId, pageSize,
+                              _db.buffer().scratchAllocator());
         if (!result.isOk()) {
             return result;
         }

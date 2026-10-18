@@ -88,6 +88,10 @@ public:
     uint32_t dirtyCount() const { return static_cast<uint32_t>(_cache.dirtyCount); }
     uint32_t pinnedCount() const { return _pinned; }
     const GxPageCacheStats& cacheStats() const { return _cache.stats; }
+    // Borrowed only while this manager is alive. The context is the same
+    // database-scoped allocator used for cache storage; callers may use it for
+    // temporary page preparation that is destroyed before returning.
+    const GxAllocator& scratchAllocator() const { return _allocator; }
     size_t cacheMemoryBytes() const;
     size_t cacheMemoryPeakBytes() const;
 

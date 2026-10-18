@@ -24,6 +24,12 @@ struct GxArray {
 GxStatus gxArrayInit(GxArray* array, const GxAllocator* allocator,
                      size_t elementSize, size_t maximumElements);
 GxStatus gxArrayReserve(GxArray* array, size_t elements);
+// Changes the logical element count after reserving storage. Newly exposed
+// bytes are uninitialized; callers must initialize them before reading.
+GxStatus gxArrayResize(GxArray* array, size_t elements);
+// Exchanges complete initialized owners, including allocator provenance,
+// without allocating or copying their byte storage.
+GxStatus gxArraySwap(GxArray* left, GxArray* right);
 GxStatus gxArrayAppend(GxArray* array, const void* records, size_t count);
 GxStatus gxArrayInsert(GxArray* array, size_t index,
                        const void* records, size_t count);

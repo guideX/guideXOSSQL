@@ -91,6 +91,25 @@ GxStatus gxArrayReserve(GxArray* array, size_t elements) {
     return GxStatus::Ok;
 }
 
+GxStatus gxArrayResize(GxArray* array, size_t elements) {
+    if (!gxArrayReady(array)) return GxStatus::InvalidArgument;
+    if (elements > array->maximum) return GxStatus::ResourceLimit;
+    const GxStatus status = gxArrayReserve(array, elements);
+    if (status != GxStatus::Ok) return status;
+    array->size = elements;
+    return GxStatus::Ok;
+}
+
+GxStatus gxArraySwap(GxArray* left, GxArray* right) {
+    if (!gxArrayReady(left) || !gxArrayReady(right)) {
+        return GxStatus::InvalidArgument;
+    }
+    GxArray temporary = *left;
+    *left = *right;
+    *right = temporary;
+    return GxStatus::Ok;
+}
+
 GxStatus gxArrayAppend(GxArray* array, const void* records, size_t count) {
     if (!gxArrayReady(array) || (count != 0 && !records)) {
         return GxStatus::InvalidArgument;
