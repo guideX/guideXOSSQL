@@ -171,6 +171,92 @@ void testCrcGoldenVectors() {
     CHECK(crc32(large.data(), large.size()) == 0x23E19BE8u);
 }
 
+void testPageInspectionExtentAndTypeValidation() {
+    const uint32_t smallPageSize = 512;
+    const uint8_t payload[] = {0x11, 0x00, 0x7A};
+    const uint16_t supportedTypes[] = {
+        static_cast<uint16_t>(PageType::Catalog),
+        static_cast<uint16_t>(PageType::Data),
+        static_cast<uint16_t>(PageType::IndexLeaf),
+        static_cast<uint16_t>(PageType::IndexInternal)
+    };
+    std::vector<uint8_t> image(smallPageSize, 0);
+    for (size_t i = 0; i < sizeof(supportedTypes) / sizeof(supportedTypes[0]);
+         ++i) {
+        CHECK(gxDatabasePageEncode(image.data(), smallPageSize, 17,
+                                   supportedTypes[i], 0x1234, 8, payload,
+                                   sizeof(payload)) == GxStatus::Ok);
+        GxDatabasePageInfo info = {};
+        CHECK(gxDatabasePageInspect(image.data(), image.size(), smallPageSize,
+                                    17, &info) == GxStatus::Ok);
+        CHECK(info.pageId == 17);
+        CHECK(info.pageType == supportedTypes[i]);
+        CHECK(info.payloadSize == sizeof(payload));
+        CHECK(info.flags == 0x1234);
+        CHECK(info.generation == 8);
+    }
+
+    GxDatabasePageInfo preserved = {91, 92, 93, 94, 95};
+    CHECK(gxDatabasePageInspect(nullptr, 0, smallPageSize, 17, &preserved) ==
+          GxStatus::InvalidArgument);
+    CHECK(preserved.pageId == 91 && preserved.pageType == 92 &&
+          preserved.flags == 93 && preserved.payloadSize == 94 &&
+          preserved.generation == 95);
+    CHECK(gxDatabasePageInspect(image.data(), 0, smallPageSize, 17,
+                                &preserved) == GxStatus::CorruptData);
+    CHECK(gxDatabasePageInspect(image.data(), kPageHeaderSize - 1,
+                                smallPageSize, 17, &preserved) ==
+          GxStatus::CorruptData);
+
+    // The page declares three payload bytes. A source ending one byte before
+    // that payload, or before the configured page extent, is rejected before
+    // header or payload access.
+    CHECK(gxDatabasePageInspect(image.data(),
+                                kPageHeaderSize + sizeof(payload) - 1,
+                                smallPageSize, 17, &preserved) ==
+          GxStatus::CorruptData);
+    CHECK(gxDatabasePageInspect(image.data(), image.size() - 1,
+                                smallPageSize, 17, &preserved) ==
+          GxStatus::CorruptData);
+    CHECK(gxDatabasePageInspect(image.data(), static_cast<size_t>(-1),
+                                smallPageSize, 17, &preserved) ==
+          GxStatus::CorruptData);
+    CHECK(preserved.pageId == 91 && preserved.pageType == 92 &&
+          preserved.flags == 93 && preserved.payloadSize == 94 &&
+          preserved.generation == 95);
+
+    std::vector<uint8_t> corrupt = image;
+    corrupt[kPageHeaderSize] ^= 0x80;
+    CHECK(gxDatabasePageInspect(corrupt.data(), corrupt.size(), smallPageSize,
+                                17, &preserved) == GxStatus::CorruptData);
+    CHECK(preserved.pageId == 91 && preserved.pageType == 92);
+
+    const uint16_t unsupportedTypes[] = {
+        static_cast<uint16_t>(PageType::Unknown), 0xFFFFu
+    };
+    for (size_t i = 0;
+         i < sizeof(unsupportedTypes) / sizeof(unsupportedTypes[0]); ++i) {
+        CHECK(gxDatabasePageEncode(image.data(), smallPageSize, 17,
+                                   unsupportedTypes[i], 0, 0, nullptr, 0) ==
+              GxStatus::Ok);
+        CHECK(gxDatabasePageInspect(image.data(), image.size(), smallPageSize,
+                                    17, &preserved) == GxStatus::CorruptData);
+        CHECK(preserved.pageId == 91 && preserved.pageType == 92);
+    }
+
+    std::vector<uint8_t> standardPage(4096, 0);
+    CHECK(gxDatabasePageEncode(
+              standardPage.data(), static_cast<uint32_t>(standardPage.size()),
+              22, static_cast<uint16_t>(PageType::Data), 0, 1, nullptr, 0) ==
+          GxStatus::Ok);
+    GxDatabasePageInfo standardInfo = {};
+    CHECK(gxDatabasePageInspect(standardPage.data(), standardPage.size(), 4096,
+                                22, &standardInfo) == GxStatus::Ok);
+    CHECK(gxDatabasePageInspect(standardPage.data(), standardPage.size(),
+                                UINT32_MAX, 22, &standardInfo) ==
+          GxStatus::InvalidArgument);
+}
+
 void testPortablePageImageEncodingAndFailure() {
     const uint32_t pageSize = 512;
     GxArena arena;
@@ -586,6 +672,7 @@ void testProductionTransactionAllocationRecovery() {
 
 int main() {
     testCrcGoldenVectors();
+    testPageInspectionExtentAndTypeValidation();
     testPortablePageImageEncodingAndFailure();
     testProductionWalBytesAndRecoveryStates();
     testProductionTransactionAllocationRecovery();

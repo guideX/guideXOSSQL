@@ -195,8 +195,9 @@ DbResult BufferManager::materialize(size_t index) {
     GxPageCacheEntry& entry = _cache.entries[index];
     if (slot.materialized) return DbResult::ok();
     try {
-        DbResult result = DatabasePage::parse(entry.image, _file.pageSize(),
-                                              entry.pageId, slot.page);
+        DbResult result = DatabasePage::parse(entry.image, _cache.pageSize,
+                                              _file.pageSize(), entry.pageId,
+                                              slot.page);
         if (!result.isOk()) return result;
     } catch (const std::bad_alloc&) {
         return DbResult::error(DbStatus::NoSpace,
@@ -295,7 +296,8 @@ DbResult BufferManager::pinPage(uint64_t pageId, BufferSlot*& outSlot) {
 
     DatabasePage page;
     try {
-        result = DatabasePage::parse(candidate, _cache.pageSize, pageId, page);
+        result = DatabasePage::parse(candidate, _cache.pageSize,
+                                     _cache.pageSize, pageId, page);
     } catch (const std::bad_alloc&) {
         result = DbResult::error(DbStatus::NoSpace,
                                  "page-view allocation failed");

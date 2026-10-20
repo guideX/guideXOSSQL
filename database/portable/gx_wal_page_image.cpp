@@ -56,8 +56,8 @@ GxStatus gxWalPageImageRecordEncodeImage(GxArray* output,
         return GxStatus::InvalidArgument;
     }
     GxDatabasePageInfo info = {};
-    const GxStatus inspect = gxDatabasePageInspect(pageImage, pageSize, pageId,
-                                                   &info);
+    const GxStatus inspect = gxDatabasePageInspect(
+        pageImage, pageImageLength, pageSize, pageId, &info);
     if (inspect != GxStatus::Ok) return inspect;
 
     const size_t payloadLength = GX_WAL_PAGE_IMAGE_HEADER_SIZE +

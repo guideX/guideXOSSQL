@@ -63,7 +63,8 @@ GxStatus gxRecoveredPagesRetain(GxRecoveredPageCollection* collection,
 
     GxDatabasePageInfo pageInfo = {};
     const GxStatus inspectStatus = gxDatabasePageInspect(
-        image, static_cast<uint32_t>(collection->pageSize), pageId, &pageInfo);
+        image, imageSize, static_cast<uint32_t>(collection->pageSize), pageId,
+        &pageInfo);
     if (inspectStatus != GxStatus::Ok) return inspectStatus;
 
     GxRecoveredPage* previous = 0;

@@ -207,6 +207,21 @@ enum class PageType : uint16_t {
     IndexInternal = 4  // SQL6 B+ tree internal page
 };
 
+// Values other than the four persisted page kinds are reserved. Unknown is a
+// useful in-memory default, but it is not a valid serialized page type.
+inline bool isSupportedPageType(PageType type) {
+    switch (type) {
+    case PageType::Catalog:
+    case PageType::Data:
+    case PageType::IndexLeaf:
+    case PageType::IndexInternal:
+        return true;
+    case PageType::Unknown:
+        return false;
+    }
+    return false;
+}
+
 inline const char* pageTypeName(PageType type) {
     switch (type) {
     case PageType::Unknown: return "Unknown";

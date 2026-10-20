@@ -321,7 +321,8 @@ void testProductionRecoveryEquivalence() {
         const GxRecoveredPage* firstPage = pageAt(transactions[0].pages, 0);
         DatabasePage decodedFirst;
         CHECK(firstPage && DatabasePage::parse(gxRecoveredPageImage(firstPage),
-                                               kPageSize, 2, decodedFirst).isOk());
+                                               kPageSize, kPageSize, 2,
+                                               decodedFirst).isOk());
         CHECK(firstPage && firstPage->pageId == 2);
         CHECK(decodedFirst.payload == makePage(2, 0x24).payload);
         CHECK(transactions[1].transactionId == 42);
@@ -331,7 +332,8 @@ void testProductionRecoveryEquivalence() {
         const GxRecoveredPage* secondPage = pageAt(transactions[1].pages, 0);
         DatabasePage decodedSecond;
         CHECK(secondPage && DatabasePage::parse(gxRecoveredPageImage(secondPage),
-                                                kPageSize, 3, decodedSecond).isOk());
+                                                kPageSize, kPageSize, 3,
+                                                decodedSecond).isOk());
         CHECK(secondPage && secondPage->pageId == 3);
         CHECK(decodedSecond.payload == makePage(3, 0x57).payload);
     }

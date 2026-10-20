@@ -105,7 +105,8 @@ DbResult Transaction::readPage(uint64_t pageId, DatabasePage& out) {
                                    "transaction page-owner index is inconsistent");
         }
         try {
-            return DatabasePage::parse(entry->image, pageSize(), pageId, out);
+            return DatabasePage::parse(entry->image, pageSize(), pageSize(),
+                                       pageId, out);
         } catch (const std::bad_alloc&) {
             return DbResult::error(DbStatus::NoSpace,
                                    "transaction page read allocation failed");
@@ -289,7 +290,7 @@ DbResult Transaction::commit() {
                                          "transaction page owner is incomplete");
             } else {
                 result = DatabasePage::parse(entry->image, pageSize(),
-                                             entry->pageId, page);
+                                             pageSize(), entry->pageId, page);
                 if (result.isOk()) result = _db.writePage(page);
             }
         } catch (const std::bad_alloc&) {

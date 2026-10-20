@@ -45,19 +45,32 @@ uint32_t computePageCrc(const uint8_t* bytes, uint32_t pageSize) {
 
 } // namespace
 
-GxStatus gxDatabasePageInspect(const uint8_t* image, uint32_t pageSize,
+GxStatus gxDatabasePageInspect(const uint8_t* image, size_t imageLength,
+                               uint32_t pageSize,
                                uint64_t expectedPageId,
                                GxDatabasePageInfo* outInfo) {
-    if (!image || !outInfo ||
-        !gxos::db::isSupportedPageSize(pageSize)) {
+    if (!image || !outInfo) {
         return GxStatus::InvalidArgument;
+    }
+    if (!gxos::db::isSupportedPageSize(pageSize)) {
+        return GxStatus::InvalidArgument;
+    }
+    // Do not read even the fixed header until the caller-provided extent is
+    // known to contain exactly one page. Equality also rejects oversized or
+    // malformed extents without any length arithmetic.
+    if (imageLength != static_cast<size_t>(pageSize)) {
+        return GxStatus::CorruptData;
     }
 
     const uint64_t pageId = gxos::db::loadLe64(
         image + gxos::db::page_offset::PageId);
+    const uint16_t pageType = gxos::db::loadLe16(
+        image + gxos::db::page_offset::PageType);
     const uint32_t payloadSize = gxos::db::loadLe32(
         image + gxos::db::page_offset::PayloadSize);
-    if (pageId != expectedPageId ||
+    if (!gxos::db::isSupportedPageType(
+            static_cast<gxos::db::PageType>(pageType)) ||
+        pageId != expectedPageId ||
         payloadSize > pageSize - gxos::db::kPageHeaderSize ||
         gxos::db::loadLe32(image + gxos::db::page_offset::PageCrc32) !=
             computePageCrc(image, pageSize)) {
@@ -66,8 +79,7 @@ GxStatus gxDatabasePageInspect(const uint8_t* image, uint32_t pageSize,
 
     GxDatabasePageInfo info;
     info.pageId = pageId;
-    info.pageType = gxos::db::loadLe16(
-        image + gxos::db::page_offset::PageType);
+    info.pageType = pageType;
     info.flags = gxos::db::loadLe16(image + gxos::db::page_offset::Flags);
     info.payloadSize = payloadSize;
     info.generation = gxos::db::loadLe32(

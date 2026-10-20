@@ -27,6 +27,9 @@
 #include "database_engine.h"
 #include "database_file.h"
 #include "database_format.h"
+#include "database_page.h"
+#include "database_relational.h"
+#include "portable/gx_page_codec.h"
 
 using namespace gxos::db;
 
@@ -414,6 +417,99 @@ void testHeaderCorruption() {
     std::remove(base.c_str());
 }
 
+void testLengthAwarePageParsing() {
+    std::printf("length-aware page parsing\n");
+    const uint8_t payload[] = {0x12, 0x00, 0xFE, 0x71};
+    const uint16_t supportedTypes[] = {
+        static_cast<uint16_t>(PageType::Catalog),
+        static_cast<uint16_t>(PageType::Data),
+        static_cast<uint16_t>(PageType::IndexLeaf),
+        static_cast<uint16_t>(PageType::IndexInternal)
+    };
+    std::vector<uint8_t> image(512, 0);
+    DatabasePage parsed;
+    for (size_t i = 0; i < sizeof(supportedTypes) / sizeof(supportedTypes[0]);
+         ++i) {
+        CHECK(gxDatabasePageEncode(image.data(), 512, 41, supportedTypes[i],
+                                   0x2345, 6, payload, sizeof(payload)) ==
+              GxStatus::Ok);
+        CHECK_STATUS(DatabasePage::parse(image.data(), image.size(), 512, 41,
+                                         parsed), DbStatus::Ok);
+        CHECK(static_cast<uint16_t>(parsed.type) == supportedTypes[i]);
+        CHECK(parsed.payload == std::vector<uint8_t>(payload,
+                                                      payload + sizeof(payload)));
+    }
+
+    DatabasePage destination;
+    destination.pageId = 99;
+    destination.type = PageType::IndexLeaf;
+    destination.flags = 0xABCD;
+    destination.payloadSize = 3;
+    destination.generation = 77;
+    destination.payload.assign(3, 0x6D);
+    const std::vector<uint8_t> priorPayload = destination.payload;
+    const auto destinationIsPreserved = [&destination, &priorPayload]() {
+        return destination.pageId == 99 &&
+               destination.type == PageType::IndexLeaf &&
+               destination.flags == 0xABCD &&
+               destination.payloadSize == 3 &&
+               destination.generation == 77 &&
+               destination.payload == priorPayload;
+    };
+
+    CHECK_STATUS(DatabasePage::parse(nullptr, 0, 512, 41, destination),
+                 DbStatus::InvalidArgument);
+    CHECK(destinationIsPreserved());
+    CHECK_STATUS(DatabasePage::parse(image.data(), 0, 512, 41, destination),
+                 DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+    CHECK_STATUS(DatabasePage::parse(image.data(), kPageHeaderSize - 1, 512,
+                                     41, destination), DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+    CHECK_STATUS(DatabasePage::parse(
+                     image.data(), kPageHeaderSize + sizeof(payload) - 1,
+                     512, 41, destination), DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+    CHECK_STATUS(DatabasePage::parse(image.data(), static_cast<size_t>(-1),
+                                     512, 41, destination),
+                 DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+
+    std::vector<uint8_t> corrupt = image;
+    corrupt[kPageHeaderSize] ^= 0x01;
+    CHECK_STATUS(DatabasePage::parse(corrupt.data(), corrupt.size(), 512, 41,
+                                     destination), DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+
+    CHECK(gxDatabasePageEncode(image.data(), 512, 41,
+                               static_cast<uint16_t>(PageType::Unknown), 0, 0,
+                               payload, sizeof(payload)) == GxStatus::Ok);
+    CHECK_STATUS(DatabasePage::parse(image.data(), image.size(), 512, 41,
+                                     destination), DbStatus::CorruptPage);
+    CHECK(destinationIsPreserved());
+
+    // A malformed attempt must leave the caller's page intact, and the same
+    // destination must remain usable for a later valid image.
+    CHECK(gxDatabasePageEncode(image.data(), 512, 41,
+                               static_cast<uint16_t>(PageType::Data), 0x1357,
+                               9, payload, sizeof(payload)) == GxStatus::Ok);
+    CHECK_STATUS(DatabasePage::parse(image.data(), image.size(), 512, 41,
+                                     destination), DbStatus::Ok);
+    CHECK(destination.pageId == 41 && destination.type == PageType::Data);
+    CHECK(destination.flags == 0x1357 && destination.generation == 9);
+    CHECK(destination.payload == std::vector<uint8_t>(payload,
+                                                      payload + sizeof(payload)));
+
+    std::vector<uint8_t> standardPage(4096, 0);
+    CHECK(gxDatabasePageEncode(
+              standardPage.data(), static_cast<uint32_t>(standardPage.size()),
+              42, static_cast<uint16_t>(PageType::Data), 0, 1, nullptr, 0) ==
+          GxStatus::Ok);
+    CHECK_STATUS(DatabasePage::parse(standardPage.data(), standardPage.size(),
+                                     4096, 42, parsed), DbStatus::Ok);
+    CHECK(parsed.pageId == 42 && parsed.payload.empty());
+}
+
 void testPageCorruption() {
     std::printf("page corruption\n");
     const std::string base = uniquePath("pagecorruptbase");
@@ -457,6 +553,60 @@ void testPageCorruption() {
         openOptions.validateAllPages = true;
         CHECK_STATUS(DatabaseEngine::openDatabase(work, openOptions, validating),
                      DbStatus::CorruptPage);
+        std::remove(work.c_str());
+    }
+
+    // A valid CRC cannot make an unsupported serialized page type acceptable.
+    // Exercise the real cached SQL read path, repair the page, and read it
+    // again across a close/reopen cycle.
+    {
+        const std::string work = uniquePath("pagetypecorrupt");
+        std::vector<uint8_t> bytes = readFileBytes(base);
+        std::vector<uint8_t> invalidImage(4096, 0);
+        CHECK(gxDatabasePageEncode(
+                  invalidImage.data(), 4096, pageId, 0xFFFFu, 0, 0, nullptr,
+                  0) == GxStatus::Ok);
+        const size_t imageOffset = static_cast<size_t>(pageId) * 4096;
+        if (imageOffset <= bytes.size() &&
+            invalidImage.size() <= bytes.size() - imageOffset) {
+            for (size_t i = 0; i < invalidImage.size(); ++i) {
+                bytes[imageOffset + i] = invalidImage[i];
+            }
+        }
+        writeFileBytes(work, bytes);
+
+        DatabaseOpenOptions pageTypeOptions;
+        std::unique_ptr<Database> out;
+        CHECK_STATUS(Database::open(work, pageTypeOptions, out), DbStatus::Ok);
+        if (out) {
+            DatabasePage destination;
+            destination.pageId = 99;
+            destination.type = PageType::IndexLeaf;
+            destination.payload.assign(2, 0xCC);
+            CHECK_STATUS(out->readPage(pageId, destination), DbStatus::CorruptPage);
+            CHECK(destination.pageId == 99 &&
+                  destination.type == PageType::IndexLeaf &&
+                  destination.payload == std::vector<uint8_t>(2, 0xCC));
+            CHECK_STATUS(out->writePage(page), DbStatus::Ok);
+            CHECK_STATUS(out->readPage(pageId, destination), DbStatus::Ok);
+            CHECK(destination.pageId == pageId &&
+                  destination.type == PageType::Data &&
+                  destination.payload == page.payload);
+            CHECK_STATUS(out->close(), DbStatus::Ok);
+            out.reset();
+        }
+
+        std::unique_ptr<Database> reopened;
+        CHECK_STATUS(Database::open(work, pageTypeOptions, reopened),
+                     DbStatus::Ok);
+        if (reopened) {
+            DatabasePage destination;
+            CHECK_STATUS(reopened->readPage(pageId, destination), DbStatus::Ok);
+            CHECK(destination.pageId == pageId &&
+                  destination.type == PageType::Data &&
+                  destination.payload == page.payload);
+            CHECK_STATUS(reopened->close(), DbStatus::Ok);
+        }
         std::remove(work.c_str());
     }
     std::remove(base.c_str());
@@ -768,6 +918,7 @@ int main() {
     testSupportedPageSizes();
     testPageIoPersistence();
     testHeaderCorruption();
+    testLengthAwarePageParsing();
     testPageCorruption();
     testTruncation();
     testBounds();

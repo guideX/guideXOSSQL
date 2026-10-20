@@ -110,7 +110,8 @@ void disableFailure(FaultAllocatorState* state) {
 bool pagePayloadIs(const uint8_t* image, uint32_t pageSize,
                    uint64_t pageId, const std::vector<uint8_t>& expected) {
     GxDatabasePageInfo info = {};
-    if (gxDatabasePageInspect(image, pageSize, pageId, &info) != GxStatus::Ok ||
+    if (gxDatabasePageInspect(image, pageSize, pageSize, pageId, &info) !=
+            GxStatus::Ok ||
         info.payloadSize != expected.size()) {
         return false;
     }

@@ -14,9 +14,11 @@ typedef struct GxDatabasePageInfo {
     uint32_t generation;
 } GxDatabasePageInfo;
 
-// Checks the existing serialized page header, extent, identity and CRC without
-// allocating. `outInfo` is written only after the complete image validates.
-GxStatus gxDatabasePageInspect(const uint8_t* image, uint32_t pageSize,
+// Checks the existing serialized page header, exact source extent, supported
+// type, identity and CRC without allocating. `imageLength` must be the actual
+// readable extent of `image`; `outInfo` is written only after validation.
+GxStatus gxDatabasePageInspect(const uint8_t* image, size_t imageLength,
+                               uint32_t pageSize,
                                uint64_t expectedPageId,
                                GxDatabasePageInfo* outInfo);
 

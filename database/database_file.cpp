@@ -352,7 +352,8 @@ DbResult DatabaseFile::validateOpenedPages(bool validateAllPages) {
     result = readPageBytes(_header.rootPageId, rootBytes);
     if (!result.isOk()) return fail(result.status(), result.message());
     DatabasePage root;
-    result = DatabasePage::parse(rootBytes.data(), _header.pageSize, _header.rootPageId, root);
+    result = DatabasePage::parse(rootBytes.data(), rootBytes.size(),
+                                 _header.pageSize, _header.rootPageId, root);
     if (!result.isOk()) return fail(result.status(), result.message());
     result = validateBootstrap(root);
     if (!result.isOk()) return fail(result.status(), result.message());
@@ -363,7 +364,8 @@ DbResult DatabaseFile::validateOpenedPages(bool validateAllPages) {
             result = readPageBytes(pageId, bytes);
             if (!result.isOk()) return fail(result.status(), result.message());
             DatabasePage page;
-            result = DatabasePage::parse(bytes.data(), _header.pageSize, pageId, page);
+            result = DatabasePage::parse(bytes.data(), bytes.size(),
+                                         _header.pageSize, pageId, page);
             if (!result.isOk()) return fail(result.status(), result.message());
         }
     }
@@ -408,7 +410,8 @@ DbResult DatabaseFile::readPage(uint64_t pageId, DatabasePage& out) {
     }
 
     DatabasePage page;
-    result = DatabasePage::parse(bytes.data(), _header.pageSize, pageId, page);
+    result = DatabasePage::parse(bytes.data(), bytes.size(),
+                                 _header.pageSize, pageId, page);
     if (!result.isOk()) {
         return fail(result.status(), result.message());
     }
@@ -443,7 +446,7 @@ DbResult DatabaseFile::readPageImage(uint64_t pageId, uint8_t* image,
 
     GxDatabasePageInfo info = {};
     const GxStatus inspectStatus = gxDatabasePageInspect(
-        image, imageSize, pageId, &info);
+        image, imageSize, _header.pageSize, pageId, &info);
     if (inspectStatus != GxStatus::Ok) {
         return fail(inspectStatus == GxStatus::CorruptData
                         ? DbStatus::CorruptPage
@@ -500,7 +503,7 @@ DbResult DatabaseFile::writePageImage(uint64_t pageId, const uint8_t* image,
 
     GxDatabasePageInfo info = {};
     const GxStatus inspectStatus = gxDatabasePageInspect(
-        image, imageSize, pageId, &info);
+        image, imageSize, _header.pageSize, pageId, &info);
     if (inspectStatus != GxStatus::Ok) {
         return fail(inspectStatus == GxStatus::CorruptData
                         ? DbStatus::CorruptPage

@@ -216,7 +216,8 @@ GxStatus gxTransactionPagesClone(GxTransactionPages* destination,
     for (size_t i = 0; i < source->count; ++i) {
         GxDatabasePageInfo info = {};
         const GxStatus inspect = gxDatabasePageInspect(
-            source->entries[i].image, static_cast<uint32_t>(source->pageSize),
+            source->entries[i].image, source->pageSize,
+            static_cast<uint32_t>(source->pageSize),
             source->entries[i].pageId, &info);
         if (inspect != GxStatus::Ok) {
             gxTransactionPagesDestroy(destination);

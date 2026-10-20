@@ -30,10 +30,11 @@ struct DatabasePage {
     // InvalidArgument when pageSize is unsupported or the payload is too large.
     DbResult serialize(std::vector<uint8_t>& out, uint32_t pageSize) const;
 
-    // Parses and validates one full page of `pageSize` bytes read from index
-    // `expectedPageId`. Verifies the page CRC and that the stored page id
-    // matches. The payload is copied only after all bounds checks pass.
-    static DbResult parse(const uint8_t* bytes, uint32_t pageSize,
+    // Parses and validates one serialized page. `sourceLength` is the actual
+    // readable extent of `bytes` and must equal `pageSize`. Verifies the page
+    // type, CRC, page id, and payload bounds before copying or publishing.
+    static DbResult parse(const uint8_t* bytes, size_t sourceLength,
+                          uint32_t pageSize,
                           uint64_t expectedPageId, DatabasePage& out);
 };
 

@@ -47,7 +47,8 @@ DbResult DatabasePage::serialize(std::vector<uint8_t>& out, uint32_t pageSize) c
     return DbResult::ok();
 }
 
-DbResult DatabasePage::parse(const uint8_t* bytes, uint32_t pageSize,
+DbResult DatabasePage::parse(const uint8_t* bytes, size_t sourceLength,
+                             uint32_t pageSize,
                              uint64_t expectedPageId, DatabasePage& out) {
     if (bytes == nullptr) {
         return DbResult::error(DbStatus::InvalidArgument, "null page buffer");
@@ -58,10 +59,10 @@ DbResult DatabasePage::parse(const uint8_t* bytes, uint32_t pageSize,
 
     GxDatabasePageInfo info = {};
     const GxStatus inspectStatus = gxDatabasePageInspect(
-        bytes, pageSize, expectedPageId, &info);
+        bytes, sourceLength, pageSize, expectedPageId, &info);
     if (inspectStatus == GxStatus::CorruptData) {
         return DbResult::error(DbStatus::CorruptPage,
-                               "page identity, payload bounds, or checksum is invalid");
+                               "page extent, type, identity, payload bounds, or checksum is invalid");
     }
     if (inspectStatus != GxStatus::Ok) {
         return DbResult::error(DbStatus::InvalidArgument,

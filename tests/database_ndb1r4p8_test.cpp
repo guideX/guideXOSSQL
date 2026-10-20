@@ -116,7 +116,7 @@ bool imageHasPayload(const GxTransactionPageEntry* entry,
                      const std::vector<uint8_t>& expected) {
     if (!entry || !entry->image) return false;
     GxDatabasePageInfo info = {};
-    if (gxDatabasePageInspect(entry->image, 512, entry->pageId, &info) !=
+    if (gxDatabasePageInspect(entry->image, 512, 512, entry->pageId, &info) !=
             GxStatus::Ok ||
         info.payloadSize != expected.size()) {
         return false;
