@@ -353,6 +353,14 @@ DbResult BufferManager::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
         return DbResult::error(DbStatus::InvalidArgument,
                                "caller-owned page has the wrong page-size configuration");
     }
+    if (pageId == kHeaderPageId) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "page 0 is the header page");
+    }
+    if (pageId >= _file.pageCount()) {
+        return DbResult::error(DbStatus::OutOfBounds,
+                               "page id is outside the database");
+    }
 
     GxOwnedPage prepared;
     GxStatus status = prepared.initLike(out);
@@ -360,30 +368,89 @@ DbResult BufferManager::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
         return ownedPageStatus(status, "caller-owned page setup failed");
     }
 
-    BufferSlot* slot = nullptr;
-    DbResult result = pinPage(pageId, slot);
-    if (!result.isOk()) return result;
-    if (!slot) {
-        return DbResult::error(DbStatus::Internal,
-                               "page pin returned no slot");
-    }
-    if (slot->cacheIndex >= _capacity ||
-        _cache.entries[slot->cacheIndex].pageId != pageId ||
-        !_cache.entries[slot->cacheIndex].image) {
-        (void)unpin(*slot);
-        return DbResult::error(DbStatus::Internal,
-                               "pinned page image is unavailable");
+    size_t index = GX_PAGE_CACHE_NO_INDEX;
+    GxPageCacheEntry* existing = gxPageCacheLookup(&_cache, pageId, &index);
+    if (existing != nullptr) {
+        if (index >= _capacity || !existing->image) {
+            return DbResult::error(DbStatus::Internal,
+                                   "resident page image is unavailable");
+        }
+        BufferSlot& slot = _slots[index];
+        if (existing->pinCount != 0 &&
+            (!slot.materialized || slot.pageId != pageId)) {
+            return DbResult::error(DbStatus::Internal,
+                                   "pinned page view is unavailable");
+        }
+        // A dirty, live view is the current committed cache state. Encode it
+        // before cloning so the serialized image and the caller-owned result
+        // agree. This operation does not acquire or release the live pin.
+        if (existing->dirty && slot.materialized) {
+            DbResult encoded = encodeSlot(index);
+            if (!encoded.isOk()) return encoded;
+        }
+        status = prepared.materialize(existing->image, _cache.pageSize,
+                                      pageId);
+        if (status != GxStatus::Ok) {
+            return ownedPageStatus(status,
+                                   "caller-owned page materialization failed");
+        }
+
+        const GxStatus touchStatus = gxPageCacheTouch(&_cache, existing);
+        if (touchStatus != GxStatus::Ok) {
+            return cacheStatus(touchStatus, "page-cache LRU clock exhausted");
+        }
+        status = prepared.moveTo(out);
+        if (status != GxStatus::Ok) {
+            return ownedPageStatus(status,
+                                   "caller-owned page publication failed");
+        }
+        return DbResult::ok();
     }
 
-    const GxPageCacheEntry& entry = _cache.entries[slot->cacheIndex];
-    status = prepared.materialize(entry.image, _cache.pageSize, pageId);
-    DbResult unpinResult = unpin(*slot);
+    // Stage both cache and caller ownership from the validated serialized
+    // image. No DatabasePage/std::vector view is parsed on this path. The cache
+    // candidate is not published until caller allocation and full-page
+    // validation have succeeded.
+    DbResult result = chooseTarget(index);
+    if (!result.isOk()) return result;
+
+    uint8_t* candidate = nullptr;
+    result = allocateCandidate(&candidate);
+    if (!result.isOk()) return result;
+    result = _file.readPageImage(pageId, candidate, _cache.pageSize);
+    if (!result.isOk()) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return result;
+    }
+    status = prepared.materialize(candidate, _cache.pageSize, pageId);
     if (status != GxStatus::Ok) {
+        gxPageCacheFreeImage(&_cache, candidate);
         return ownedPageStatus(status,
                                "caller-owned page materialization failed");
     }
-    if (!unpinResult.isOk()) return unpinResult;
 
+    GxPageCacheEntry& target = _cache.entries[index];
+    if (target.pageId != 0 && target.dirty) {
+        result = flushVictim(index);
+        if (!result.isOk()) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return result;
+        }
+    }
+    const GxStatus publishStatus = gxPageCachePublish(
+        &_cache, index, pageId, candidate, false, false);
+    if (publishStatus != GxStatus::Ok) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return cacheStatus(publishStatus, "page-cache publication failed");
+    }
+
+    BufferSlot& slot = _slots[index];
+    discardMaterialized(slot);
+    slot.cacheIndex = static_cast<uint32_t>(index);
+    syncSlot(slot, _cache.entries[index]);
+
+    // initLike copied the destination's exact allocator tuple and page bound,
+    // so this final transfer cannot allocate or reject the destination.
     status = prepared.moveTo(out);
     if (status != GxStatus::Ok) {
         return ownedPageStatus(status,

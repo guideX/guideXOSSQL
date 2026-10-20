@@ -15,6 +15,7 @@
 #include "database_page.h"
 #include "database_relational.h"
 #include "database_sql.h"
+#include "database_transaction.h"
 #include "gx_owned_page.h"
 #include "gx_test_allocator.h"
 
@@ -286,7 +287,7 @@ void testProductionReadLifetimeAndSql9() {
     gxArenaMakeAllocator(&cloneArena, &cloneAllocator);
 
     DatabaseCreateOptions createOptions;
-    createOptions.bufferCapacity = 4;
+    createOptions.bufferCapacity = 2;
     createOptions.pageCacheAllocator = &cacheAllocator;
     std::unique_ptr<Database> db;
     DbResult result = Database::create(path, createOptions, db);
@@ -315,13 +316,69 @@ void testProductionReadLifetimeAndSql9() {
               readYourWrites.statements[0].resultSet.rowCount() == 1 &&
               readYourWrites.statements[0].resultSet.value(0, 0).textValue() ==
                   "after");
+        const SqlExecutionResult statementFailure = engine.execute(
+            "INSERT INTO PortableRows VALUES (1, 'duplicate');");
+        CHECK(!statementFailure.ok && engine.inTransaction());
+        SqlExecutionResult afterStatementFailure = engine.execute(
+            "SELECT Value FROM PortableRows WHERE Id=1;");
+        CHECK(afterStatementFailure.ok &&
+              afterStatementFailure.statements[0].resultSet.value(0, 0)
+                      .textValue() == "after");
         CHECK(sqlOk(engine, "COMMIT;"));
         SqlExecutionResult indexedAfterCommit = engine.execute(
             "SELECT Id FROM PortableRows WHERE Value='after';");
         CHECK(indexedAfterCommit.ok && indexedAfterCommit.statements.size() == 1 &&
               indexedAfterCommit.statements[0].accessPath == "IndexLookup" &&
               indexedAfterCommit.statements[0].resultSet.rowCount() == 1);
+
+        CHECK(sqlOk(engine, "BEGIN;"));
+        CHECK(sqlOk(engine, "DELETE FROM PortableRows WHERE Id=1;"));
+        SqlExecutionResult deletedInTransaction = engine.execute(
+            "SELECT Id FROM PortableRows WHERE Id=1;");
+        CHECK(deletedInTransaction.ok &&
+              deletedInTransaction.statements[0].resultSet.rowCount() == 0);
+        CHECK(sqlOk(engine, "ROLLBACK;"));
+        SqlExecutionResult restoredAfterRollback = engine.execute(
+            "SELECT Value FROM PortableRows WHERE Id=1;");
+        CHECK(restoredAfterRollback.ok &&
+              restoredAfterRollback.statements[0].resultSet.rowCount() == 1 &&
+              restoredAfterRollback.statements[0].resultSet.value(0, 0)
+                      .textValue() == "after");
     }
+
+    // The owned API reads only the committed cache. An explicit transaction's
+    // staged image remains visible to Transaction::readPage, not this reader.
+    GxOwnedPage committedOnly;
+    CHECK(committedOnly.init(&callerAllocator, db->pageSize()) == GxStatus::Ok);
+    CHECK(db->readOwnedPage(1, committedOnly).isOk());
+    const uint32_t committedGeneration = committedOnly.generation();
+    std::unique_ptr<Transaction> overlayTransaction;
+    CHECK(db->beginTransaction(overlayTransaction).isOk() &&
+          overlayTransaction != nullptr);
+    if (overlayTransaction) {
+        DatabasePage staged;
+        CHECK(overlayTransaction->readPage(1, staged).isOk());
+        staged.generation = committedGeneration + 1;
+        CHECK(overlayTransaction->writePage(staged).isOk());
+        DatabasePage overlay;
+        CHECK(overlayTransaction->readPage(1, overlay).isOk());
+        CHECK(overlay.generation == committedGeneration + 1);
+        CHECK(db->readOwnedPage(1, committedOnly).isOk());
+        CHECK(committedOnly.generation() == committedGeneration);
+        CHECK(overlayTransaction->rollback().isOk());
+    }
+
+    GxOwnedPage initialFailure;
+    CHECK(initialFailure.init(&callerAllocator, db->pageSize()) == GxStatus::Ok);
+    gxArenaFailAfter(&callerArena, 0);
+    CHECK(db->readOwnedPage(1, initialFailure).status() == DbStatus::NoSpace);
+    CHECK(!initialFailure.isValid());
+    gxArenaDisableFailure(&callerArena);
+
+    GxOwnedPage unconfiguredCaller;
+    CHECK(db->readOwnedPage(1, unconfiguredCaller).status() ==
+          DbStatus::InvalidArgument);
+    CHECK(!unconfiguredCaller.isInitialized() && !unconfiguredCaller.isValid());
 
     GxOwnedPage retained;
     CHECK(retained.init(&callerAllocator, db->pageSize()) == GxStatus::Ok);
@@ -333,8 +390,14 @@ void testProductionReadLifetimeAndSql9() {
 
     DatabasePage hosted;
     CHECK(db->readPage(1, hosted).isOk());
-    std::vector<uint8_t> expected;
-    CHECK(hosted.serialize(expected, db->pageSize()).isOk());
+    const std::vector<uint8_t> expected = referencePage(
+        hosted.pageId, static_cast<uint16_t>(hosted.type), hosted.flags,
+        hosted.generation,
+        hosted.payload.empty() ? nullptr : hosted.payload.data(),
+        hosted.payload.size(), db->pageSize());
+    std::vector<uint8_t> hostedEncoding;
+    CHECK(hosted.serialize(hostedEncoding, db->pageSize()).isOk());
+    CHECK(hostedEncoding == expected);
     CHECK(sameBytes(retained, expected));
 
     const uint8_t* retainedBeforeFailure = retained.encodedBytes();
@@ -346,6 +409,73 @@ void testProductionReadLifetimeAndSql9() {
     CHECK(db->readOwnedPage(1, retained).isOk());
     CHECK(sameBytes(retained, expected));
 
+    // Reads from a resident, already-pinned cache entry borrow its stable
+    // serialized image without acquiring or releasing the caller's pin.
+    BufferSlot* pinned = nullptr;
+    CHECK(db->buffer().pinPage(1, pinned).isOk() && pinned != nullptr);
+    if (pinned) {
+        const uint32_t slotPinsBefore = pinned->pinCount;
+        const uint32_t managerPinsBefore = db->buffer().pinnedCount();
+        const uint8_t* retainedBeforePinnedFailure = retained.encodedBytes();
+        gxArenaFailAfter(&callerArena, 0);
+        CHECK(db->readOwnedPage(1, retained).status() == DbStatus::NoSpace);
+        CHECK(retained.encodedBytes() == retainedBeforePinnedFailure &&
+              sameBytes(retained, expected));
+        CHECK(pinned->pinCount == slotPinsBefore &&
+              db->buffer().pinnedCount() == managerPinsBefore);
+        gxArenaDisableFailure(&callerArena);
+        CHECK(db->readOwnedPage(1, retained).isOk());
+        CHECK(sameBytes(retained, expected));
+        CHECK(pinned->pinCount == slotPinsBefore &&
+              db->buffer().pinnedCount() == managerPinsBefore);
+        CHECK(db->buffer().unpin(*pinned).isOk());
+        CHECK(db->buffer().pinnedCount() + 1 == managerPinsBefore);
+    }
+
+    // Stream through the on-disk pages so page 1 is outside the two-slot
+    // cache. Exercise both cache-image allocation failure and caller-owner
+    // allocation failure before a miss can replace a resident entry.
+    const uint64_t committedPageCount = db->pageCount();
+    CHECK(committedPageCount > db->bufferCapacity() + 1);
+    for (uint64_t pageId = 1; pageId < committedPageCount; ++pageId) {
+        BufferSlot* scanSlot = nullptr;
+        const DbResult pinResult = db->buffer().pinPage(pageId, scanSlot);
+        CHECK(pinResult.isOk() && scanSlot != nullptr);
+        if (pinResult.isOk() && scanSlot) {
+            CHECK(db->buffer().unpin(*scanSlot).isOk());
+        }
+    }
+
+    const uint8_t* retainedBeforeMissFailure = retained.encodedBytes();
+    const size_t cacheOutstandingBeforeMissFailure = cacheArena.outstanding;
+    gxArenaFailAfter(&cacheArena, 0);
+    CHECK(db->readOwnedPage(1, retained).status() == DbStatus::NoSpace);
+    CHECK(retained.encodedBytes() == retainedBeforeMissFailure &&
+          sameBytes(retained, expected));
+    CHECK(cacheArena.outstanding == cacheOutstandingBeforeMissFailure &&
+          db->buffer().pinnedCount() == 0);
+    gxArenaDisableFailure(&cacheArena);
+
+    const size_t cacheOutstandingBeforeCallerFailure = cacheArena.outstanding;
+    gxArenaFailAfter(&callerArena, 0);
+    CHECK(db->readOwnedPage(1, retained).status() == DbStatus::NoSpace);
+    CHECK(retained.encodedBytes() == retainedBeforeMissFailure &&
+          sameBytes(retained, expected));
+    CHECK(cacheArena.outstanding == cacheOutstandingBeforeCallerFailure &&
+          db->buffer().pinnedCount() == 0);
+    gxArenaDisableFailure(&callerArena);
+    CHECK(db->readOwnedPage(1, retained).isOk());
+    CHECK(sameBytes(retained, expected));
+    CHECK(db->buffer().pinnedCount() == 0);
+
+    GxOwnedPage wrongPageSize;
+    CHECK(wrongPageSize.init(&callerAllocator, 1024) == GxStatus::Ok);
+    const uint8_t* retainedBeforeInvalidOwner = wrongPageSize.encodedBytes();
+    CHECK(db->readOwnedPage(1, wrongPageSize).status() ==
+          DbStatus::InvalidArgument);
+    CHECK(wrongPageSize.encodedBytes() == retainedBeforeInvalidOwner &&
+          !wrongPageSize.isValid());
+
     GxOwnedPage unchanged;
     CHECK(unchanged.init(&callerAllocator, db->pageSize()) == GxStatus::Ok);
     CHECK(db->readOwnedPage(1, unchanged).isOk());
@@ -356,7 +486,7 @@ void testProductionReadLifetimeAndSql9() {
     CHECK(db->close().isOk());
     db.reset();
     CHECK(cacheArena.outstanding == 0);
-    CHECK(callerArena.outstanding == 2);
+    CHECK(callerArena.outstanding == 3);
     CHECK(retained.validate() == GxStatus::Ok && sameBytes(retained, expected));
     GxOwnedPage clonedAfterClose;
     CHECK(clonedAfterClose.init(&cloneAllocator, retained.pageSize()) == GxStatus::Ok);
@@ -379,7 +509,10 @@ void testProductionReadLifetimeAndSql9() {
     reopened.reset();
 
     clonedAfterClose.destroy();
+    committedOnly.destroy();
     unchanged.destroy();
+    wrongPageSize.destroy();
+    initialFailure.destroy();
     retained.destroy();
     CHECK(callerArena.outstanding == 0 && cloneArena.outstanding == 0);
     CHECK(cacheArena.invalidFrees == 0 && callerArena.invalidFrees == 0 &&
