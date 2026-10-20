@@ -36,8 +36,9 @@ below. Parent NDB1R4P11 remains open, and neither phase marker advances.
   next_expected=NDB1R4P11
   ```
 
-- SQL ends on the existing `main` branch. The ending commit is recorded in the
-  final closeout below.
+- SQL remains on the existing `main` branch. The implementation acceptance
+  commit is `2136bc8df8432168c2d3b9dfc075b01b9f8054b4`; the report-only
+  closeout commit follows it.
 - Server was inspected read-only at branch `NATIVE_DB_STORAGE`, HEAD
   `f29850c93bbac0a0763a31e806d2816310156575`; its worktree remained clean.
   No Server files, build settings, Git state, or markers were changed.
@@ -301,8 +302,9 @@ in separate bounded steps. Do not begin those steps automatically.
 
 - Outcome: `CHECKED_PAGE_PUBLICATION_VERIFIED` for `Database::readOwnedPage`.
 - Starting SQL HEAD: `d16e818930fa98bc66bbc2e3d015716fd6459d06`.
-- SQL branch remains `main`; implementation and report closeout commit SHAs
-  are recorded by the final closeout follow-up.
+- SQL branch remains `main`; implementation acceptance commit:
+  `2136bc8df8432168c2d3b9dfc075b01b9f8054b4`. The report-only closeout commit
+  is the final SQL HEAD and is identified in the task closeout.
 - Final SQL phase markers remain SQL9 → SQL10 and NDB1R4P10 → NDB1R4P11.
 - Server remains read-only, clean, on `NATIVE_DB_STORAGE` at
   `f29850c93bbac0a0763a31e806d2816310156575`.
