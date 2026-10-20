@@ -44,6 +44,17 @@ DbResult codecStatus(GxStatus status, const char* operation) {
     return cacheStatus(status, operation);
 }
 
+DbResult ownedPageStatus(GxStatus status, const char* operation) {
+    if (status == GxStatus::CorruptData) {
+        return DbResult::error(DbStatus::CorruptPage, operation);
+    }
+    if (status == GxStatus::InvalidArgument ||
+        status == GxStatus::UnsupportedAlignment) {
+        return DbResult::error(DbStatus::InvalidArgument, operation);
+    }
+    return cacheStatus(status, operation);
+}
+
 } // namespace
 
 BufferManager::BufferManager(DatabaseFile& file, uint32_t capacity,
@@ -330,6 +341,54 @@ DbResult BufferManager::pinPage(uint64_t pageId, BufferSlot*& outSlot) {
     ++_pinned;
     syncSlot(slot, _cache.entries[index]);
     outSlot = &slot;
+    return DbResult::ok();
+}
+
+DbResult BufferManager::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
+    if (!_initialized) {
+        return DbResult::error(DbStatus::NotOpen,
+                               "buffer manager is not initialized");
+    }
+    if (!out.isConfiguredFor(_file.pageSize())) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "caller-owned page has the wrong page-size configuration");
+    }
+
+    GxOwnedPage prepared;
+    GxStatus status = prepared.initLike(out);
+    if (status != GxStatus::Ok) {
+        return ownedPageStatus(status, "caller-owned page setup failed");
+    }
+
+    BufferSlot* slot = nullptr;
+    DbResult result = pinPage(pageId, slot);
+    if (!result.isOk()) return result;
+    if (!slot) {
+        return DbResult::error(DbStatus::Internal,
+                               "page pin returned no slot");
+    }
+    if (slot->cacheIndex >= _capacity ||
+        _cache.entries[slot->cacheIndex].pageId != pageId ||
+        !_cache.entries[slot->cacheIndex].image) {
+        (void)unpin(*slot);
+        return DbResult::error(DbStatus::Internal,
+                               "pinned page image is unavailable");
+    }
+
+    const GxPageCacheEntry& entry = _cache.entries[slot->cacheIndex];
+    status = prepared.materialize(entry.image, _cache.pageSize, pageId);
+    DbResult unpinResult = unpin(*slot);
+    if (status != GxStatus::Ok) {
+        return ownedPageStatus(status,
+                               "caller-owned page materialization failed");
+    }
+    if (!unpinResult.isOk()) return unpinResult;
+
+    status = prepared.moveTo(out);
+    if (status != GxStatus::Ok) {
+        return ownedPageStatus(status,
+                               "caller-owned page publication failed");
+    }
     return DbResult::ok();
 }
 

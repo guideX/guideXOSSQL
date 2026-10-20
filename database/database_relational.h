@@ -72,6 +72,11 @@ public:
     uint32_t pageSize() const override;
     uint64_t pageCount() const override;
     DbResult readPage(uint64_t pageId, DatabasePage& out) override;
+    // Reads the committed page into an independently caller-owned portable
+    // image. Initialize `out` with a valid allocator and this database's page
+    // size first. The allocator context must outlive `out`; it is not borrowed
+    // from the database, cache, or active transaction.
+    DbResult readOwnedPage(uint64_t pageId, GxOwnedPage& out);
     DbResult writePage(const DatabasePage& page) override;
     DbResult allocatePage(PageType type, uint64_t& outPageId) override;
 

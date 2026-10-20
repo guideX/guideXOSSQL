@@ -135,6 +135,17 @@ DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
     return DbResult::ok();
 }
 
+DbResult Database::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
+    if (!_buffer) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_diagnostics.recoveryRequired) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "committed page publication requires WAL recovery");
+    }
+    return _buffer->readOwnedPage(pageId, out);
+}
+
 DbResult Database::writePage(const DatabasePage& page) {
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");

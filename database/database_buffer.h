@@ -26,6 +26,7 @@
 #include "database_page.h"
 #include "database_result.h"
 #include "portable/gx_page_cache.h"
+#include "portable/gx_owned_page.h"
 
 namespace gxos {
 namespace db {
@@ -63,6 +64,11 @@ public:
     // cache miss. The caller MUST call unpin() exactly once. On failure the
     // slot is not pinned.
     DbResult pinPage(uint64_t pageId, BufferSlot*& outSlot);
+
+    // Materializes the committed serialized image into an initialized
+    // caller-owned page. The destination must use this database's page size;
+    // its allocator context must outlive the owner, not this manager.
+    DbResult readOwnedPage(uint64_t pageId, GxOwnedPage& out);
 
     // Pins a page that was already allocated and written (zeroed) by
     // DatabaseFile::allocatePage. The slot is marked dirty so the final

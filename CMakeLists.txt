@@ -23,6 +23,7 @@ add_library(gxos_database STATIC
     database/portable/gx_allocator.cpp
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
+    database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
     database/portable/gx_page_cache.cpp
@@ -294,6 +295,22 @@ else()
 endif()
 add_test(NAME database_heap_page_construction_test
     COMMAND database_heap_page_construction_test)
+
+add_executable(database_owned_page_test
+    tests/gx_test_allocator.cpp
+    tests/database_owned_page_test.cpp
+)
+target_link_libraries(database_owned_page_test PRIVATE gxos_database)
+target_include_directories(database_owned_page_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+if(MSVC)
+    target_compile_options(database_owned_page_test PRIVATE /W4)
+else()
+    target_compile_options(database_owned_page_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_owned_page_test COMMAND database_owned_page_test)
 
 option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
 if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
