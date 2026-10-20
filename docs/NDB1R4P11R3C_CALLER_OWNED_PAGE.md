@@ -253,10 +253,16 @@ contract is stable; neither starts automatically in R3C.
 
 - Outcome: `CALLER_OWNED_PAGE_MATERIALIZATION_VERIFIED`.
 - Starting SQL HEAD: `92d7b566090d8ca631a3175d8f51aa3a2c77492c`.
-- Ending SQL HEAD, branch, full regression, and local commit SHA: to be filled
-  after final gate verification and commit.
+- SQL branch: `main`; the qualified R3C source, test, R3B evidence, and report
+  acceptance commit is `b4dbe722fd684e7126212d7c6c3ae4f1369d3c3e`.
+- This report receives a documentation-only closeout follow-up after the
+  acceptance commit so it can record that commit's exact SHA. The final
+  worktree remains on `main`; the final repository HEAD is also reported in
+  the task closeout.
+- Full regression: 20/20 CTest targets, 145,380 checks, zero failures;
+  1,898.24 seconds.
 - Both phase markers remain at SQL9 → SQL10 and NDB1R4P10 → NDB1R4P11.
 - The R3B Outcome B report remains preserved and is included with the R3C
-  source, tests, and report in the local commit.
+  source, tests, and report in the acceptance commit.
 - Server remains read-only and unchanged.
 - No push or Git topology operation was performed.
