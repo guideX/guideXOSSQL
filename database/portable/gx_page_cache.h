@@ -59,6 +59,11 @@ void gxPageCacheFreeImage(GxPageCache* cache, uint8_t* image);
 // replacing an eligible victim.
 GxStatus gxPageCachePublish(GxPageCache* cache, size_t index, uint64_t pageId,
                             uint8_t* image, bool dirty, bool pin);
+// Replaces the serialized image for the same resident key. The supplied
+// image is adopted only on success; key and pin count are preserved.
+GxStatus gxPageCacheReplaceImage(GxPageCache* cache, size_t index,
+                                 uint64_t pageId, uint8_t* image,
+                                 bool dirty);
 GxStatus gxPageCacheTouch(GxPageCache* cache, GxPageCacheEntry* entry);
 GxStatus gxPageCachePin(GxPageCache* cache, GxPageCacheEntry* entry);
 GxStatus gxPageCacheUnpin(GxPageCache* cache, GxPageCacheEntry* entry);

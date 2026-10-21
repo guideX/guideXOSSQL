@@ -187,6 +187,8 @@ private:
     DbResult openAndRecoverWal(IDatabaseFileSystem& fileSystem,
                                bool validateAllPages);
     DbResult ensureWalOpen();
+    DbResult installCommittedPageImage(uint64_t pageId, const uint8_t* image,
+                                       size_t imageSize);
     DbResult applyRecovery(const std::vector<WalTransaction>& transactions);
     DbResult validateRecoveryCoverage(const std::vector<WalTransaction>& transactions);
     void refreshDiagnostics();

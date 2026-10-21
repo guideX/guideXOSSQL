@@ -312,6 +312,22 @@ else()
 endif()
 add_test(NAME database_owned_page_test COMMAND database_owned_page_test)
 
+add_executable(database_cache_publication_test
+    tests/gx_test_allocator.cpp
+    tests/database_cache_publication_test.cpp
+)
+target_link_libraries(database_cache_publication_test PRIVATE gxos_database)
+target_include_directories(database_cache_publication_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests"
+)
+if(MSVC)
+    target_compile_options(database_cache_publication_test PRIVATE /W4)
+else()
+    target_compile_options(database_cache_publication_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_cache_publication_test COMMAND database_cache_publication_test)
+
 option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
 if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
     target_compile_options(database_portable_runtime_test PRIVATE

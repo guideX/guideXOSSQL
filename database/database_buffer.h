@@ -20,6 +20,7 @@
 //     still applies to every page that enters the cache.
 //   * No threads and no background flushing.
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "database_file.h"
@@ -76,12 +77,17 @@ public:
     // content is guaranteed to reach the file on flush/close.
     DbResult pinAllocatedPage(uint64_t pageId, BufferSlot*& outSlot);
 
-    // SQL3: installs a complete committed page image into the cache without
-    // reading it from the file. The slot is marked dirty so the image reaches
-    // the file on the next flush. Used by transaction commit/recovery to
-    // publish committed page images (including newly allocated pages) into the
-    // committed cache. Never used for uncommitted data.
+    // Compatibility writer for an already materialized page. The slot is
+    // marked dirty so the image reaches the file on flush. Transaction commit
+    // uses the encoded-image overload below to avoid rebuilding this view.
     DbResult installPage(uint64_t pageId, const DatabasePage& page);
+
+    // Installs an exact encoded committed page image, including newly
+    // allocated pages. The source is borrowed only for this call and is copied
+    // into cache-allocator storage after the R3A validator accepts its extent,
+    // identity, type, bounds, and CRC. Used only after durable COMMIT.
+    DbResult installPage(uint64_t pageId, const uint8_t* image,
+                         size_t imageSize);
 
     DbResult markDirty(BufferSlot& slot);
     DbResult unpin(BufferSlot& slot);
@@ -108,6 +114,9 @@ private:
     DbResult encodeSlot(size_t index);
     DbResult allocateCandidate(uint8_t** outImage);
     DbResult chooseTarget(size_t& outIndex);
+    DbResult publishCandidate(uint64_t pageId, uint8_t* candidate,
+                              GxPageCacheEntry* existing, size_t index,
+                              DatabasePage* preparedPinnedView);
     void discardMaterialized(BufferSlot& slot);
     void syncSlot(BufferSlot& slot, const GxPageCacheEntry& entry);
 

@@ -183,6 +183,75 @@ DbResult BufferManager::chooseTarget(size_t& outIndex) {
     return DbResult::ok();
 }
 
+DbResult BufferManager::publishCandidate(
+    uint64_t pageId, uint8_t* candidate, GxPageCacheEntry* existing,
+    size_t index, DatabasePage* preparedPinnedView) {
+    if (candidate == nullptr) {
+        return DbResult::error(DbStatus::Internal,
+                               "page-cache candidate is missing");
+    }
+
+    if (existing != nullptr) {
+        if (index >= _capacity || existing != &_cache.entries[index] ||
+            existing->pageId != pageId) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::Internal,
+                                   "page-cache replacement identity changed");
+        }
+        BufferSlot& slot = _slots[index];
+        if (existing->pinCount != 0 &&
+            (!slot.materialized || slot.pageId != pageId ||
+             slot.pinCount != existing->pinCount ||
+             preparedPinnedView == nullptr)) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::Internal,
+                                   "pinned page view is not prepared");
+        }
+
+        const GxStatus replaceStatus = gxPageCacheReplaceImage(
+            &_cache, index, pageId, candidate, true);
+        if (replaceStatus != GxStatus::Ok) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return cacheStatus(replaceStatus,
+                               "page-cache image replacement failed");
+        }
+        if (existing->pinCount != 0) {
+            preparedPinnedView->pageId = pageId;
+            slot.page = std::move(*preparedPinnedView);
+            slot.materialized = true;
+        } else {
+            discardMaterialized(slot);
+        }
+        syncSlot(slot, *existing);
+        return DbResult::ok();
+    }
+
+    DbResult result = chooseTarget(index);
+    if (!result.isOk()) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return result;
+    }
+    GxPageCacheEntry& target = _cache.entries[index];
+    if (target.pageId != 0 && target.dirty) {
+        result = flushVictim(index);
+        if (!result.isOk()) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return result;
+        }
+    }
+    const GxStatus publishStatus = gxPageCachePublish(
+        &_cache, index, pageId, candidate, true, false);
+    if (publishStatus != GxStatus::Ok) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return cacheStatus(publishStatus, "page-cache publication failed");
+    }
+    BufferSlot& slot = _slots[index];
+    discardMaterialized(slot);
+    slot.cacheIndex = static_cast<uint32_t>(index);
+    syncSlot(slot, _cache.entries[index]);
+    return DbResult::ok();
+}
+
 void BufferManager::syncSlot(BufferSlot& slot,
                              const GxPageCacheEntry& entry) {
     slot.pageId = entry.pageId;
@@ -563,48 +632,12 @@ DbResult BufferManager::installPage(uint64_t pageId,
                                "committed page id is outside the database");
     }
 
-    size_t index = GX_PAGE_CACHE_NO_INDEX;
-    GxPageCacheEntry* existing = gxPageCacheLookup(&_cache, pageId, &index);
-    if (existing != nullptr) {
-        DatabasePage viewCopy;
-        const bool replaceView = existing->pinCount != 0;
-        if (replaceView) {
-            try {
-                viewCopy = page;
-            } catch (const std::bad_alloc&) {
-                return DbResult::error(DbStatus::NoSpace,
-                                       "page-view copy allocation failed");
-            }
-        }
-        const GxStatus touchStatus = gxPageCacheTouch(&_cache, existing);
-        if (touchStatus != GxStatus::Ok) {
-            return cacheStatus(touchStatus, "page-cache LRU clock exhausted");
-        }
-        const GxStatus encodeStatus = gxDatabasePageEncode(
-            existing->image, _cache.pageSize, pageId,
-            static_cast<uint16_t>(page.type), page.flags, page.generation,
-            page.payload.empty() ? nullptr : page.payload.data(),
-            page.payload.size());
-        if (encodeStatus != GxStatus::Ok) {
-            return codecStatus(encodeStatus, "committed page encoding failed");
-        }
-        const GxStatus dirtyStatus = gxPageCacheMarkDirty(&_cache, existing);
-        if (dirtyStatus != GxStatus::Ok) {
-            return cacheStatus(dirtyStatus, "page-cache dirty mark failed");
-        }
-        if (replaceView) {
-            viewCopy.pageId = pageId;
-            _slots[index].page = std::move(viewCopy);
-            _slots[index].materialized = true;
-        }
-        syncSlot(_slots[index], *existing);
-        return DbResult::ok();
+    if (page.pageId != pageId) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "page value identity does not match cache key");
     }
-
-    DbResult result = chooseTarget(index);
-    if (!result.isOk()) return result;
     uint8_t* candidate = nullptr;
-    result = allocateCandidate(&candidate);
+    DbResult result = allocateCandidate(&candidate);
     if (!result.isOk()) return result;
     const GxStatus encodeStatus = gxDatabasePageEncode(
         candidate, _cache.pageSize, pageId,
@@ -616,25 +649,104 @@ DbResult BufferManager::installPage(uint64_t pageId,
         return codecStatus(encodeStatus, "committed page encoding failed");
     }
 
-    GxPageCacheEntry& target = _cache.entries[index];
-    if (target.pageId != 0 && target.dirty) {
-        result = flushVictim(index);
+    GxDatabasePageInfo info = {};
+    const GxStatus inspectStatus = gxDatabasePageInspect(
+        candidate, _cache.pageSize, _cache.pageSize, pageId, &info);
+    if (inspectStatus != GxStatus::Ok) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return codecStatus(inspectStatus,
+                           "committed page validation failed");
+    }
+
+    size_t index = GX_PAGE_CACHE_NO_INDEX;
+    GxPageCacheEntry* existing = gxPageCacheLookup(&_cache, pageId, &index);
+    DatabasePage preparedView;
+    DatabasePage* preparedViewPointer = nullptr;
+    if (existing != nullptr && existing->pinCount != 0) {
+        BufferSlot& slot = _slots[index];
+        if (!slot.materialized || slot.pageId != pageId ||
+            slot.pinCount != existing->pinCount) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::Internal,
+                                   "pinned page view is inconsistent");
+        }
+        try {
+            preparedView = page;
+        } catch (const std::bad_alloc&) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::NoSpace,
+                                   "pinned page-view copy allocation failed");
+        }
+        preparedViewPointer = &preparedView;
+    }
+    return publishCandidate(pageId, candidate, existing, index,
+                            preparedViewPointer);
+}
+
+DbResult BufferManager::installPage(uint64_t pageId, const uint8_t* image,
+                                    size_t imageSize) {
+    if (!_initialized) {
+        return DbResult::error(DbStatus::NotOpen,
+                               "buffer manager is not initialized");
+    }
+    if (pageId == kHeaderPageId) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "page 0 is the header page");
+    }
+    if (pageId >= _file.pageCount()) {
+        return DbResult::error(DbStatus::OutOfBounds,
+                               "committed page id is outside the database");
+    }
+    GxDatabasePageInfo info = {};
+    const GxStatus sourceStatus = gxDatabasePageInspect(
+        image, imageSize, _cache.pageSize, pageId, &info);
+    if (sourceStatus != GxStatus::Ok) {
+        return codecStatus(sourceStatus, "committed page image is invalid");
+    }
+
+    uint8_t* candidate = nullptr;
+    DbResult result = allocateCandidate(&candidate);
+    if (!result.isOk()) return result;
+    for (size_t i = 0; i < imageSize; ++i) candidate[i] = image[i];
+
+    GxDatabasePageInfo copiedInfo = {};
+    const GxStatus copiedStatus = gxDatabasePageInspect(
+        candidate, _cache.pageSize, _cache.pageSize, pageId, &copiedInfo);
+    if (copiedStatus != GxStatus::Ok) {
+        gxPageCacheFreeImage(&_cache, candidate);
+        return codecStatus(copiedStatus,
+                           "prepared committed page image is invalid");
+    }
+
+    size_t index = GX_PAGE_CACHE_NO_INDEX;
+    GxPageCacheEntry* existing = gxPageCacheLookup(&_cache, pageId, &index);
+    DatabasePage preparedView;
+    DatabasePage* preparedViewPointer = nullptr;
+    if (existing != nullptr && existing->pinCount != 0) {
+        BufferSlot& slot = _slots[index];
+        if (!slot.materialized || slot.pageId != pageId ||
+            slot.pinCount != existing->pinCount) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::Internal,
+                                   "pinned page view is inconsistent");
+        }
+        try {
+            result = DatabasePage::parse(candidate, _cache.pageSize,
+                                         _cache.pageSize, pageId,
+                                         preparedView);
+        } catch (const std::bad_alloc&) {
+            gxPageCacheFreeImage(&_cache, candidate);
+            return DbResult::error(DbStatus::NoSpace,
+                                   "pinned page-view allocation failed");
+        }
         if (!result.isOk()) {
             gxPageCacheFreeImage(&_cache, candidate);
             return result;
         }
+        preparedViewPointer = &preparedView;
     }
-    const GxStatus publishStatus = gxPageCachePublish(
-        &_cache, index, pageId, candidate, true, false);
-    if (publishStatus != GxStatus::Ok) {
-        gxPageCacheFreeImage(&_cache, candidate);
-        return cacheStatus(publishStatus, "page-cache publication failed");
-    }
-    BufferSlot& slot = _slots[index];
-    discardMaterialized(slot);
-    slot.cacheIndex = static_cast<uint32_t>(index);
-    syncSlot(slot, _cache.entries[index]);
-    return DbResult::ok();
+    return publishCandidate(pageId, candidate, existing, index,
+                            preparedViewPointer);
 }
 
 DbResult BufferManager::markDirty(BufferSlot& slot) {

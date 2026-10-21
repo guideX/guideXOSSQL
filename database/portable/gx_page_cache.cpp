@@ -211,6 +211,36 @@ GxStatus gxPageCachePublish(GxPageCache* cache, size_t index, uint64_t pageId,
     return GxStatus::Ok;
 }
 
+GxStatus gxPageCacheReplaceImage(GxPageCache* cache, size_t index,
+                                 uint64_t pageId, uint8_t* image,
+                                 bool dirty) {
+    if (!cache || !cache->initialized || index >= cache->capacity ||
+        pageId == 0 || !image) {
+        return GxStatus::InvalidArgument;
+    }
+    GxPageCacheEntry& entry = cache->entries[index];
+    if (entry.pageId != pageId || !entry.image || entry.image == image) {
+        return GxStatus::InvalidArgument;
+    }
+    if (cache->clock == UINT64_MAX) return GxStatus::Overflow;
+    if (dirty && !entry.dirty &&
+        cache->dirtyCount == static_cast<size_t>(-1)) {
+        return GxStatus::Overflow;
+    }
+    if (!dirty && entry.dirty && cache->dirtyCount == 0) {
+        return GxStatus::InvalidArgument;
+    }
+
+    uint8_t* priorImage = entry.image;
+    if (dirty && !entry.dirty) ++cache->dirtyCount;
+    if (!dirty && entry.dirty) --cache->dirtyCount;
+    entry.image = image;
+    entry.dirty = dirty;
+    entry.lastUsed = ++cache->clock;
+    gxPageCacheFreeImage(cache, priorImage);
+    return GxStatus::Ok;
+}
+
 GxStatus gxPageCachePin(GxPageCache* cache, GxPageCacheEntry* entry) {
     if (!cache || !cache->initialized || !entry || entry->pageId == 0 ||
         !entry->image) {

@@ -283,19 +283,12 @@ DbResult Transaction::commit() {
     for (size_t i = 0; i < gxTransactionPageOverlayCount(&_pageOverlay); ++i) {
         const GxTransactionPageEntry* entry =
             gxTransactionPageOverlayAt(&_pageOverlay, i);
-        DatabasePage page;
-        try {
-            if (!entry || !entry->image) {
-                result = DbResult::error(DbStatus::Internal,
-                                         "transaction page owner is incomplete");
-            } else {
-                result = DatabasePage::parse(entry->image, pageSize(),
-                                             pageSize(), entry->pageId, page);
-                if (result.isOk()) result = _db.writePage(page);
-            }
-        } catch (const std::bad_alloc&) {
-            result = DbResult::error(DbStatus::NoSpace,
-                                     "committed page view allocation failed");
+        if (!entry || !entry->image) {
+            result = DbResult::error(DbStatus::Internal,
+                                     "transaction page owner is incomplete");
+        } else {
+            result = _db.installCommittedPageImage(
+                entry->pageId, entry->image, pageSize());
         }
         if (!result.isOk()) {
             // WAL COMMIT is already durable. Keep reads from the committed

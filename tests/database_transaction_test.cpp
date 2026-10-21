@@ -158,6 +158,7 @@ struct BudgetState {
     bool failLookup;
     bool failRemove;
     bool failClose;
+    bool freezeAfterCommitSync;
     uint32_t removeCalls;
     uint64_t durableCommitOffset;
     std::vector<uint64_t> boundaries;
@@ -165,7 +166,8 @@ struct BudgetState {
     BudgetState()
         : budget(UINT64_MAX), written(0), exhausted(false), recording(false),
           pendingCommitRecord(false), failSize(false), failLookup(false),
-          failRemove(false), failClose(false), removeCalls(0),
+          failRemove(false), failClose(false), freezeAfterCommitSync(false),
+          removeCalls(0),
           durableCommitOffset(UINT64_MAX) {}
 
     void freeze() { budget = written; }
@@ -232,6 +234,9 @@ public:
         if (_state->pendingCommitRecord) {
             _state->durableCommitOffset = _state->written;
             _state->pendingCommitRecord = false;
+            if (_state->freezeAfterCommitSync) {
+                _state->budget = _state->written;
+            }
         }
         return true;
     }
@@ -1934,6 +1939,86 @@ void testCrashDuringRedo() {
     removeFile(path);
 }
 
+void testDurableCommitCachePublicationIoFailure() {
+    std::printf("durable commit with cache-publication write failure\n");
+    const std::string path = uniquePath("cachepublishio");
+    std::shared_ptr<BudgetState> state(new BudgetState());
+    BudgetFileSystem fs(state);
+    DatabaseCreateOptions createOptions;
+    createOptions.bufferCapacity = 1;
+    std::unique_ptr<Database> db;
+    CHECK_STATUS(Database::create(path, createOptions, db, &fs), DbStatus::Ok);
+    if (!db) {
+        removeFile(walPath(path));
+        removeFile(path);
+        return;
+    }
+
+    uint32_t committedGeneration = 0;
+    {
+        std::unique_ptr<Transaction> tx;
+        CHECK_STATUS(db->beginTransaction(tx), DbStatus::Ok);
+        DatabasePage page;
+        CHECK_STATUS(tx->readPage(kBootstrapPageId, page), DbStatus::Ok);
+        page.generation += 5;
+        committedGeneration = page.generation;
+        CHECK_STATUS(tx->writePage(page), DbStatus::Ok);
+        CHECK_STATUS(tx->commit(), DbStatus::Ok);
+    }
+    CHECK(db->buffer().dirtyCount() == 1);
+
+    uint64_t allocatedPageId = 0;
+    std::unique_ptr<Transaction> tx;
+    CHECK_STATUS(db->beginTransaction(tx), DbStatus::Ok);
+    if (tx) {
+        CHECK_STATUS(tx->allocatePage(PageType::Data, allocatedPageId),
+                     DbStatus::Ok);
+        DatabasePage page;
+        page.pageId = allocatedPageId;
+        page.type = PageType::Data;
+        page.generation = 91;
+        page.payload.push_back(0x5A);
+        CHECK_STATUS(tx->writePage(page), DbStatus::Ok);
+
+        // The next WAL sync durably records COMMIT, then the byte budget stops
+        // the cache from flushing its dirty victim during page publication.
+        state->freezeAfterCommitSync = true;
+        CHECK_STATUS(tx->commit(), DbStatus::CommitFailed);
+        CHECK(!tx->isActive());
+        CHECK(state->durableCommitOffset != UINT64_MAX && state->exhausted);
+        CHECK(db->diagnostics().recoveryRequired);
+        CHECK(db->readPage(kBootstrapPageId, page).status() ==
+              DbStatus::RecoveryRequired);
+        CHECK(db->buffer().dirtyCount() == 1);
+        CHECK(fileExists(walPath(path)) &&
+              !readFileBytes(walPath(path)).empty());
+    }
+
+    state->budget = UINT64_MAX;
+    tx.reset();
+    CHECK_STATUS(db->close(), DbStatus::RecoveryRequired);
+    db.reset();
+    CHECK(!readFileBytes(walPath(path)).empty());
+
+    std::unique_ptr<Database> recovered;
+    CHECK_STATUS(Database::open(path, DatabaseOpenOptions(), recovered),
+                 DbStatus::Ok);
+    if (recovered) {
+        DatabasePage page;
+        CHECK_STATUS(recovered->readPage(kBootstrapPageId, page), DbStatus::Ok);
+        CHECK(page.generation == committedGeneration);
+        CHECK_STATUS(recovered->readPage(allocatedPageId, page), DbStatus::Ok);
+        CHECK(page.pageId == allocatedPageId && page.type == PageType::Data &&
+              page.generation == 91 && page.payload.size() == 1 &&
+              page.payload[0] == 0x5A);
+        CHECK(!readFileBytes(walPath(path)).empty());
+        CHECK_STATUS(recovered->close(), DbStatus::Ok);
+    }
+    recovered.reset();
+    removeFile(walPath(path));
+    removeFile(path);
+}
+
 void testCrashDuringCheckpoint() {
     std::printf("crash during WAL checkpoint\n");
     const std::string path = uniquePath("checkpointc");
@@ -2403,6 +2488,7 @@ int main() {
     testCrashMatrix();
     testCatalogGrowthCrashMatrix();
     testCrashDuringRedo();
+    testDurableCommitCachePublicationIoFailure();
     testCrashDuringCheckpoint();
     testRecoveryIdempotence();
     testReadOnlyRecoveryRequired();

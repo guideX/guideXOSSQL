@@ -156,6 +156,18 @@ DbResult Database::writePage(const DatabasePage& page) {
     return _buffer->installPage(page.pageId, page);
 }
 
+DbResult Database::installCommittedPageImage(uint64_t pageId,
+                                             const uint8_t* image,
+                                             size_t imageSize) {
+    if (!_buffer) {
+        return DbResult::error(DbStatus::NotOpen, "database is not open");
+    }
+    if (_readOnly) {
+        return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
+    }
+    return _buffer->installPage(pageId, image, imageSize);
+}
+
 DbResult Database::allocatePage(PageType, uint64_t&) {
     return DbResult::error(DbStatus::Internal,
                            "the committed page view cannot allocate pages");
