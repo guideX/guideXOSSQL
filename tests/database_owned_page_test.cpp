@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sys/stat.h>
@@ -12,6 +13,7 @@
 #endif
 
 #include "database_format.h"
+#include "database_io.h"
 #include "database_page.h"
 #include "database_relational.h"
 #include "database_sql.h"
@@ -92,6 +94,77 @@ bool sameBytes(const GxOwnedPage& page, const std::vector<uint8_t>& bytes) {
     }
     return true;
 }
+
+struct PageReadFaults {
+    uint64_t targetOffset;
+    uint32_t pageSize;
+    bool failSizeQueryOnce;
+    bool truncateReportedExtent;
+    bool failReadOnce;
+    bool shortReadOnce;
+    size_t targetReadCalls;
+
+    PageReadFaults()
+        : targetOffset(0), pageSize(0), failSizeQueryOnce(false),
+          truncateReportedExtent(false), failReadOnce(false),
+          shortReadOnce(false), targetReadCalls(0) {}
+};
+
+class FaultingPageReadFile : public IDatabaseFile {
+public:
+    FaultingPageReadFile(std::unique_ptr<IDatabaseFile> inner,
+                         PageReadFaults* faults)
+        : _inner(std::move(inner)), _faults(faults) {}
+
+    DbResult open(const std::string& path, FileOpenMode mode,
+                  bool truncateExisting) override {
+        return _inner->open(path, mode, truncateExisting);
+    }
+    DbResult close() override { return _inner->close(); }
+    bool isOpen() const override { return _inner->isOpen(); }
+    bool isReadOnly() const override { return _inner->isReadOnly(); }
+    DbResult getSize(uint64_t& outSize) override {
+        if (_faults->failSizeQueryOnce) {
+            _faults->failSizeQueryOnce = false;
+            return DbResult::error(DbStatus::IoError, "injected size query failure");
+        }
+        DbResult result = _inner->getSize(outSize);
+        if (result.isOk() && _faults->truncateReportedExtent) {
+            const uint64_t pageEnd =
+                _faults->targetOffset + _faults->pageSize;
+            if (outSize >= pageEnd) outSize = pageEnd - 1;
+        }
+        return result;
+    }
+    bool readAt(uint64_t offset, void* buffer, size_t length) override {
+        if (offset == _faults->targetOffset) {
+            ++_faults->targetReadCalls;
+            if (_faults->failReadOnce) {
+                _faults->failReadOnce = false;
+                return false;
+            }
+            if (_faults->shortReadOnce) {
+                _faults->shortReadOnce = false;
+                const size_t partial = length == 0 ? 0 : length - 1;
+                if (partial != 0 && !_inner->readAt(offset, buffer, partial)) {
+                    return false;
+                }
+                return false;
+            }
+        }
+        return _inner->readAt(offset, buffer, length);
+    }
+    bool writeAt(uint64_t offset, const void* buffer, size_t length) override {
+        return _inner->writeAt(offset, buffer, length);
+    }
+    bool truncateTo(uint64_t size) override { return _inner->truncateTo(size); }
+    bool flush() override { return _inner->flush(); }
+    const std::string& path() const override { return _inner->path(); }
+
+private:
+    std::unique_ptr<IDatabaseFile> _inner;
+    PageReadFaults* _faults;
+};
 
 bool sqlOk(SqlEngine& engine, const char* sql) {
     const SqlExecutionResult result = engine.execute(sql);
@@ -269,6 +342,232 @@ void testOwnerContracts() {
     destination.destroy();
     CHECK(arenaA.outstanding == 0 && arenaB.outstanding == 0);
     CHECK(arenaA.invalidFrees == 0 && arenaB.invalidFrees == 0);
+}
+
+void testDatabaseFileOwnedPageRead() {
+    const std::string path = databasePath();
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = 512;
+
+    std::unique_ptr<IDatabaseFile> createFile =
+        defaultFileSystem().createFile();
+    CHECK(createFile &&
+          createFile->open(path, FileOpenMode::Create, true).isOk());
+    std::unique_ptr<DatabaseFile> created;
+    CHECK(DatabaseFile::create(std::move(createFile), createOptions, created)
+              .isOk());
+    if (!created) {
+        removeDatabase(path);
+        return;
+    }
+
+    uint64_t pageId = 0;
+    CHECK(created->allocatePage(PageType::Data, pageId).isOk());
+    DatabasePage expectedPage;
+    expectedPage.pageId = pageId;
+    expectedPage.type = PageType::Data;
+    expectedPage.flags = 0x34;
+    expectedPage.generation = 0x01020304u;
+    expectedPage.payload = {0x10, 0x20, 0x30, 0x40, 0x50};
+    expectedPage.payloadSize =
+        static_cast<uint32_t>(expectedPage.payload.size());
+    std::vector<uint8_t> expectedImage;
+    CHECK(expectedPage.serialize(expectedImage, createOptions.pageSize).isOk());
+    const std::vector<uint8_t> fixture = referencePage(
+        pageId, static_cast<uint16_t>(PageType::Data), expectedPage.flags,
+        expectedPage.generation, expectedPage.payload.data(),
+        expectedPage.payload.size(), createOptions.pageSize);
+    CHECK(expectedImage == fixture);
+    CHECK(created->writePage(expectedPage).isOk());
+    CHECK(created->flush().isOk());
+    CHECK(created->close().isOk());
+    created.reset();
+
+    PageReadFaults faults;
+    faults.pageSize = createOptions.pageSize;
+    faults.targetOffset = pageId * createOptions.pageSize;
+    std::unique_ptr<IDatabaseFile> inner = defaultFileSystem().createFile();
+    CHECK(inner && inner->open(path, FileOpenMode::ReadWrite, false).isOk());
+    FaultingPageReadFile* faulting =
+        new FaultingPageReadFile(std::move(inner), &faults);
+    std::unique_ptr<IDatabaseFile> wrapped(faulting);
+    DatabaseOpenOptions openOptions;
+    std::unique_ptr<DatabaseFile> file;
+    CHECK(DatabaseFile::open(std::move(wrapped), openOptions, file).isOk());
+    if (!file) {
+        removeDatabase(path);
+        return;
+    }
+    // Open-time bootstrap validation already consumed the new owned file-read
+    // path, while the selected data page remains available for fault tests.
+    CHECK(file->pageSize() == createOptions.pageSize &&
+          file->pageCount() == pageId + 1);
+    CHECK(faults.targetReadCalls == 0);
+
+    GxArena arenaA;
+    GxArena arenaB;
+    GxArena arenaInitialFailure;
+    gxArenaInit(&arenaA, createOptions.pageSize);
+    gxArenaInit(&arenaB, createOptions.pageSize);
+    gxArenaInit(&arenaInitialFailure, createOptions.pageSize);
+    GxAllocator allocatorA = {};
+    GxAllocator allocatorB = {};
+    GxAllocator initialFailureAllocator = {};
+    gxArenaMakeAllocator(&arenaA, &allocatorA);
+    gxArenaMakeAllocator(&arenaB, &allocatorB);
+    gxArenaMakeAllocator(&arenaInitialFailure, &initialFailureAllocator);
+
+    GxOwnedPage pageA;
+    GxOwnedPage pageB;
+    GxOwnedPage initialFailure;
+    CHECK(pageA.init(&allocatorA, createOptions.pageSize) == GxStatus::Ok);
+    CHECK(pageB.init(&allocatorB, createOptions.pageSize) == GxStatus::Ok);
+    CHECK(initialFailure.init(&initialFailureAllocator,
+                              createOptions.pageSize) == GxStatus::Ok);
+
+    gxArenaFailAfter(&arenaInitialFailure, 0);
+    CHECK(file->readOwnedPage(pageId, initialFailure).status() ==
+          DbStatus::NoSpace);
+    CHECK(!initialFailure.isValid() && arenaInitialFailure.outstanding == 0);
+    gxArenaDisableFailure(&arenaInitialFailure);
+    CHECK(file->readOwnedPage(pageId, initialFailure).isOk());
+    CHECK(sameBytes(initialFailure, fixture));
+
+    CHECK(file->readOwnedPage(pageId, pageA).isOk());
+    CHECK(sameBytes(pageA, fixture) && pageA.byteCount() == 512 &&
+          pageA.allocatedCapacity() == 512);
+    CHECK(pageA.allocator().context == &arenaA && arenaA.outstanding == 1);
+    CHECK(faults.targetReadCalls == 2);
+
+    DatabasePage legacy;
+    legacy.pageId = 99;
+    legacy.type = PageType::IndexLeaf;
+    legacy.payload = {0xCC, 0xDD};
+    faults.failReadOnce = true;
+    CHECK(file->readPage(pageId, legacy).status() == DbStatus::IoError);
+    CHECK(legacy.pageId == 99 && legacy.type == PageType::IndexLeaf &&
+          legacy.payload == std::vector<uint8_t>({0xCC, 0xDD}));
+    faults.shortReadOnce = true;
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::IoError);
+    CHECK(sameBytes(pageA, fixture) && arenaA.outstanding == 1);
+
+    const uint8_t* oldA = pageA.encodedBytes();
+    gxArenaFailAfter(&arenaA, 0);
+    const size_t readCallsBeforeAllocationFailure = faults.targetReadCalls;
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::NoSpace);
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::NoSpace);
+    CHECK(pageA.encodedBytes() == oldA && sameBytes(pageA, fixture) &&
+          arenaA.outstanding == 1 &&
+          faults.targetReadCalls == readCallsBeforeAllocationFailure);
+    gxArenaDisableFailure(&arenaA);
+    CHECK(file->readOwnedPage(pageId, pageA).isOk());
+    CHECK(sameBytes(pageA, fixture) && arenaA.outstanding == 1);
+    oldA = pageA.encodedBytes();
+
+    faults.failSizeQueryOnce = true;
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::IoError);
+    faults.truncateReportedExtent = true;
+    const size_t attemptsBeforeShortExtent = arenaA.allocationAttempts;
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::Truncated);
+    CHECK(arenaA.allocationAttempts == attemptsBeforeShortExtent &&
+          pageA.encodedBytes() == oldA && sameBytes(pageA, fixture));
+    faults.truncateReportedExtent = false;
+
+    GxArena wrongSizeArena;
+    gxArenaInit(&wrongSizeArena, 1024);
+    GxAllocator wrongSizeAllocator = {};
+    gxArenaMakeAllocator(&wrongSizeArena, &wrongSizeAllocator);
+    GxOwnedPage wrongPageSize;
+    CHECK(wrongPageSize.init(&wrongSizeAllocator, 1024) == GxStatus::Ok);
+    CHECK(file->readOwnedPage(pageId, wrongPageSize).status() ==
+          DbStatus::InvalidArgument);
+    GxOwnedPage unconfigured;
+    CHECK(file->readOwnedPage(pageId, unconfigured).status() ==
+          DbStatus::InvalidArgument);
+    CHECK(file->readOwnedPage(0, pageA).status() == DbStatus::InvalidArgument);
+    CHECK(file->readOwnedPage(pageId + 1, pageA).status() ==
+          DbStatus::OutOfBounds);
+    CHECK(oldA != nullptr && sameBytes(pageA, fixture));
+
+    std::vector<uint8_t> invalidImage(createOptions.pageSize, 0);
+    CHECK(gxDatabasePageEncode(
+              invalidImage.data(), createOptions.pageSize, pageId + 1,
+              static_cast<uint16_t>(PageType::Data), expectedPage.flags,
+              expectedPage.generation, expectedPage.payload.data(),
+              expectedPage.payload.size()) == GxStatus::Ok);
+    CHECK(faulting->writeAt(faults.targetOffset, invalidImage.data(),
+                            invalidImage.size()));
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::CorruptPage);
+    CHECK(pageA.encodedBytes() == oldA && sameBytes(pageA, fixture));
+
+    CHECK(gxDatabasePageEncode(
+              invalidImage.data(), createOptions.pageSize, pageId, 0xFFFFu,
+              expectedPage.flags, expectedPage.generation,
+              expectedPage.payload.data(), expectedPage.payload.size()) ==
+          GxStatus::Ok);
+    CHECK(faulting->writeAt(faults.targetOffset, invalidImage.data(),
+                            invalidImage.size()));
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::CorruptPage);
+    CHECK(pageA.encodedBytes() == oldA && sameBytes(pageA, fixture));
+
+    invalidImage = fixture;
+    invalidImage[page_offset::PageCrc32] ^= 0x80;
+    CHECK(faulting->writeAt(faults.targetOffset, invalidImage.data(),
+                            invalidImage.size()));
+    CHECK(file->readOwnedPage(pageId, pageA).status() == DbStatus::CorruptPage);
+    CHECK(pageA.encodedBytes() == oldA && sameBytes(pageA, fixture));
+    CHECK(faulting->writeAt(faults.targetOffset, fixture.data(), fixture.size()));
+
+    void* foreignImage = nullptr;
+    CHECK(gxAllocatorAllocate(&allocatorB, createOptions.pageSize, 1,
+                              &foreignImage) == GxStatus::Ok);
+    if (foreignImage) {
+        std::memcpy(foreignImage, fixture.data(), fixture.size());
+        CHECK(pageA.adoptEncodedBytes(&allocatorB,
+                                      static_cast<uint8_t*>(foreignImage),
+                                      fixture.size(), pageId) ==
+              GxStatus::InvalidArgument);
+        CHECK(pageA.encodedBytes() == oldA && sameBytes(pageA, fixture));
+        gxAllocatorFree(&allocatorB, foreignImage);
+    }
+
+    // The public DatabasePage reader remains a hosted compatibility edge. It
+    // decodes the checked owner and moves the complete value into the caller.
+    DatabasePage compatible;
+    CHECK(file->readPage(pageId, compatible).isOk());
+    std::vector<uint8_t> compatibleBytes;
+    CHECK(compatible.serialize(compatibleBytes, createOptions.pageSize).isOk());
+    CHECK(compatibleBytes == fixture);
+
+    CHECK(file->close().isOk());
+    file.reset();
+    CHECK(pageA.validate() == GxStatus::Ok && sameBytes(pageA, fixture));
+    CHECK(pageA.cloneTo(&allocatorB, pageB) == GxStatus::Ok);
+    CHECK(pageA.encodedBytes() != pageB.encodedBytes() &&
+          pageA.allocator().context == &arenaA &&
+          pageB.allocator().context == &arenaB &&
+          sameBytes(pageB, fixture));
+    const uint8_t* oldB = pageB.encodedBytes();
+    gxArenaFailAfter(&arenaB, 0);
+    CHECK(pageA.cloneTo(&allocatorB, pageB) == GxStatus::OutOfMemory);
+    CHECK(pageB.encodedBytes() == oldB && sameBytes(pageB, fixture) &&
+          sameBytes(pageA, fixture));
+    gxArenaDisableFailure(&arenaB);
+
+    pageA.destroy();
+    CHECK(arenaA.outstanding == 0 && pageB.validate() == GxStatus::Ok &&
+          sameBytes(pageB, fixture));
+    pageB.destroy();
+    initialFailure.destroy();
+    wrongPageSize.destroy();
+    unconfigured.destroy();
+    CHECK(arenaA.outstanding == 0 && arenaB.outstanding == 0 &&
+          arenaInitialFailure.outstanding == 0 &&
+          wrongSizeArena.outstanding == 0);
+    CHECK(arenaA.invalidFrees == 0 && arenaB.invalidFrees == 0 &&
+          arenaInitialFailure.invalidFrees == 0 &&
+          wrongSizeArena.invalidFrees == 0);
+    removeDatabase(path);
 }
 
 void testProductionReadLifetimeAndSql9() {
@@ -524,6 +823,7 @@ void testProductionReadLifetimeAndSql9() {
 
 int main() {
     testOwnerContracts();
+    testDatabaseFileOwnedPageRead();
     testProductionReadLifetimeAndSql9();
     std::printf("Caller-owned page: %d passed, %d failed\n", gPassed, gFailed);
     return gFailed == 0 ? 0 : 1;

@@ -26,6 +26,7 @@
 #include "database_pagestore.h"
 #include "database_result.h"
 #include "portable/gx_allocator.h"
+#include "portable/gx_owned_page.h"
 
 namespace gxos {
 namespace db {
@@ -112,6 +113,11 @@ public:
     // Reads a full page. Page 0 (the header page) is not readable here.
     DbResult readPage(uint64_t pageId, DatabasePage& out) override;
 
+    // Reads one exact encoded page directly into a caller-configured portable
+    // owner. The owner retains its allocator callbacks and borrowed context;
+    // that context must outlive the owner, including after this file closes.
+    DbResult readOwnedPage(uint64_t pageId, GxOwnedPage& out);
+
     // Reads and validates one full serialized page into caller-owned storage.
     // This is used by the portable committed-page cache to avoid a temporary
     // hosted vector and to keep failed reads out of resident entries.
@@ -155,9 +161,8 @@ public:
 
 private:
     DbResult fail(DbStatus status, const std::string& message);
-    DbResult readPageBytes(uint64_t pageId, std::vector<uint8_t>& out);
     DbResult writeHeaderPage();
-    DbResult validateBootstrap(const DatabasePage& root);
+    DbResult validateBootstrap(const GxOwnedPage& root);
     bool computePageOffset(uint64_t pageId, uint64_t& outOffset) const;
     DbResult refreshDiagnostics();
 

@@ -32,6 +32,14 @@ public:
     GxStatus materialize(const uint8_t* bytes, size_t byteCount,
                          uint64_t expectedPageId);
 
+    // Adopts a complete encoded page allocated through `sourceAllocator`.
+    // The allocator must match this owner's callbacks and context. Validation
+    // completes before the current page is replaced. On success ownership of
+    // `bytes` transfers to this owner; on failure the caller still owns it.
+    GxStatus adoptEncodedBytes(const GxAllocator* sourceAllocator,
+                               uint8_t* bytes, size_t byteCount,
+                               uint64_t expectedPageId);
+
     // Deep-copies into the explicitly selected allocator domain. The source
     // remains unchanged; destination replacement occurs only after allocation
     // and validation succeed.

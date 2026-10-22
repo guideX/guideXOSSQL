@@ -82,6 +82,30 @@ GxStatus GxOwnedPage::materialize(const uint8_t* bytes, size_t byteCount,
     return GxStatus::Ok;
 }
 
+GxStatus GxOwnedPage::adoptEncodedBytes(const GxAllocator* sourceAllocator,
+                                       uint8_t* bytes, size_t byteCount,
+                                       uint64_t expectedPageId) {
+    if (!_initialized || !sourceAllocator || !bytes ||
+        !sameAllocationDomain(_allocator, *sourceAllocator) ||
+        byteCount != _pageSize || bytes == _bytes) {
+        return GxStatus::InvalidArgument;
+    }
+
+    GxDatabasePageInfo info = {};
+    const GxStatus inspectStatus = gxDatabasePageInspect(
+        bytes, byteCount, _pageSize, expectedPageId, &info);
+    if (inspectStatus != GxStatus::Ok) return inspectStatus;
+
+    uint8_t* oldBytes = _bytes;
+    _bytes = bytes;
+    _byteCount = _pageSize;
+    _capacity = _pageSize;
+    _info = info;
+    _valid = true;
+    gxAllocatorFree(&_allocator, oldBytes);
+    return GxStatus::Ok;
+}
+
 GxStatus GxOwnedPage::cloneTo(const GxAllocator* destinationAllocator,
                              GxOwnedPage& destination) const {
     if (!_initialized || !_valid || !destinationAllocator ||

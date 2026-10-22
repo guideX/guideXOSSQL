@@ -2,15 +2,35 @@
 
 #include <cstring>
 #include <new>
+#include <type_traits>
 #include <utility>
 
 #include "database_endian.h"
+#include "portable/gx_allocator_hosted.h"
 #include "portable/gx_page_codec.h"
 
 namespace gxos {
 namespace db {
 
 namespace {
+
+DbResult ownedPageStatus(GxStatus status, const char* operation) {
+    switch (status) {
+    case GxStatus::Ok:
+        return DbResult::ok();
+    case GxStatus::OutOfMemory:
+        return DbResult::error(DbStatus::NoSpace, operation);
+    case GxStatus::CorruptData:
+        return DbResult::error(DbStatus::CorruptPage, operation);
+    case GxStatus::InvalidArgument:
+    case GxStatus::UnsupportedAlignment:
+        return DbResult::error(DbStatus::InvalidArgument, operation);
+    case GxStatus::ResourceLimit:
+    case GxStatus::Overflow:
+        return DbResult::error(DbStatus::NoSpace, operation);
+    }
+    return DbResult::error(DbStatus::Internal, operation);
+}
 
 std::vector<uint8_t> makeCatalogPayload() {
     // SQL2 root catalog header: empty catalog, next table id 1.
@@ -133,44 +153,31 @@ DbResult DatabaseFile::writeHeaderPage() {
     return DbResult::ok();
 }
 
-DbResult DatabaseFile::readPageBytes(uint64_t pageId, std::vector<uint8_t>& out) {
-    if (pageId >= _header.pageCount) {
-        return DbResult::error(DbStatus::OutOfBounds, "page id outside allocated range");
-    }
-    uint64_t offset = 0;
-    if (!computePageOffset(pageId, offset)) {
-        return DbResult::error(DbStatus::CorruptHeader, "page offset overflow");
-    }
-    out.assign(_header.pageSize, 0);
-    if (!_file->readAt(offset, out.data(), out.size())) {
-        return DbResult::error(DbStatus::Truncated, "short page read");
-    }
-    return DbResult::ok();
-}
-
-DbResult DatabaseFile::validateBootstrap(const DatabasePage& root) {
-    if (root.type != PageType::Catalog) {
+DbResult DatabaseFile::validateBootstrap(const GxOwnedPage& root) {
+    if (!root.isValid() ||
+        root.pageType() != static_cast<uint16_t>(PageType::Catalog)) {
         return DbResult::error(DbStatus::CorruptPage, "root page is not a catalog page");
     }
-    if (root.payloadSize < kCatalogPayloadSize) {
+    if (root.payloadSize() < kCatalogPayloadSize) {
         return DbResult::error(DbStatus::CorruptPage, "catalog payload too small");
     }
-    if (loadLe32(root.payload.data() + 0) != kCatalogMagic) {
+    const uint8_t* payload = root.encodedBytes() + kPageHeaderSize;
+    if (loadLe32(payload + 0) != kCatalogMagic) {
         return DbResult::error(DbStatus::CorruptPage, "catalog signature mismatch");
     }
-    const uint16_t catalogVersion = loadLe16(root.payload.data() + 4);
+    const uint16_t catalogVersion = loadLe16(payload + 4);
     if (catalogVersion == kCatalogVersionLegacy) {
         // SQL1 database: empty catalog, no tables.
         return DbResult::ok();
     }
     if (catalogVersion == kCatalogVersionV3) {
-        if (root.payloadSize < kCatalogV3RootHeaderSize) {
+        if (root.payloadSize() < kCatalogV3RootHeaderSize) {
             return DbResult::error(DbStatus::CorruptPage, "catalog root header truncated");
         }
         return DbResult::ok();
     }
     if (catalogVersion == kCatalogVersionV4) {
-        if (root.payloadSize < kCatalogV4RootHeaderSize) {
+        if (root.payloadSize() < kCatalogV4RootHeaderSize) {
             return DbResult::error(DbStatus::CorruptPage, "catalog v4 root header truncated");
         }
         return DbResult::ok();
@@ -180,7 +187,7 @@ DbResult DatabaseFile::validateBootstrap(const DatabasePage& root) {
                                "unsupported catalog version " +
                                    std::to_string(static_cast<unsigned>(catalogVersion)));
     }
-    if (root.payloadSize < kCatalogRootHeaderSize) {
+    if (root.payloadSize() < kCatalogRootHeaderSize) {
         return DbResult::error(DbStatus::CorruptPage, "catalog root header truncated");
     }
     return DbResult::ok();
@@ -348,25 +355,31 @@ DbResult DatabaseFile::validateOpenedPages(bool validateAllPages) {
         return fail(DbStatus::CorruptHeader, "file size is not page aligned");
     }
 
-    std::vector<uint8_t> rootBytes;
-    result = readPageBytes(_header.rootPageId, rootBytes);
-    if (!result.isOk()) return fail(result.status(), result.message());
-    DatabasePage root;
-    result = DatabasePage::parse(rootBytes.data(), rootBytes.size(),
-                                 _header.pageSize, _header.rootPageId, root);
-    if (!result.isOk()) return fail(result.status(), result.message());
-    result = validateBootstrap(root);
+    GxAllocator validationAllocator = {};
+    GxStatus allocatorStatus = gxHostedAllocatorInit(
+        &validationAllocator, _header.pageSize);
+    if (allocatorStatus != GxStatus::Ok) {
+        const DbResult mapped = ownedPageStatus(
+            allocatorStatus, "page-validation allocator setup failed");
+        return fail(mapped.status(), mapped.message());
+    }
+
+    GxOwnedPage page;
+    allocatorStatus = page.init(&validationAllocator, _header.pageSize);
+    if (allocatorStatus != GxStatus::Ok) {
+        const DbResult mapped = ownedPageStatus(
+            allocatorStatus, "page-validation owner setup failed");
+        return fail(mapped.status(), mapped.message());
+    }
+    result = readOwnedPage(_header.rootPageId, page);
+    if (!result.isOk()) return result;
+    result = validateBootstrap(page);
     if (!result.isOk()) return fail(result.status(), result.message());
 
     if (validateAllPages) {
         for (uint64_t pageId = 1; pageId < _header.pageCount; ++pageId) {
-            std::vector<uint8_t> bytes;
-            result = readPageBytes(pageId, bytes);
-            if (!result.isOk()) return fail(result.status(), result.message());
-            DatabasePage page;
-            result = DatabasePage::parse(bytes.data(), bytes.size(),
-                                         _header.pageSize, pageId, page);
-            if (!result.isOk()) return fail(result.status(), result.message());
+            result = readOwnedPage(pageId, page);
+            if (!result.isOk()) return result;
         }
     }
     return refreshDiagnostics();
@@ -403,20 +416,101 @@ DbResult DatabaseFile::readPage(uint64_t pageId, DatabasePage& out) {
         return fail(DbStatus::OutOfBounds, "page id outside allocated range");
     }
 
-    std::vector<uint8_t> bytes;
-    DbResult result = readPageBytes(pageId, bytes);
-    if (!result.isOk()) {
-        return fail(result.status(), result.message());
+    GxAllocator allocator = {};
+    GxStatus ownerStatus = gxHostedAllocatorInit(&allocator, _header.pageSize);
+    if (ownerStatus != GxStatus::Ok) {
+        const DbResult mapped = ownedPageStatus(
+            ownerStatus, "page-read allocator setup failed");
+        return fail(mapped.status(), mapped.message());
     }
+
+    GxOwnedPage encoded;
+    ownerStatus = encoded.init(&allocator, _header.pageSize);
+    if (ownerStatus != GxStatus::Ok) {
+        const DbResult mapped = ownedPageStatus(
+            ownerStatus, "page-read owner setup failed");
+        return fail(mapped.status(), mapped.message());
+    }
+    DbResult result = readOwnedPage(pageId, encoded);
+    if (!result.isOk()) return result;
 
     DatabasePage page;
-    result = DatabasePage::parse(bytes.data(), bytes.size(),
+    try {
+        result = DatabasePage::parse(encoded.encodedBytes(), encoded.byteCount(),
                                  _header.pageSize, pageId, page);
+    } catch (const std::bad_alloc&) {
+        return fail(DbStatus::NoSpace,
+                    "hosted compatibility page payload allocation failed");
+    }
     if (!result.isOk()) {
         return fail(result.status(), result.message());
     }
 
-    out = page;
+    static_assert(std::is_nothrow_move_assignable<DatabasePage>::value,
+                  "compatibility page publication must not allocate");
+    out = std::move(page);
+    return DbResult::ok();
+}
+
+DbResult DatabaseFile::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
+    _lastError = DbResult::ok();
+    if (!_open || !_file || !_file->isOpen()) {
+        return fail(DbStatus::NotOpen, "database file is not open");
+    }
+    if (!out.isConfiguredFor(_header.pageSize)) {
+        return fail(DbStatus::InvalidArgument,
+                    "caller-owned page has the wrong page-size configuration");
+    }
+    if (pageId == kHeaderPageId) {
+        return fail(DbStatus::InvalidArgument, "page 0 is the header page");
+    }
+    if (pageId >= _header.pageCount) {
+        return fail(DbStatus::OutOfBounds, "page id outside allocated range");
+    }
+
+    uint64_t offset = 0;
+    uint64_t requiredEnd = 0;
+    if (!computePageOffset(pageId, offset) ||
+        !checkedAddU64(offset, static_cast<uint64_t>(_header.pageSize),
+                       requiredEnd)) {
+        return fail(DbStatus::OutOfBounds, "page offset overflow");
+    }
+
+    uint64_t sourceSize = 0;
+    DbResult sizeResult = _file->getSize(sourceSize);
+    if (!sizeResult.isOk()) {
+        return fail(DbStatus::IoError,
+                    "failed to query source page extent: " + sizeResult.describe());
+    }
+    if (sourceSize < requiredEnd) {
+        return fail(DbStatus::Truncated,
+                    "physical database extent does not contain the requested page");
+    }
+
+    void* allocation = nullptr;
+    const GxAllocator& destinationAllocator = out.allocator();
+    GxStatus allocationStatus = gxAllocatorAllocate(
+        &destinationAllocator, _header.pageSize, 1, &allocation);
+    if (allocationStatus != GxStatus::Ok) {
+        const DbResult mapped = ownedPageStatus(
+            allocationStatus, "caller-owned page allocation failed");
+        return fail(mapped.status(), mapped.message());
+    }
+
+    uint8_t* image = static_cast<uint8_t*>(allocation);
+    if (!_file->readAt(offset, image, _header.pageSize)) {
+        gxAllocatorFree(&destinationAllocator, image);
+        return fail(DbStatus::IoError, "failed to read complete page image");
+    }
+
+    const GxStatus adoptStatus = out.adoptEncodedBytes(
+        &destinationAllocator, image, _header.pageSize, pageId);
+    if (adoptStatus != GxStatus::Ok) {
+        gxAllocatorFree(&destinationAllocator, image);
+        const DbResult mapped = ownedPageStatus(
+            adoptStatus, "source page image failed validation or adoption");
+        return fail(mapped.status(), mapped.message());
+    }
     return DbResult::ok();
 }
 
