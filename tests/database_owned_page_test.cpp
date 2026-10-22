@@ -601,11 +601,14 @@ void testProductionReadLifetimeAndSql9() {
         CHECK(sqlOk(engine, "CREATE TABLE PortableRows (Id INT64 PRIMARY KEY, Value TEXT NOT NULL);"));
         CHECK(sqlOk(engine, "CREATE INDEX IX_PortableRows_Value ON PortableRows (Value);"));
         CHECK(sqlOk(engine, "INSERT INTO PortableRows VALUES (1, 'before');"));
+        const size_t allocationsBeforeIndexedSelect =
+            cacheArena.allocationAttempts;
         SqlExecutionResult indexed = engine.execute(
             "SELECT Id FROM PortableRows WHERE Value='before';");
         CHECK(indexed.ok && indexed.statements.size() == 1 &&
               indexed.statements[0].accessPath == "IndexLookup" &&
               indexed.statements[0].resultSet.rowCount() == 1);
+        CHECK(cacheArena.allocationAttempts > allocationsBeforeIndexedSelect);
 
         CHECK(sqlOk(engine, "BEGIN;"));
         CHECK(sqlOk(engine, "UPDATE PortableRows SET Value='after' WHERE Id=1;"));
@@ -699,6 +702,50 @@ void testProductionReadLifetimeAndSql9() {
     CHECK(hostedEncoding == expected);
     CHECK(sameBytes(retained, expected));
 
+    // The database-level compatibility reader now materializes through its
+    // checked encoded owner. Fail that actual cache-allocator request while a
+    // stable cache pin is held, then verify the old output and pin survive.
+    BufferSlot* readerPinned = nullptr;
+    CHECK(db->buffer().pinPage(1, readerPinned).isOk() &&
+          readerPinned != nullptr);
+    if (readerPinned != nullptr) {
+        const uint32_t readerPinCount = readerPinned->pinCount;
+        const uint32_t readerManagerPins = db->buffer().pinnedCount();
+        const uint8_t* const pinnedPayload =
+            readerPinned->page.payload.empty()
+                ? nullptr
+                : readerPinned->page.payload.data();
+        const uint64_t priorOutputPageId = hosted.pageId;
+        const PageType priorOutputType = hosted.type;
+        const uint32_t priorOutputGeneration = hosted.generation;
+        const std::vector<uint8_t> priorOutputPayload = hosted.payload;
+        const size_t scratchAttemptsBefore = cacheArena.allocationAttempts;
+        const size_t scratchOutstandingBefore = cacheArena.outstanding;
+
+        gxArenaFailAfter(&cacheArena, 0);
+        const DbResult ownerAllocationFailure = db->readPage(1, hosted);
+        gxArenaDisableFailure(&cacheArena);
+        CHECK(ownerAllocationFailure.status() == DbStatus::NoSpace);
+        CHECK(cacheArena.allocationAttempts == scratchAttemptsBefore + 1 &&
+              cacheArena.outstanding == scratchOutstandingBefore);
+        CHECK(hosted.pageId == priorOutputPageId &&
+              hosted.type == priorOutputType &&
+              hosted.generation == priorOutputGeneration &&
+              hosted.payload == priorOutputPayload);
+        CHECK(readerPinned->pageId == 1 &&
+              readerPinned->page.payload.data() == pinnedPayload &&
+              readerPinned->pinCount == readerPinCount &&
+              db->buffer().pinnedCount() == readerManagerPins);
+
+        CHECK(db->readPage(1, hosted).isOk());
+        CHECK(hosted.serialize(hostedEncoding, db->pageSize()).isOk() &&
+              hostedEncoding == expected);
+        CHECK(readerPinned->page.payload.data() == pinnedPayload &&
+              readerPinned->pinCount == readerPinCount &&
+              db->buffer().pinnedCount() == readerManagerPins);
+        CHECK(db->buffer().unpin(*readerPinned).isOk());
+    }
+
     const uint8_t* retainedBeforeFailure = retained.encodedBytes();
     gxArenaFailAfter(&callerArena, 0);
     CHECK(db->readOwnedPage(1, retained).status() == DbStatus::NoSpace);
@@ -784,6 +831,9 @@ void testProductionReadLifetimeAndSql9() {
 
     CHECK(db->close().isOk());
     db.reset();
+    CHECK(hosted.serialize(hostedEncoding,
+                           static_cast<uint32_t>(expected.size())).isOk() &&
+          hostedEncoding == expected);
     CHECK(cacheArena.outstanding == 0);
     CHECK(callerArena.outstanding == 3);
     CHECK(retained.validate() == GxStatus::Ok && sameBytes(retained, expected));
@@ -819,12 +869,58 @@ void testProductionReadLifetimeAndSql9() {
     removeDatabase(path);
 }
 
+void testDatabaseReadPageByteCompatibility512() {
+    const std::string path = databasePath();
+    GxArena cacheArena;
+    gxArenaInit(&cacheArena, 8192);
+    GxAllocator cacheAllocator = {};
+    gxArenaMakeAllocator(&cacheArena, &cacheAllocator);
+
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = 512;
+    createOptions.bufferCapacity = 2;
+    createOptions.pageCacheAllocator = &cacheAllocator;
+    std::unique_ptr<Database> db;
+    CHECK(Database::create(path, createOptions, db).isOk() && db != nullptr);
+    if (!db) {
+        removeDatabase(path);
+        return;
+    }
+
+    DatabasePage page;
+    CHECK(db->readPage(1, page).isOk());
+    std::vector<uint8_t> compatibilityBytes;
+    CHECK(page.serialize(compatibilityBytes, db->pageSize()).isOk());
+
+    GxArena callerArena;
+    gxArenaInit(&callerArena, 1024);
+    GxAllocator callerAllocator = {};
+    gxArenaMakeAllocator(&callerArena, &callerAllocator);
+    GxOwnedPage encoded;
+    CHECK(encoded.init(&callerAllocator, db->pageSize()) == GxStatus::Ok);
+    CHECK(db->readOwnedPage(1, encoded).isOk());
+    CHECK(encoded.byteCount() == 512 &&
+          compatibilityBytes.size() == encoded.byteCount() &&
+          std::memcmp(compatibilityBytes.data(), encoded.encodedBytes(),
+                      encoded.byteCount()) == 0);
+
+    CHECK(db->close().isOk());
+    db.reset();
+    CHECK(page.serialize(compatibilityBytes, 512).isOk() &&
+          compatibilityBytes.size() == 512);
+    CHECK(cacheArena.outstanding == 0 && cacheArena.invalidFrees == 0);
+    encoded.destroy();
+    CHECK(callerArena.outstanding == 0 && callerArena.invalidFrees == 0);
+    removeDatabase(path);
+}
+
 } // namespace
 
 int main() {
     testOwnerContracts();
     testDatabaseFileOwnedPageRead();
     testProductionReadLifetimeAndSql9();
+    testDatabaseReadPageByteCompatibility512();
     std::printf("Caller-owned page: %d passed, %d failed\n", gPassed, gFailed);
     return gFailed == 0 ? 0 : 1;
 }

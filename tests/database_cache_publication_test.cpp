@@ -468,6 +468,70 @@ void testHostedPinnedViewAllocationFailure() {
     CHECK(db->readOwnedPage(pageId, original).isOk());
     const std::vector<uint8_t> originalBytes = bytesOf(original);
 
+    DatabasePage compatibility;
+    CHECK(db->readPage(pageId, compatibility).isOk());
+    std::vector<uint8_t> compatibilityBytes;
+    CHECK(compatibility.serialize(compatibilityBytes, db->pageSize()).isOk());
+    CHECK(compatibilityBytes == originalBytes);
+
+    BufferSlot* compatibilityPin = nullptr;
+    CHECK(db->buffer().pinPage(pageId, compatibilityPin).isOk() &&
+          compatibilityPin != nullptr);
+    if (compatibilityPin != nullptr) {
+        const uint32_t pinsBefore = compatibilityPin->pinCount;
+        const uint32_t managerPinsBefore = db->buffer().pinnedCount();
+        const uint8_t* const cachePayloadBefore =
+            compatibilityPin->page.payload.data();
+        const std::vector<uint8_t> priorPayload = compatibility.payload;
+        const uint64_t priorPageId = compatibility.pageId;
+        const uint32_t priorGeneration = compatibility.generation;
+        const size_t scratchAttemptsBefore = cacheArena.allocationAttempts;
+        const size_t scratchOutstandingBefore = cacheArena.outstanding;
+
+        gxArenaFailAfter(&cacheArena, 0);
+        const DbResult ownerFailure = db->readPage(pageId, compatibility);
+        gxArenaDisableFailure(&cacheArena);
+        CHECK(ownerFailure.status() == DbStatus::NoSpace);
+        CHECK(cacheArena.allocationAttempts == scratchAttemptsBefore + 1 &&
+              cacheArena.outstanding == scratchOutstandingBefore);
+        CHECK(compatibility.pageId == priorPageId &&
+              compatibility.generation == priorGeneration &&
+              compatibility.payload == priorPayload);
+        CHECK(compatibilityPin->pageId == pageId &&
+              compatibilityPin->page.payload.data() == cachePayloadBefore &&
+              compatibilityPin->pinCount == pinsBefore &&
+              db->buffer().pinnedCount() == managerPinsBefore);
+
+        DbResult hostedFailure;
+        unsigned hostedTriggerCount = 0;
+        const size_t parseScratchAttempts = cacheArena.allocationAttempts;
+        {
+            ScopedHostedAllocationFailure failure(compatibility.payload.size());
+            hostedFailure = db->readPage(pageId, compatibility);
+            hostedTriggerCount = failure.triggerCount();
+        }
+        CHECK(hostedTriggerCount == 1);
+        CHECK(hostedFailure.status() == DbStatus::NoSpace &&
+              !hostedAllocationFailureArmed());
+        CHECK(cacheArena.allocationAttempts == parseScratchAttempts + 1 &&
+              cacheArena.outstanding == scratchOutstandingBefore);
+        CHECK(compatibility.pageId == priorPageId &&
+              compatibility.generation == priorGeneration &&
+              compatibility.payload == priorPayload);
+        CHECK(compatibilityPin->pageId == pageId &&
+              compatibilityPin->page.payload.data() == cachePayloadBefore &&
+              compatibilityPin->pinCount == pinsBefore &&
+              db->buffer().pinnedCount() == managerPinsBefore);
+
+        CHECK(db->readPage(pageId, compatibility).isOk());
+        CHECK(compatibility.serialize(compatibilityBytes, db->pageSize()).isOk() &&
+              compatibilityBytes == originalBytes);
+        CHECK(compatibilityPin->page.payload.data() == cachePayloadBefore &&
+              compatibilityPin->pinCount == pinsBefore &&
+              db->buffer().pinnedCount() == managerPinsBefore);
+        CHECK(db->buffer().unpin(*compatibilityPin).isOk());
+    }
+
     DatabasePage replacement;
     CHECK(DatabasePage::parse(original.encodedBytes(), original.byteCount(),
                               original.pageSize(), pageId, replacement).isOk());

@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <type_traits>
+#include <utility>
 
 #include "database_endian.h"
 #include "database_engine.h"
@@ -17,6 +19,9 @@ namespace db {
 namespace {
 
 const uint32_t kDefaultBufferCapacity = 32;
+
+static_assert(std::is_nothrow_move_assignable<DatabasePage>::value,
+              "published page views must be installable without allocation");
 
 // Human-readable rendering of a column DEFAULT value for diagnostics.
 std::string describeDbValue(const DbValue& value) {
@@ -119,19 +124,41 @@ DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
         return DbResult::error(DbStatus::RecoveryRequired,
                                "committed page publication requires WAL recovery");
     }
-    BufferSlot* slot = nullptr;
-    DbResult result = _buffer->pinPage(pageId, slot);
-    if (!result.isOk()) {
-        return result;
+
+    // Read the committed encoded image through the checked owner API. This
+    // temporary uses the cache allocator only for this call; the owned bytes
+    // are destroyed here and never escape with the database's allocator.
+    GxOwnedPage encoded;
+    const GxStatus ownerStatus = encoded.init(
+        &_buffer->scratchAllocator(), pageSize());
+    if (ownerStatus != GxStatus::Ok) {
+        const DbStatus status =
+            ownerStatus == GxStatus::OutOfMemory
+                ? DbStatus::NoSpace
+                : (ownerStatus == GxStatus::ResourceLimit ||
+                           ownerStatus == GxStatus::Overflow
+                       ? DbStatus::TransactionTooLarge
+                       : DbStatus::Internal);
+        return DbResult::error(status, "temporary page owner setup failed");
     }
-    try {
-        out = slot->page;
-    } catch (const std::bad_alloc&) {
-        (void)_buffer->unpin(*slot);
-        return DbResult::error(DbStatus::NoSpace, "page copy allocation failed");
-    }
-    result = _buffer->unpin(*slot);
+    DbResult result = readOwnedPage(pageId, encoded);
     if (!result.isOk()) return result;
+
+    DatabasePage prepared;
+    try {
+        result = DatabasePage::parse(encoded.encodedBytes(),
+                                     encoded.byteCount(), encoded.pageSize(),
+                                     pageId, prepared);
+    } catch (const std::bad_alloc&) {
+        return DbResult::error(
+            DbStatus::NoSpace,
+            "hosted compatibility page payload allocation failed");
+    }
+    if (!result.isOk()) return result;
+
+    // The compatibility vector remains hosted, but is prepared and validated
+    // before this nonallocating publication into the caller's destination.
+    out = std::move(prepared);
     return DbResult::ok();
 }
 

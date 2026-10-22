@@ -814,9 +814,11 @@ void testDurableWalAfterCacheAllocationFailure() {
                      "UPDATE CacheRecovery SET Payload='cache-committed' "
                      "WHERE Id >= 0;").ok);
         // Catalog serialization at commit first reads its committed root via
-        // the cache. Let that single miss succeed, then fail the subsequent
-        // committed-page publication after the WAL durability point.
-        gxArenaFailAfter(&arena, 1);
+        // the cache. The checked Database::readPage path stages both a cache
+        // image and its caller-owned image on this miss. Let those two
+        // allocations succeed, then fail the subsequent committed-page
+        // publication after the WAL durability point.
+        gxArenaFailAfter(&arena, 2);
         SqlExecutionResult commit = runSql(engine, "COMMIT;", false);
         CHECK(!commit.ok);
         CHECK(db->diagnostics().recoveryRequired);
