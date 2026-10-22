@@ -329,7 +329,12 @@ DbResult Database::applyRecovery(const std::vector<WalTransaction>& transactions
         uint64_t redone = 0;
         for (size_t i = 0; i < transactions.size(); ++i) {
             const WalTransaction& tx = transactions[i];
-            if (tx.hasHeaderImage) {
+            if (tx.hasHeaderImage &&
+                tx.headerImage.pageCount >= _file->pageCount()) {
+                // The database header can already reflect a later committed
+                // image (for example, close persisted the latest page count
+                // while the WAL still retains earlier commits). Do not replay
+                // an older header image over that later state.
                 result = _file->applyHeaderImage(tx.headerImage);
                 if (!result.isOk()) return result;
             }
@@ -359,18 +364,32 @@ DbResult Database::validateRecoveryCoverage(
     DbResult result = _file->getFileSize(fileSize);
     if (!result.isOk()) return result;
 
+    // The on-disk header may already contain a later committed page count
+    // than the first retained WAL header image. Validate WAL history against
+    // its own preceding header image, while using the maximum of the physical
+    // header and committed WAL headers as the recovery extent.
     uint64_t finalPageCount = _file->pageCount();
+    uint64_t previousWalHeaderPageCount = 0;
+    bool haveWalHeaderPageCount = false;
     uint64_t retainedPageCount = 0;
     for (size_t i = 0; i < transactions.size(); ++i) {
         const WalTransaction& tx = transactions[i];
         if (tx.hasHeaderImage) {
             if (tx.headerImage.pageSize != _file->pageSize() ||
-                std::memcmp(tx.headerImage.databaseId, _file->header().databaseId, 16) != 0 ||
-                tx.headerImage.pageCount < finalPageCount) {
+                std::memcmp(tx.headerImage.databaseId, _file->header().databaseId, 16) != 0) {
                 return DbResult::error(DbStatus::WalCorrupt,
-                                       "recovery header images are incompatible or regress page count");
+                                       "recovery header image is incompatible with database");
             }
-            finalPageCount = tx.headerImage.pageCount;
+            if (haveWalHeaderPageCount &&
+                tx.headerImage.pageCount < previousWalHeaderPageCount) {
+                return DbResult::error(DbStatus::WalCorrupt,
+                                       "committed WAL header images regress page count");
+            }
+            previousWalHeaderPageCount = tx.headerImage.pageCount;
+            haveWalHeaderPageCount = true;
+            if (tx.headerImage.pageCount > finalPageCount) {
+                finalPageCount = tx.headerImage.pageCount;
+            }
         }
         const size_t count = gxRecoveredPagesCount(&tx.pages);
         if (count > static_cast<size_t>(UINT64_MAX - retainedPageCount)) {
