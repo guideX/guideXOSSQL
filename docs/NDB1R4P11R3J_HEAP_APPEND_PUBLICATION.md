@@ -125,7 +125,7 @@ The next bounded P11 continuation should target `Table::applyMutationsInTransact
 
 ## Git closeout
 
-- R3J source, tests, and this report are committed locally on the pre-existing `main` branch. No push or topology-changing operation was performed.
-- The report records the R3J implementation commit SHA after the initial local commit; the final documentation-only closeout commit remains the ending SQL HEAD.
+- R3J implementation, tests, and report source commit: `b2674075c3843db559fec6c95fee8e171e3a0d8b`, on the pre-existing `main` branch.
+- This documentation-only follow-up records the implementation commit SHA. Its resulting HEAD is the final local SQL HEAD reported in the task handoff. No push or topology-changing operation was performed.
 - Ending phase markers remain SQL9 → SQL10 and NDB1R4P10 → NDB1R4P11.
 - Server remains unchanged at `f29850c93bbac0a0763a31e806d2816310156575`.
