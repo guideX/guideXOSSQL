@@ -38,6 +38,8 @@
 namespace gxos {
 namespace db {
 
+class Transaction;
+
 // ---- Canonical key encoding ------------------------------------------------
 
 // Encodes one logical value into an order-preserving byte string.
@@ -95,10 +97,13 @@ struct IndexValidation {
 
 class IndexTree {
 public:
-    // `pages` is the transaction-private page view; `keyType` is the indexed
-    // column type; `indexId` is the durable index id recorded in every page so
-    // traversal can reject pages that belong to another index.
-    IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId);
+    // `pages` is the page view; `keyType` is the indexed column type; `indexId`
+    // is the durable index id recorded in every page so traversal can reject
+    // pages that belong to another index. Mutation callers may supply the
+    // matching active transaction to prepare fitting leaf replacements with
+    // its allocator and publish them through its checked payload staging API.
+    IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
+              Transaction* transaction = nullptr);
 
     // Allocates a fresh empty leaf page and returns its id. Used to seed a new
     // index before its catalog record is persisted.
@@ -170,6 +175,9 @@ private:
                              std::vector<IndexEntry>& out) const;
     DbResult writeLeaf(uint64_t pageId, uint64_t nextLeaf,
                        const std::vector<IndexEntry>& entries);
+    DbResult stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
+                               uint16_t flags, uint32_t generation,
+                               const std::vector<IndexEntry>& entries);
     DbResult allocateLeaf(uint64_t nextLeaf, uint64_t& outPageId);
     DbResult readInternal(uint64_t pageId, DatabasePage& page, InternalInfo& info) const;
     DbResult readInternalChildren(const DatabasePage& page, const InternalInfo& info,
@@ -198,6 +206,7 @@ private:
     PageAccess& _pages;
     DbType _keyType;
     uint32_t _indexId;
+    Transaction* _transaction;
 };
 
 } // namespace db

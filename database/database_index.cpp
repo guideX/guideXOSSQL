@@ -7,6 +7,8 @@
 #include <set>
 
 #include "database_endian.h"
+#include "database_transaction.h"
+#include "portable/gx_array.h"
 
 namespace gxos {
 namespace db {
@@ -39,6 +41,127 @@ uint64_t readU64Big(const uint8_t* bytes) {
         value = (value << 8) | static_cast<uint64_t>(bytes[i]);
     }
     return value;
+}
+
+uint8_t physicalEntryByte(const IndexEntry& entry, size_t offset) {
+    if (offset < entry.key.size()) return entry.key[offset];
+    offset -= entry.key.size();
+    if (offset < 8) {
+        return static_cast<uint8_t>(entry.locator.pageId >> (56 - offset * 8));
+    }
+    offset -= 8;
+    return static_cast<uint8_t>(entry.locator.slot >> (24 - offset * 8));
+}
+
+int comparePhysicalEntries(const IndexEntry& left, const IndexEntry& right) {
+    const size_t leftLength = left.key.size() + 12;
+    const size_t rightLength = right.key.size() + 12;
+    const size_t compareLength = leftLength < rightLength ? leftLength : rightLength;
+    for (size_t i = 0; i < compareLength; ++i) {
+        const uint8_t a = physicalEntryByte(left, i);
+        const uint8_t b = physicalEntryByte(right, i);
+        if (a != b) return a < b ? -1 : 1;
+    }
+    if (leftLength == rightLength) return 0;
+    return leftLength < rightLength ? -1 : 1;
+}
+
+bool leafEntriesFit(const std::vector<IndexEntry>& entries, uint32_t capacity,
+                    uint32_t maxKeyBytes, uint64_t& outUsed) {
+    if (capacity < kIndexLeafHeaderSize ||
+        entries.size() > (capacity - kIndexLeafHeaderSize) / kIndexSlotSize) {
+        return false;
+    }
+    uint64_t used = kIndexLeafHeaderSize +
+        static_cast<uint64_t>(entries.size()) * kIndexSlotSize;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const size_t keyLength = entries[i].key.size();
+        if (keyLength > maxKeyBytes || keyLength > UINT32_MAX ||
+            keyLength > capacity ||
+            kIndexLeafEntryOverhead > capacity - keyLength ||
+            used > capacity - (kIndexLeafEntryOverhead + keyLength)) {
+            return false;
+        }
+        used += kIndexLeafEntryOverhead + keyLength;
+    }
+    outUsed = used;
+    return true;
+}
+
+DbResult leafPreparationStatus(GxStatus status) {
+    switch (status) {
+    case GxStatus::Ok:
+        return DbResult::ok();
+    case GxStatus::OutOfMemory:
+        return DbResult::error(DbStatus::NoSpace,
+                               "index leaf preparation allocation failed");
+    case GxStatus::ResourceLimit:
+    case GxStatus::Overflow:
+        return DbResult::error(DbStatus::TransactionTooLarge,
+                               "index leaf preparation exceeds its bound");
+    case GxStatus::CorruptData:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf preparation produced invalid data");
+    case GxStatus::InvalidArgument:
+    case GxStatus::UnsupportedAlignment:
+        return DbResult::error(DbStatus::Internal,
+                               "index leaf preparation allocator is invalid");
+    }
+    return DbResult::error(DbStatus::Internal,
+                           "index leaf preparation failed unexpectedly");
+}
+
+bool validatePreparedLeaf(const uint8_t* bytes, uint32_t capacity,
+                           uint64_t nextLeaf, uint32_t indexId,
+                           const std::vector<IndexEntry>& entries,
+                           uint32_t maxKeyBytes, uint64_t pageCount) {
+    if (bytes == nullptr || capacity < kIndexLeafHeaderSize ||
+        loadLe32(bytes) != kIndexLeafMagic ||
+        loadLe16(bytes + 4) != kIndexPageVersion ||
+        loadLe16(bytes + 6) != 0 || loadLe64(bytes + 8) != nextLeaf ||
+        loadLe32(bytes + 16) != entries.size() ||
+        loadLe32(bytes + 20) != indexId ||
+        entries.size() > (capacity - kIndexLeafHeaderSize) / kIndexSlotSize) {
+        return false;
+    }
+
+    uint32_t expectedOffset = kIndexLeafHeaderSize;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const uint64_t slotDistance =
+            static_cast<uint64_t>(kIndexSlotSize) * (i + 1);
+        if (slotDistance > capacity) return false;
+        const uint32_t slotOffset = capacity - static_cast<uint32_t>(slotDistance);
+        const uint32_t entryOffset = loadLe32(bytes + slotOffset);
+        const uint32_t entryLength = loadLe32(bytes + slotOffset + 4);
+        if (entryOffset != expectedOffset || entryOffset > capacity ||
+            entryLength < kIndexLeafEntryOverhead ||
+            entryLength > capacity - entryOffset) {
+            return false;
+        }
+        const uint8_t* entry = bytes + entryOffset;
+        const uint32_t keyLength = loadLe32(entry);
+        if (keyLength > maxKeyBytes || keyLength != entries[i].key.size() ||
+            keyLength > UINT32_MAX - kIndexLeafEntryOverhead ||
+            keyLength + kIndexLeafEntryOverhead != entryLength ||
+            entryOffset > slotOffset ||
+            entryLength > slotOffset - entryOffset ||
+            (keyLength != 0 &&
+             std::memcmp(entry + 4, entries[i].key.data(), keyLength) != 0)) {
+            return false;
+        }
+        const uint64_t locatorPage = loadLe64(entry + 4 + keyLength);
+        const uint32_t locatorSlot = loadLe32(entry + 4 + keyLength + 8);
+        if (locatorPage != entries[i].locator.pageId ||
+            locatorSlot != entries[i].locator.slot || locatorPage == 0 ||
+            locatorPage >= pageCount) {
+            return false;
+        }
+        if (i != 0 && comparePhysicalEntries(entries[i - 1], entries[i]) >= 0) {
+            return false;
+        }
+        expectedOffset += entryLength;
+    }
+    return expectedOffset <= capacity - entries.size() * kIndexSlotSize;
 }
 
 // Order-preserving Float64 transform for finite values. -0.0 is normalized to
@@ -192,8 +315,10 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
 // ---------------------------------------------------------------------------
 // IndexTree.
 
-IndexTree::IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId)
-    : _pages(pages), _keyType(keyType), _indexId(indexId) {}
+IndexTree::IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
+                     Transaction* transaction)
+    : _pages(pages), _keyType(keyType), _indexId(indexId),
+      _transaction(transaction) {}
 
 uint32_t IndexTree::capacity() const {
     return DatabasePage::payloadCapacity(_pages.pageSize());
@@ -345,6 +470,84 @@ DbResult IndexTree::writeLeaf(uint64_t pageId, uint64_t nextLeaf,
     }
     page.payloadSize = cap;
     return _pages.writePage(page);
+}
+
+DbResult IndexTree::stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
+                                      uint16_t flags, uint32_t generation,
+                                      const std::vector<IndexEntry>& entries) {
+    if (_transaction == nullptr) {
+        return DbResult::error(DbStatus::Internal,
+                               "checked index leaf staging requires a transaction");
+    }
+    if (static_cast<PageAccess*>(_transaction) != &_pages) {
+        return DbResult::error(DbStatus::Internal,
+                               "index leaf transaction does not own its page view");
+    }
+    const uint32_t cap = capacity();
+    uint64_t used = 0;
+    if (!leafEntriesFit(entries, cap, maxIndexKeyBytes(_pages.pageSize()), used)) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index leaf entries do not fit");
+    }
+
+    GxArray candidate = {};
+    GxStatus status = gxArrayInit(&candidate, &_transaction->pageAllocator(),
+                                  sizeof(uint8_t), cap);
+    if (status == GxStatus::Ok) {
+        status = gxArrayResize(&candidate, cap);
+    }
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&candidate);
+        return leafPreparationStatus(status);
+    }
+
+    uint8_t* bytes = static_cast<uint8_t*>(gxArrayAt(&candidate, 0));
+    if (bytes == nullptr || gxArraySize(&candidate) != cap) {
+        gxArrayDestroy(&candidate);
+        return DbResult::error(DbStatus::Internal,
+                               "index leaf candidate storage is inconsistent");
+    }
+    std::memset(bytes, 0, cap);
+    storeLe32(bytes + 0, kIndexLeafMagic);
+    storeLe16(bytes + 4, kIndexPageVersion);
+    storeLe16(bytes + 6, 0);
+    storeLe64(bytes + 8, nextLeaf);
+    storeLe32(bytes + 16, static_cast<uint32_t>(entries.size()));
+    storeLe32(bytes + 20, _indexId);
+
+    uint32_t offset = kIndexLeafHeaderSize;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const uint32_t keyLength = static_cast<uint32_t>(entries[i].key.size());
+        const uint32_t entryLength =
+            kIndexLeafEntryOverhead + keyLength;
+        storeLe32(bytes + offset, keyLength);
+        if (keyLength != 0) {
+            std::memcpy(bytes + offset + 4, entries[i].key.data(), keyLength);
+        }
+        storeLe64(bytes + offset + 4 + keyLength,
+                  entries[i].locator.pageId);
+        storeLe32(bytes + offset + 4 + keyLength + 8,
+                  entries[i].locator.slot);
+        const uint32_t slotOffset =
+            cap - kIndexSlotSize * (static_cast<uint32_t>(i) + 1);
+        storeLe32(bytes + slotOffset, offset);
+        storeLe32(bytes + slotOffset + 4, entryLength);
+        offset += entryLength;
+    }
+
+    if (offset + entries.size() * kIndexSlotSize != used ||
+        !validatePreparedLeaf(bytes, cap, nextLeaf, _indexId, entries,
+                              maxIndexKeyBytes(_pages.pageSize()),
+                              _transaction->pageCount())) {
+        gxArrayDestroy(&candidate);
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf candidate validation failed");
+    }
+
+    DbResult staged = _transaction->writePagePayload(
+        pageId, PageType::IndexLeaf, flags, generation, bytes, cap);
+    gxArrayDestroy(&candidate);
+    return staged;
 }
 
 DbResult IndexTree::allocateLeaf(uint64_t nextLeaf, uint64_t& outPageId) {
@@ -723,6 +926,16 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
                       IndexTree::makePhysicalKey(b.key, b.locator);
                   return compareEncodedKeys(pa.data(), pa.size(), pb.data(), pb.size()) < 0;
               });
+
+    if (leafUsed(entries) <= capacity()) {
+        result = _transaction != nullptr
+            ? stagePreparedLeaf(leaf, leafInfo.nextLeaf, leafPage.flags,
+                                leafPage.generation, entries)
+            : writeLeaf(leaf, leafInfo.nextLeaf, entries);
+        if (!result.isOk()) return result;
+        outInserted = true;
+        return DbResult::ok();
+    }
 
     result = writeLeaf(leaf, leafInfo.nextLeaf, entries);
     if (result.isOk()) {

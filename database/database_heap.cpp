@@ -561,7 +561,7 @@ DbResult maintainIndexes(Database& db, uint32_t tableId,
             continue;
         }
 
-        IndexTree tree(db.pages(), type, rec.indexId);
+        IndexTree tree(db.pages(), type, rec.indexId, db.activeTransaction());
         uint64_t root = rec.rootPageId;
         uint64_t removedCount = 0;
         for (size_t i = 0; i < removals.size(); ++i) {
@@ -1095,7 +1095,8 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
     }
 
     for (size_t i = 0; i < targets.size(); ++i) {
-        IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId);
+        IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId,
+                       _db.activeTransaction());
         uint64_t root = targets[i].record.rootPageId;
         if (root == 0) {
             result = tree.createEmpty(root);

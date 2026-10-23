@@ -136,6 +136,7 @@ struct AllocationState {
     size_t frees;
     size_t outstanding;
     size_t matchingSize;
+    size_t matchingAttempts;
     size_t matchingSuccesses;
     size_t matchingFailures;
     size_t failAtMatchingSuccess;
@@ -146,7 +147,8 @@ struct AllocationState {
 
     AllocationState()
         : attempts(0), successes(0), frees(0), outstanding(0),
-          matchingSize(0), matchingSuccesses(0), matchingFailures(0),
+          matchingSize(0), matchingAttempts(0), matchingSuccesses(0),
+          matchingFailures(0),
           failAtMatchingSuccess(0), failureEnabled(false), failAtAttempt(0),
           failAtAttemptEnabled(false), allocationFailures(0) {}
 };
@@ -162,10 +164,12 @@ bool allocateBytes(void* context, size_t size, size_t alignment,
         return false;
     }
     if (alignment == 0 || alignment > 8) return false;
-    if (state->failureEnabled && size == state->matchingSize &&
-        state->matchingSuccesses >= state->failAtMatchingSuccess) {
-        ++state->matchingFailures;
-        return false;
+    if (state->failureEnabled && size == state->matchingSize) {
+        ++state->matchingAttempts;
+        if (state->matchingSuccesses >= state->failAtMatchingSuccess) {
+            ++state->matchingFailures;
+            return false;
+        }
     }
     void* pointer = std::malloc(size);
     if (!pointer) return false;
@@ -312,6 +316,37 @@ std::vector<uint8_t> expectedHeapPayload(
               static_cast<uint32_t>(rows.size()));
     storeLe32(expected.data() + kHeapRowAreaEndOffset,
               static_cast<uint32_t>(rowOffset));
+    return expected;
+}
+
+std::vector<uint8_t> expectedIndexLeaf(
+    uint32_t pageSize, uint32_t indexId,
+    const std::vector<IndexEntry>& entries) {
+    const uint32_t capacity = pageSize - kPageHeaderSize;
+    std::vector<uint8_t> expected(capacity, 0);
+    storeLe32(expected.data(), kIndexLeafMagic);
+    storeLe16(expected.data() + 4, kIndexPageVersion);
+    storeLe16(expected.data() + 6, 0);
+    storeLe64(expected.data() + 8, 0);
+    storeLe32(expected.data() + 16, static_cast<uint32_t>(entries.size()));
+    storeLe32(expected.data() + 20, indexId);
+    uint32_t entryOffset = kIndexLeafHeaderSize;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const uint32_t keyLength = static_cast<uint32_t>(entries[i].key.size());
+        const uint32_t entryLength = kIndexLeafEntryOverhead + keyLength;
+        storeLe32(expected.data() + entryOffset, keyLength);
+        std::copy(entries[i].key.begin(), entries[i].key.end(),
+                  expected.begin() + entryOffset + 4);
+        storeLe64(expected.data() + entryOffset + 4 + keyLength,
+                  entries[i].locator.pageId);
+        storeLe32(expected.data() + entryOffset + 4 + keyLength + 8,
+                  entries[i].locator.slot);
+        const uint32_t slotOffset =
+            capacity - kIndexSlotSize * (static_cast<uint32_t>(i) + 1);
+        storeLe32(expected.data() + slotOffset, entryOffset);
+        storeLe32(expected.data() + slotOffset + 4, entryLength);
+        entryOffset += entryLength;
+    }
     return expected;
 }
 
@@ -799,7 +834,7 @@ void testProductionMutationFailureAndRelocation() {
 }
 
 void testInsertSavepointFailureAtomicity() {
-    std::printf("NDB1R4P11R3I INSERT savepoint and checked index writer\n");
+    std::printf("NDB1R4P11R3K checked existing-leaf publication and INSERT savepoint\n");
     const std::string path = testPath() + ".r3i.gxdb";
     removeDatabase(path);
 
@@ -832,7 +867,10 @@ void testInsertSavepointFailureAtomicity() {
                      "CREATE TABLE ChildRows (Id INT64 PRIMARY KEY, "
                      "ParentId INT64, Code TEXT NOT NULL, FOREIGN KEY (ParentId) "
                      "REFERENCES ParentRows (Id));"));
-        CHECK(runSql(engine, "CREATE INDEX IX_ChildRows_Code ON ChildRows (Code);"));
+        CHECK(runSql(engine,
+                     "CREATE UNIQUE INDEX IX_ChildRows_Code ON ChildRows (Code);"));
+        CHECK(runSql(engine,
+                     "INSERT INTO ChildRows VALUES (1, 1, 'existing-code');"));
 
         SqlPreparedStatement insertChild;
         CHECK(engine.prepare("INSERT INTO ChildRows VALUES (?, ?, ?);",
@@ -868,23 +906,23 @@ void testInsertSavepointFailureAtomicity() {
         CHECK(db->activeTransaction() != nullptr &&
               db->activeTransaction()->modifiedPageCount() == snapshotPageCount &&
               db->activeTransaction()->finalPageCount() == snapshotNextPage);
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
         const SqlExecutionResult priorAfterSnapshotFailure = engine.execute(
             "SELECT V FROM PriorRows WHERE Id = 1;");
         CHECK(priorAfterSnapshotFailure.ok &&
               priorAfterSnapshotFailure.statements[0].resultSet.value(0, 0).textValue() ==
                   "rollback-probe");
         CHECK(runSql(engine, "ROLLBACK;"));
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
         const SqlExecutionResult priorAfterExplicitRollback = engine.execute(
             "SELECT V FROM PriorRows WHERE Id = 1;");
         CHECK(priorAfterExplicitRollback.ok &&
               priorAfterExplicitRollback.statements[0].resultSet.value(0, 0).textValue() ==
                   "before");
 
-        // First fail the primary leaf's payload preparation after the heap
-        // page is staged. This also proves IndexTree::insert does not mistake
-        // allocation NoSpace for a leaf-overflow split request.
+        // First fail the transaction-allocator-owned candidate for the
+        // existing primary leaf after the heap page is staged. A fitting leaf
+        // preparation error must return directly and must not request a split.
         CHECK(runSql(engine, "BEGIN;"));
         CHECK(runSql(engine,
                      "UPDATE PriorRows SET V = 'commit-probe' WHERE Id = 1;"));
@@ -893,33 +931,63 @@ void testInsertSavepointFailureAtomicity() {
         const uint32_t writerPageCount = tx ? tx->modifiedPageCount() : 0;
         const uint64_t writerNextPage = tx ? tx->finalPageCount() : 0;
         const size_t writerOwnedBytes = transactionState.outstanding;
+        const uint64_t writerImageAllocations = tx->pageStats().imageAllocations;
 
-        // R3J moved the heap candidate off the hosted 480-byte allocator. The
-        // scoped fault still verifies that the primary leaf payload allocator
-        // returns its production NoSpace status after heap staging.
         CHECK(insertChild.bindInt64(0, 10).isOk());
         CHECK(insertChild.bindNull(1).isOk());
         CHECK(insertChild.bindText(2, "first-writer-fail").isOk());
         SqlStatementResult writerFailure;
-        {
-            ScopedHostedAllocationFailure failure(480, 6);
-            writerFailure = insertChild.execute();
-            CHECK(failure.matchingAttempts() == 7);
-            CHECK(failure.matchingSuccesses() == 6);
-            CHECK(failure.matchingFailures() == 1);
-        }
+        const size_t firstLeafAttempts = transactionState.matchingAttempts;
+        const size_t firstLeafMatches = transactionState.matchingSuccesses;
+        const size_t firstLeafFailures = transactionState.matchingFailures;
+        failMatchingAfter(&transactionState, 480, 1);
+        writerFailure = insertChild.execute();
+        disableFailure(&transactionState);
         CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
         CHECK(writerFailure.error.message ==
-              "index leaf payload allocation failed");
+              "index leaf preparation allocation failed");
+        CHECK(transactionState.matchingAttempts - firstLeafAttempts == 2);
+        CHECK(transactionState.matchingSuccesses - firstLeafMatches == 1);
+        CHECK(transactionState.matchingFailures == firstLeafFailures + 1);
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->pageStats().imageAllocations ==
+                  writerImageAllocations + 1);
         CHECK(db->activeTransaction() != nullptr &&
               db->activeTransaction()->modifiedPageCount() == writerPageCount &&
               db->activeTransaction()->finalPageCount() == writerNextPage);
         CHECK(transactionState.outstanding == writerOwnedBytes);
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
 
-        // Fail the hosted transaction-page materialization during a later
-        // index mutation read. Its status must propagate through the INSERT
-        // savepoint and leave the earlier UPDATE staged.
+        // The candidate is complete before staging. Fail the real transaction
+        // page-owner allocation after the savepoint clone and heap-page stage.
+        CHECK(insertChild.bindText(2, "stage-writer-fail").isOk());
+        const uint64_t stageImageAllocations =
+            db->activeTransaction()->pageStats().imageAllocations;
+        const size_t stageAttempts = transactionState.matchingAttempts;
+        const size_t stageSuccesses = transactionState.matchingSuccesses;
+        const size_t stageFailures = transactionState.matchingFailures;
+        failMatchingAfter(&transactionState, 512, writerPageCount + 1);
+        writerFailure = insertChild.execute();
+        disableFailure(&transactionState);
+        CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
+        CHECK(writerFailure.error.message == "transaction page staging failed");
+        CHECK(transactionState.matchingAttempts - stageAttempts ==
+              writerPageCount + 2);
+        CHECK(transactionState.matchingSuccesses - stageSuccesses ==
+              writerPageCount + 1);
+        CHECK(transactionState.matchingFailures == stageFailures + 1);
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->pageStats().imageAllocations ==
+                  stageImageAllocations + 1);
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->modifiedPageCount() == writerPageCount &&
+              db->activeTransaction()->finalPageCount() == writerNextPage);
+        CHECK(transactionState.outstanding == writerOwnedBytes);
+        CHECK(countRows(engine, "ChildRows") == 1);
+
+        // Fail the checked hosted view while INSERT reads an existing index
+        // leaf. Its status must propagate through the statement savepoint and
+        // leave the earlier UPDATE staged.
         CHECK(insertChild.bindText(2, "insert-writer-fail").isOk());
         {
             ScopedHostedAllocationFailure failure(480, 10);
@@ -930,43 +998,66 @@ void testInsertSavepointFailureAtomicity() {
         }
         CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
         CHECK(writerFailure.error.message ==
-              "transaction page read allocation failed");
+              "hosted compatibility page payload allocation failed");
         CHECK(db->activeTransaction() != nullptr &&
               db->activeTransaction()->modifiedPageCount() == writerPageCount &&
               db->activeTransaction()->finalPageCount() == writerNextPage);
         CHECK(transactionState.outstanding == writerOwnedBytes);
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
 
-        // Allow the primary index leaf publication to complete, then fail the
-        // secondary index leaf payload allocation.
+        // Let heap staging and the primary leaf replacement complete, then
+        // fail the secondary leaf candidate. The two successful 480-byte
+        // allocations prove the fault reached the later index after earlier
+        // index work had already been staged.
         CHECK(insertChild.bindText(2, "writer-fail").isOk());
-        {
-            ScopedHostedAllocationFailure failure(480, 11);
-            writerFailure = insertChild.execute();
-            CHECK(failure.matchingAttempts() == 12);
-            CHECK(failure.matchingSuccesses() == 11);
-            CHECK(failure.matchingFailures() == 1);
-        }
+        const size_t secondaryLeafMatches = transactionState.matchingSuccesses;
+        const size_t secondaryLeafFailures = transactionState.matchingFailures;
+        const size_t secondaryLeafAttempts = transactionState.matchingAttempts;
+        const uint64_t secondaryLeafImageAllocations =
+            db->activeTransaction()->pageStats().imageAllocations;
+        failMatchingAfter(&transactionState, 480, 2);
+        writerFailure = insertChild.execute();
+        disableFailure(&transactionState);
         CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
         CHECK(writerFailure.error.message ==
-              "index leaf payload allocation failed");
+              "index leaf preparation allocation failed");
+        CHECK(transactionState.matchingAttempts - secondaryLeafAttempts == 3);
+        CHECK(transactionState.matchingSuccesses - secondaryLeafMatches == 2);
+        CHECK(transactionState.matchingFailures == secondaryLeafFailures + 1);
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->pageStats().imageAllocations ==
+                  secondaryLeafImageAllocations + 2);
         CHECK(db->activeTransaction() != nullptr &&
               db->activeTransaction()->modifiedPageCount() == writerPageCount &&
               db->activeTransaction()->finalPageCount() == writerNextPage);
         CHECK(transactionState.outstanding == writerOwnedBytes);
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
 
         std::vector<IndexInfo> stagedIndexes;
         CHECK_DB(db->listIndexes(stagedIndexes), DbStatus::Ok);
         for (size_t i = 0; i < stagedIndexes.size(); ++i) {
             if (stagedIndexes[i].tableName == "ChildRows") {
-                CHECK(stagedIndexes[i].entryCount == 0);
+                CHECK(stagedIndexes[i].entryCount == 1);
                 IndexValidation validation;
                 CHECK_DB(db->validateIndex(stagedIndexes[i].indexId, validation),
                          DbStatus::Ok);
-                CHECK(validation.ok && validation.entryCount == 0);
+                CHECK(validation.ok && validation.entryCount == 1);
             }
         }
+        const SqlExecutionResult retainedPrimaryRow = engine.execute(
+            "SELECT Code FROM ChildRows WHERE Id = 1;");
+        CHECK(retainedPrimaryRow.ok && retainedPrimaryRow.statements.size() == 1 &&
+              retainedPrimaryRow.statements[0].accessPath == "IndexLookup" &&
+              retainedPrimaryRow.statements[0].resultSet.rowCount() == 1 &&
+              retainedPrimaryRow.statements[0].resultSet.value(0, 0).textValue() ==
+                  "existing-code");
+        const SqlExecutionResult retainedSecondaryRow = engine.execute(
+            "SELECT Id FROM ChildRows WHERE Code = 'existing-code';");
+        CHECK(retainedSecondaryRow.ok && retainedSecondaryRow.statements.size() == 1 &&
+              retainedSecondaryRow.statements[0].accessPath == "IndexLookup" &&
+              retainedSecondaryRow.statements[0].resultSet.rowCount() == 1 &&
+              retainedSecondaryRow.statements[0].resultSet.value(0, 0).int64Value() ==
+                  1);
         const SqlExecutionResult priorAfterWriterFailure = engine.execute(
             "SELECT V FROM PriorRows WHERE V = 'commit-probe';");
         CHECK(priorAfterWriterFailure.ok &&
@@ -981,13 +1072,13 @@ void testInsertSavepointFailureAtomicity() {
         CHECK(!invalidForeignKey.ok && invalidForeignKey.transactionActiveAfter);
         CHECK(invalidForeignKey.error.message.find("foreign key constraint violation") !=
               std::string::npos);
-        CHECK(countRows(engine, "ChildRows") == 0);
+        CHECK(countRows(engine, "ChildRows") == 1);
 
         CHECK(insertChild.bindInt64(0, 10).isOk());
         CHECK(insertChild.bindInt64(1, 1).isOk());
         CHECK(insertChild.bindText(2, "valid-code").isOk());
         CHECK(insertChild.execute().ok);
-        CHECK(countRows(engine, "ChildRows") == 1);
+        CHECK(countRows(engine, "ChildRows") == 2);
         checkIndexes(*db);
         std::string integrity;
         CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
@@ -996,11 +1087,19 @@ void testInsertSavepointFailureAtomicity() {
         CHECK_DB(db->listIndexes(indexes), DbStatus::Ok);
         uint32_t primaryIndexId = 0;
         uint32_t codeIndexId = 0;
+        uint64_t primaryRootPageId = 0;
+        uint64_t codeRootPageId = 0;
         for (size_t i = 0; i < indexes.size(); ++i) {
             if (indexes[i].tableName == "ChildRows") {
-                CHECK(indexes[i].entryCount == 1);
-                if (indexes[i].columnName == "Id") primaryIndexId = indexes[i].indexId;
-                if (indexes[i].columnName == "Code") codeIndexId = indexes[i].indexId;
+                CHECK(indexes[i].entryCount == 2);
+                if (indexes[i].columnName == "Id") {
+                    primaryIndexId = indexes[i].indexId;
+                    primaryRootPageId = indexes[i].rootPageId;
+                }
+                if (indexes[i].columnName == "Code") {
+                    codeIndexId = indexes[i].indexId;
+                    codeRootPageId = indexes[i].rootPageId;
+                }
             }
         }
         CHECK(primaryIndexId != 0 && codeIndexId != 0);
@@ -1016,9 +1115,95 @@ void testInsertSavepointFailureAtomicity() {
         if (primaryLocators.size() == 1 && codeLocators.size() == 1) {
             CHECK(primaryLocators[0].pageId == codeLocators[0].pageId &&
                   primaryLocators[0].slot == codeLocators[0].slot);
+
+            std::vector<uint8_t> primaryKey10;
+            std::vector<uint8_t> primaryKey1;
+            CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(10), primaryKey10));
+            CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(1), primaryKey1));
+            std::vector<RowLocator> oldPrimaryLocators;
+            CHECK_DB(db->indexLookup(primaryIndexId, primaryKey1,
+                                     oldPrimaryLocators), DbStatus::Ok);
+            CHECK(oldPrimaryLocators.size() == 1);
+            std::vector<IndexEntry> primaryEntries;
+            if (oldPrimaryLocators.size() == 1) {
+                IndexEntry oldEntry;
+                oldEntry.key = primaryKey1;
+                oldEntry.locator = oldPrimaryLocators[0];
+                primaryEntries.push_back(oldEntry);
+            }
+            IndexEntry newPrimaryEntry;
+            newPrimaryEntry.key = primaryKey10;
+            newPrimaryEntry.locator = primaryLocators[0];
+            primaryEntries.push_back(newPrimaryEntry);
+            DatabasePage primaryLeaf;
+            CHECK_DB(db->pages().readPage(primaryRootPageId, primaryLeaf),
+                     DbStatus::Ok);
+            CHECK(primaryLeaf.payload == expectedIndexLeaf(
+                      512, primaryIndexId, primaryEntries));
+
+            std::vector<uint8_t> codeKey;
+            std::vector<uint8_t> oldCodeKey;
+            CHECK(encodeIndexKey(DbType::Text, DbValue::text("valid-code"), codeKey));
+            CHECK(encodeIndexKey(DbType::Text, DbValue::text("existing-code"),
+                                 oldCodeKey));
+            std::vector<RowLocator> oldCodeLocators;
+            CHECK_DB(db->indexLookup(codeIndexId, oldCodeKey, oldCodeLocators),
+                     DbStatus::Ok);
+            CHECK(oldCodeLocators.size() == 1);
+            std::vector<IndexEntry> codeEntries;
+            if (oldCodeLocators.size() == 1) {
+                IndexEntry oldEntry;
+                oldEntry.key = oldCodeKey;
+                oldEntry.locator = oldCodeLocators[0];
+                codeEntries.push_back(oldEntry);
+            }
+            IndexEntry newCodeEntry;
+            newCodeEntry.key = codeKey;
+            newCodeEntry.locator = codeLocators[0];
+            codeEntries.push_back(newCodeEntry);
+            DatabasePage codeLeaf;
+            CHECK_DB(db->pages().readPage(codeRootPageId, codeLeaf), DbStatus::Ok);
+            CHECK(codeLeaf.payload == expectedIndexLeaf(
+                      512, codeIndexId, codeEntries));
         }
+
+        // The primary key and unique secondary key still reject duplicates
+        // before any heap or index page mutation is published.
+        const SqlExecutionResult duplicatePrimary = engine.execute(
+            "INSERT INTO ChildRows VALUES (10, 1, 'other-code');");
+        CHECK(!duplicatePrimary.ok && duplicatePrimary.transactionActiveAfter &&
+              duplicatePrimary.error.message.find(
+                  "unique index constraint violation") != std::string::npos);
+        const SqlExecutionResult duplicateUniqueSecondary = engine.execute(
+            "INSERT INTO ChildRows VALUES (12, 1, 'valid-code');");
+        CHECK(!duplicateUniqueSecondary.ok &&
+              duplicateUniqueSecondary.transactionActiveAfter &&
+              duplicateUniqueSecondary.error.message.find(
+                  "unique index constraint violation") != std::string::npos);
+        CHECK(countRows(engine, "ChildRows") == 2);
+        CHECK(db->validateIntegrity(integrity).isOk());
         CHECK(runSql(engine, "COMMIT;"));
         CHECK(!engine.inTransaction());
+
+        // A later successful existing-leaf INSERT remains transaction-owned
+        // and disappears from both indexes and the heap on explicit rollback.
+        CHECK(runSql(engine, "BEGIN;"));
+        CHECK(runSql(engine,
+                     "INSERT INTO ChildRows VALUES (20, 1, 'rollback-code');"));
+        CHECK(countRows(engine, "ChildRows") == 3);
+        const SqlExecutionResult rollbackProbe = engine.execute(
+            "SELECT Id FROM ChildRows WHERE Code = 'rollback-code';");
+        CHECK(rollbackProbe.ok && rollbackProbe.statements.size() == 1 &&
+              rollbackProbe.statements[0].accessPath == "IndexLookup" &&
+              rollbackProbe.statements[0].resultSet.rowCount() == 1);
+        CHECK(runSql(engine, "ROLLBACK;"));
+        CHECK(countRows(engine, "ChildRows") == 2);
+        const SqlExecutionResult rolledBackIndexProbe = engine.execute(
+            "SELECT Id FROM ChildRows WHERE Code = 'rollback-code';");
+        CHECK(rolledBackIndexProbe.ok && rolledBackIndexProbe.statements.size() == 1 &&
+              rolledBackIndexProbe.statements[0].resultSet.rowCount() == 0);
+        CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
+        checkIndexes(*db);
     }
 
     CHECK_DB(db->close(), DbStatus::Ok);
@@ -1034,7 +1219,7 @@ void testInsertSavepointFailureAtomicity() {
     if (reopened) {
         {
             SqlEngine engine(*reopened);
-            CHECK(countRows(engine, "ChildRows") == 1);
+            CHECK(countRows(engine, "ChildRows") == 2);
             const SqlExecutionResult prior = engine.execute(
                 "SELECT V FROM PriorRows WHERE Id = 1;");
             CHECK(prior.ok && prior.statements.size() == 1 &&

@@ -1119,7 +1119,7 @@ DbResult Database::buildIndex(uint32_t indexId) {
     const uint32_t maxKey = maxIndexKeyBytes(pageSize());
     const bool unique = rec->unique();
 
-    IndexTree tree(pages(), type, indexId);
+    IndexTree tree(pages(), type, indexId, activeTransaction());
     uint64_t root = rec->rootPageId;
     uint64_t entryCount = 0;
 
