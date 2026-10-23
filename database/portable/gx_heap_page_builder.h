@@ -28,4 +28,14 @@ GxStatus gxHeapPagePrepare(GxArray* output, uint32_t pageSize,
                            uint64_t nextPageId,
                            const GxHeapPageRowSource* rows);
 
+// Prepares an append to an existing heap payload while preserving every
+// existing byte except the new row, slot, slot count, and row-area end. A
+// ResourceLimit result means the row does not fit this page. On any failure,
+// output retains its prior contents.
+GxStatus gxHeapPageAppendPrepare(GxArray* output, uint32_t pageSize,
+                                 const uint8_t* existingPayload,
+                                 size_t existingLength,
+                                 const uint8_t* rowBytes,
+                                 size_t rowLength);
+
 #endif

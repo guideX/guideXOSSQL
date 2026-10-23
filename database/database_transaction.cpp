@@ -119,18 +119,25 @@ DbResult Transaction::readPage(uint64_t pageId, DatabasePage& out) {
 }
 
 DbResult Transaction::writePage(const DatabasePage& page) {
+    return writePagePayload(page.pageId, page.type, page.flags, page.generation,
+                            page.payload.empty() ? nullptr : page.payload.data(),
+                            page.payload.size());
+}
+
+DbResult Transaction::stagePagePayload(uint64_t pageId, PageType type,
+                                       uint16_t flags, uint32_t generation,
+                                       const uint8_t* payload,
+                                       size_t payloadSize) {
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
-    if (page.pageId == kHeaderPageId) {
+    if (pageId == kHeaderPageId) {
         return DbResult::error(DbStatus::InvalidArgument, "page 0 is the header page");
     }
     bool replaced = false;
     const GxStatus status = gxTransactionPageOverlayStage(
-        &_pageOverlay, page.pageId, static_cast<uint16_t>(page.type),
-        page.flags, page.generation,
-        page.payload.empty() ? nullptr : page.payload.data(),
-        page.payload.size(), &replaced);
+        &_pageOverlay, pageId, static_cast<uint16_t>(type), flags, generation,
+        payload, payloadSize, &replaced);
     if (status == GxStatus::CorruptData) {
         return DbResult::error(DbStatus::Internal,
                                "transaction page-owner index is inconsistent");
@@ -140,6 +147,41 @@ DbResult Transaction::writePage(const DatabasePage& page) {
                                      "transaction page staging failed");
     }
     (void)replaced;
+    return DbResult::ok();
+}
+
+DbResult Transaction::writePagePayload(uint64_t pageId, PageType type,
+                                       uint16_t flags, uint32_t generation,
+                                       const uint8_t* payload,
+                                       size_t payloadSize) {
+    return stagePagePayload(pageId, type, flags, generation, payload,
+                            payloadSize);
+}
+
+DbResult Transaction::allocatePagePayload(PageType type, uint16_t flags,
+                                          uint32_t generation,
+                                          const uint8_t* payload,
+                                          size_t payloadSize,
+                                          uint64_t& outPageId) {
+    if (!_active) {
+        return DbResult::error(DbStatus::NoActiveTransaction,
+                               "transaction is not active");
+    }
+    if (_nextPageId >= kMaxPageCount) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "database reached the page count limit");
+    }
+    if (gxTransactionPageOverlayCount(&_pageOverlay) >=
+        kMaxTransactionPages) {
+        return DbResult::error(DbStatus::TransactionTooLarge,
+                               "transaction modified page limit exceeded");
+    }
+    const uint64_t pageId = _nextPageId;
+    DbResult result = stagePagePayload(pageId, type, flags, generation,
+                                       payload, payloadSize);
+    if (!result.isOk()) return result;
+    ++_nextPageId;
+    outPageId = pageId;
     return DbResult::ok();
 }
 

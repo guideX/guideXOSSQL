@@ -76,6 +76,16 @@ public:
     DbResult readPage(uint64_t pageId, DatabasePage& out) override;
     DbResult writePage(const DatabasePage& page) override;
     DbResult allocatePage(PageType type, uint64_t& outPageId) override;
+    // Checked payload staging avoids materializing a hosted DatabasePage when
+    // the caller already owns a complete payload image.
+    DbResult writePagePayload(uint64_t pageId, PageType type, uint16_t flags,
+                              uint32_t generation, const uint8_t* payload,
+                              size_t payloadSize);
+    // Atomically stages a complete new page image and advances the transaction
+    // page count only after the transaction owner accepts it.
+    DbResult allocatePagePayload(PageType type, uint16_t flags,
+                                 uint32_t generation, const uint8_t* payload,
+                                 size_t payloadSize, uint64_t& outPageId);
     DbResult init();
 
     DbResult createTable(const TableDefinition& def, uint32_t& outTableId);
@@ -106,12 +116,17 @@ public:
     size_t pageIndexAllocationBytes() const {
         return _pageOverlay.index.allocationBytes;
     }
+    const GxAllocator& pageAllocator() const { return _pageAllocator; }
     bool isActive() const { return _active; }
     void markCatalogChanged() { _catalogChanged = true; }
     uint64_t finalPageCount() const { return _nextPageId; }
     bool headerChanged() const { return _nextPageId != _basePageCount; }
 
 private:
+    DbResult stagePagePayload(uint64_t pageId, PageType type, uint16_t flags,
+                              uint32_t generation, const uint8_t* payload,
+                              size_t payloadSize);
+
     Database& _db;
     uint64_t _id;
     uint64_t _basePageCount;

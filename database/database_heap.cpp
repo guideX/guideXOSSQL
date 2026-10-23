@@ -67,6 +67,18 @@ GxStatus heapRowAt(const void* context, size_t index,
     return GxStatus::Ok;
 }
 
+GxStatus encodedHeapRowAt(const void* context, size_t index,
+                          const uint8_t** outBytes, size_t* outLength) {
+    if (!context || !outBytes || !outLength || index != 0) {
+        return GxStatus::InvalidArgument;
+    }
+    const std::vector<uint8_t>* row =
+        static_cast<const std::vector<uint8_t>*>(context);
+    *outBytes = row->empty() ? nullptr : row->data();
+    *outLength = row->size();
+    return GxStatus::Ok;
+}
+
 DbResult heapPackingStatus(GxStatus status) {
     switch (status) {
     case GxStatus::Ok:
@@ -125,16 +137,6 @@ DbResult readHeapPage(const DatabasePage& page, uint32_t pageSize, HeapPageInfo&
     out.slotCount = slotCount;
     out.rowAreaEnd = rowAreaEnd;
     return DbResult::ok();
-}
-
-void writeHeapHeader(std::vector<uint8_t>& payload, uint64_t nextPageId, uint32_t slotCount,
-                     uint32_t rowAreaEnd) {
-    storeLe32(payload.data() + kHeapMagicOffset, kHeapMagic);
-    storeLe16(payload.data() + kHeapVersionOffset, kHeapVersion);
-    storeLe16(payload.data() + kHeapFlagsOffset, 0);
-    storeLe64(payload.data() + kHeapNextPageOffset, nextPageId);
-    storeLe32(payload.data() + kHeapSlotCountOffset, slotCount);
-    storeLe32(payload.data() + kHeapRowAreaEndOffset, rowAreaEnd);
 }
 
 // Reads slot `index` from a heap page payload. `capacity` is the payload
@@ -938,14 +940,15 @@ DbResult Table::ensureLastHeapPage() {
     if (_lastResolved && _resolvedEpoch == _db.dataEpoch()) {
         return DbResult::ok();
     }
-    _lastResolved = true;
-    _resolvedEpoch = _db.dataEpoch();
+    _lastResolved = false;
     const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "table record not found");
     }
     if (rec->heapPageCount == 0 || rec->firstHeapPageId == 0) {
         _lastHeapPageId = 0;
+        _resolvedEpoch = _db.dataEpoch();
+        _lastResolved = true;
         return DbResult::ok();
     }
     // Walk the chain to find the last page.
@@ -961,7 +964,15 @@ DbResult Table::ensureLastHeapPage() {
                 return DbResult::error(DbStatus::CorruptPage, "heap page chain cycle");
             }
         }
-        visited.push_back(current);
+        try {
+            visited.push_back(current);
+        } catch (const std::bad_alloc&) {
+            // A failed chain walk is not a resolved tail. Keep the cache
+            // invalid so a retry after allocation pressure can walk again.
+            _lastResolved = false;
+            return DbResult::error(DbStatus::NoSpace,
+                                   "heap tail resolution allocation failed");
+        }
         if (visited.size() > pageCount) {
             return DbResult::error(DbStatus::CorruptPage, "heap page chain cycle");
         }
@@ -981,6 +992,8 @@ DbResult Table::ensureLastHeapPage() {
         _lastHeapPageId = current;
         current = info.nextPageId;
     }
+    _resolvedEpoch = _db.dataEpoch();
+    _lastResolved = true;
     return DbResult::ok();
 }
 
@@ -1119,8 +1132,12 @@ DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
                                        RowLocator* outLocator) {
     const uint32_t pageSize = _db.pages().pageSize();
     const uint32_t capacity = DatabasePage::payloadCapacity(pageSize);
+    if (rowBytes.size() > UINT32_MAX) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "encoded row exceeds heap page capacity");
+    }
     const uint32_t rowLength = static_cast<uint32_t>(rowBytes.size());
-    if (rowLength + 8u > capacity) {
+    if (static_cast<uint64_t>(kHeapHeaderSize) + rowLength + 8u > capacity) {
         return DbResult::error(DbStatus::InvalidArgument,
                                "encoded row exceeds heap page capacity");
     }
@@ -1130,78 +1147,76 @@ DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
         return result;
     }
 
-    if (_lastHeapPageId != 0) {
-        DatabasePage page;
-        result = _db.pages().readPage(_lastHeapPageId, page);
+    Transaction* transaction = _db.activeTransaction();
+    if (transaction == nullptr) {
+        return DbResult::error(DbStatus::NoActiveTransaction,
+                               "heap append requires an active transaction");
+    }
+    const GxAllocator& allocator = transaction->pageAllocator();
+
+    const bool hasTail = _lastHeapPageId != 0;
+    DatabasePage tailPage;
+    HeapPageInfo tailInfo = {};
+    if (hasTail) {
+        result = _db.pages().readPage(_lastHeapPageId, tailPage);
         if (!result.isOk()) {
             return result;
         }
-        if (page.type != PageType::Data) {
+        if (tailPage.type != PageType::Data) {
             return DbResult::error(DbStatus::CorruptPage, "heap page has wrong page type");
         }
-        HeapPageInfo info;
-        result = readHeapPage(page, pageSize, info);
+        result = readHeapPage(tailPage, pageSize, tailInfo);
         if (!result.isOk()) {
             return result;
         }
-        if (info.rowAreaEnd + rowLength <= capacity - 8u * (info.slotCount + 1)) {
-            std::vector<uint8_t>& payload = page.payload;
-            std::memcpy(payload.data() + info.rowAreaEnd, rowBytes.data(), rowBytes.size());
-            const uint32_t slotOffset = capacity - 8u * (info.slotCount + 1);
-            storeLe32(payload.data() + slotOffset, info.rowAreaEnd);
-            storeLe32(payload.data() + slotOffset + 4, rowLength);
-            storeLe32(payload.data() + kHeapSlotCountOffset, info.slotCount + 1);
-            storeLe32(payload.data() + kHeapRowAreaEndOffset, info.rowAreaEnd + rowLength);
+
+        GxArray candidate = {};
+        GxStatus status = gxArrayInit(&candidate, &allocator, 1, capacity);
+        if (status != GxStatus::Ok) return heapPackingStatus(status);
+        status = gxHeapPageAppendPrepare(
+            &candidate, pageSize,
+            tailPage.payload.empty() ? nullptr : tailPage.payload.data(),
+            tailPage.payload.size(), rowBytes.data(), rowBytes.size());
+        if (status == GxStatus::Ok) {
+            result = transaction->writePagePayload(
+                tailPage.pageId, tailPage.type, tailPage.flags,
+                tailPage.generation, candidate.data, candidate.size);
+            gxArrayDestroy(&candidate);
+            if (!result.isOk()) return result;
             if (outLocator != nullptr) {
-                *outLocator = RowLocator(_lastHeapPageId, info.slotCount);
+                *outLocator = RowLocator(_lastHeapPageId, tailInfo.slotCount);
             }
-            return _db.pages().writePage(page);
+            return DbResult::ok();
         }
+        gxArrayDestroy(&candidate);
+        if (status != GxStatus::ResourceLimit) return heapPackingStatus(status);
     }
 
-    // Allocate a new heap page and link it into the chain.
+    // Prepare the whole new heap payload in the active transaction allocator.
+    // The transaction page id and owner are published only after preparation.
+    GxArray candidate = {};
+    GxStatus status = gxArrayInit(&candidate, &allocator, 1, capacity);
+    if (status != GxStatus::Ok) return heapPackingStatus(status);
+    GxHeapPageRowSource oneRow = {};
+    oneRow.context = &rowBytes;
+    oneRow.rowCount = 1;
+    oneRow.rowAt = encodedHeapRowAt;
+    status = gxHeapPagePrepare(&candidate, pageSize, 0, &oneRow);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&candidate);
+        return heapPackingStatus(status);
+    }
+
     uint64_t newPageId = 0;
-    result = _db.pages().allocatePage(PageType::Data, newPageId);
-    if (!result.isOk()) {
-        return result;
-    }
+    result = transaction->allocatePagePayload(
+        PageType::Data, 0, 0, candidate.data, candidate.size, newPageId);
+    gxArrayDestroy(&candidate);
+    if (!result.isOk()) return result;
 
-    DatabasePage newPageImage;
-    result = _db.pages().readPage(newPageId, newPageImage);
-    if (!result.isOk()) {
-        return result;
-    }
-    newPageImage.pageId = newPageId;
-    newPageImage.type = PageType::Data;
-    newPageImage.payload.assign(capacity, 0);
-    writeHeapHeader(newPageImage.payload, 0, 0, kHeapHeaderSize);
-    newPageImage.payloadSize = capacity;
-
-    {
-        std::vector<uint8_t>& payload = newPageImage.payload;
-        std::memcpy(payload.data() + kHeapHeaderSize, rowBytes.data(), rowBytes.size());
-        const uint32_t slotOffset = capacity - 8u;
-        storeLe32(payload.data() + slotOffset, kHeapHeaderSize);
-        storeLe32(payload.data() + slotOffset + 4, rowLength);
-        storeLe32(payload.data() + kHeapSlotCountOffset, 1u);
-        storeLe32(payload.data() + kHeapRowAreaEndOffset, kHeapHeaderSize + rowLength);
-    }
-    result = _db.pages().writePage(newPageImage);
-    if (!result.isOk()) {
-        return result;
-    }
-
-    if (_lastHeapPageId != 0) {
-        DatabasePage oldPage;
-        result = _db.pages().readPage(_lastHeapPageId, oldPage);
-        if (!result.isOk()) {
-            return result;
-        }
-        storeLe64(oldPage.payload.data() + kHeapNextPageOffset, newPageId);
-        result = _db.pages().writePage(oldPage);
-        if (!result.isOk()) {
-            return result;
-        }
+    if (hasTail) {
+        storeLe64(tailPage.payload.data() + kHeapNextPageOffset, newPageId);
+        result = transaction->writePage(tailPage);
+        if (!result.isOk()) return result;
     }
 
     if (newPagesOut == 0) {

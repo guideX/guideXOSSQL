@@ -141,3 +141,96 @@ GxStatus gxHeapPagePrepare(GxArray* output, uint32_t pageSize,
     gxArrayDestroy(&prepared);
     return status;
 }
+
+GxStatus gxHeapPageAppendPrepare(GxArray* output, uint32_t pageSize,
+                                 const uint8_t* existingPayload,
+                                 size_t existingLength,
+                                 const uint8_t* rowBytes,
+                                 size_t rowLength) {
+    if (!output || !output->initialized || output->elementSize != 1 ||
+        !output->allocator.allocate || !output->allocator.deallocate ||
+        !existingPayload || !rowBytes || rowLength < 8 ||
+        rowLength > 0xFFFFFFFFu) {
+        return GxStatus::InvalidArgument;
+    }
+    if (!gxos::db::isSupportedPageSize(pageSize)) {
+        return GxStatus::InvalidArgument;
+    }
+
+    const size_t capacity =
+        static_cast<size_t>(pageSize - gxos::db::kPageHeaderSize);
+    if (output->maximum < capacity) return GxStatus::ResourceLimit;
+    if (existingLength != capacity) return GxStatus::CorruptData;
+    if (gxos::db::loadLe32(rowBytes) != static_cast<uint32_t>(rowLength)) {
+        return GxStatus::CorruptData;
+    }
+    if (gxos::db::loadLe32(existingPayload + kHeapMagicOffset) !=
+            gxos::db::kHeapMagic ||
+        gxos::db::loadLe16(existingPayload + kHeapVersionOffset) !=
+            gxos::db::kHeapVersion) {
+        return GxStatus::CorruptData;
+    }
+
+    const uint32_t slotCount =
+        gxos::db::loadLe32(existingPayload + kHeapSlotCountOffset);
+    const uint32_t rowAreaEnd =
+        gxos::db::loadLe32(existingPayload + kHeapRowAreaEndOffset);
+    if (slotCount >
+        (capacity - gxos::db::kHeapHeaderSize) / 8u) {
+        return GxStatus::CorruptData;
+    }
+    const size_t currentSlotBytes = static_cast<size_t>(slotCount) * 8u;
+    if (rowAreaEnd < gxos::db::kHeapHeaderSize + currentSlotBytes ||
+        rowAreaEnd > capacity) {
+        return GxStatus::CorruptData;
+    }
+    for (uint32_t i = 0; i < slotCount; ++i) {
+        const size_t oldSlotOffset = capacity - 8u * (i + 1u);
+        const uint32_t oldRowOffset =
+            gxos::db::loadLe32(existingPayload + oldSlotOffset);
+        const uint32_t oldRowLength =
+            gxos::db::loadLe32(existingPayload + oldSlotOffset + 4u);
+        if (oldRowOffset < gxos::db::kHeapHeaderSize || oldRowLength < 8u ||
+            oldRowOffset > rowAreaEnd ||
+            oldRowLength > rowAreaEnd - oldRowOffset ||
+            gxos::db::loadLe32(existingPayload + oldRowOffset) !=
+                oldRowLength) {
+            return GxStatus::CorruptData;
+        }
+    }
+    if (slotCount == 0xFFFFFFFFu) return GxStatus::ResourceLimit;
+    const size_t newSlotCount = static_cast<size_t>(slotCount) + 1u;
+    if (newSlotCount >
+        (capacity - gxos::db::kHeapHeaderSize) / 8u) {
+        return GxStatus::ResourceLimit;
+    }
+    const size_t slotOffset = capacity - 8u * newSlotCount;
+    if (rowAreaEnd > slotOffset || rowLength > slotOffset - rowAreaEnd) {
+        return GxStatus::ResourceLimit;
+    }
+
+    GxArray prepared = {};
+    GxStatus status = gxArrayInit(&prepared, &output->allocator, 1,
+                                  output->maximum);
+    if (status != GxStatus::Ok) return status;
+    status = gxArrayResize(&prepared, capacity);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&prepared);
+        return status;
+    }
+
+    copyBytes(prepared.data, existingPayload, capacity);
+    copyBytes(prepared.data + rowAreaEnd, rowBytes, rowLength);
+    gxos::db::storeLe32(prepared.data + slotOffset,
+                         static_cast<uint32_t>(rowAreaEnd));
+    gxos::db::storeLe32(prepared.data + slotOffset + 4u,
+                         static_cast<uint32_t>(rowLength));
+    gxos::db::storeLe32(prepared.data + kHeapSlotCountOffset,
+                         slotCount + 1u);
+    gxos::db::storeLe32(prepared.data + kHeapRowAreaEndOffset,
+                         rowAreaEnd + static_cast<uint32_t>(rowLength));
+
+    status = gxArraySwap(output, &prepared);
+    gxArrayDestroy(&prepared);
+    return status;
+}
