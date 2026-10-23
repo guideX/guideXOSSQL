@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <new>
 #include <set>
 
 #include "database_endian.h"
@@ -312,7 +313,12 @@ DbResult IndexTree::writeLeaf(uint64_t pageId, uint64_t nextLeaf,
     }
     page.pageId = pageId;
     page.type = PageType::IndexLeaf;
-    page.payload.assign(cap, 0);
+    try {
+        page.payload.assign(cap, 0);
+    } catch (const std::bad_alloc&) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index leaf payload allocation failed");
+    }
     storeLe32(page.payload.data() + 0, kIndexLeafMagic);
     storeLe16(page.payload.data() + 4, kIndexPageVersion);
     storeLe16(page.payload.data() + 6, 0);
@@ -451,7 +457,12 @@ DbResult IndexTree::writeInternal(uint64_t pageId, const std::vector<Child>& chi
     }
     page.pageId = pageId;
     page.type = PageType::IndexInternal;
-    page.payload.assign(cap, 0);
+    try {
+        page.payload.assign(cap, 0);
+    } catch (const std::bad_alloc&) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index internal payload allocation failed");
+    }
     storeLe32(page.payload.data() + 0, kIndexInternalMagic);
     storeLe16(page.payload.data() + 4, kIndexPageVersion);
     storeLe16(page.payload.data() + 6, 0);
@@ -718,7 +729,8 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
         outInserted = true;
         return DbResult::ok();
     }
-    if (result.status() != DbStatus::NoSpace) {
+    if (result.status() != DbStatus::NoSpace ||
+        leafUsed(entries) <= capacity()) {
         return result;
     }
 
@@ -802,7 +814,8 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
             outInserted = true;
             return DbResult::ok();
         }
-        if (result.status() != DbStatus::NoSpace) {
+        if (result.status() != DbStatus::NoSpace ||
+            internalUsed(children) <= capacity()) {
             return result;
         }
 

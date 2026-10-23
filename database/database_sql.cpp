@@ -2851,7 +2851,11 @@ bool SqlEngine::executeCreateIndex(const SqlCreateIndexAst& ast,
     DbResult result = _db.createIndex(def, indexId);
     if (!result.isOk()) {
         if (explicitTransaction) {
-            _tx->rollbackStatement(savepoint);
+            DbResult rollback = _tx->rollbackStatement(savepoint);
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, ast.index.line, ast.index.column);
+                return false;
+            }
         }
         out.error = errorFromResult(result, ast.index.line, ast.index.column);
         return false;
@@ -2983,10 +2987,31 @@ bool SqlEngine::executeInsert(const SqlInsertAst& ast, ExecContext& ctx,
         // else: leave as NULL (already set)
     }
 
+    const bool explicitTransaction = (_tx != nullptr);
+    TransactionSavepoint savepoint;
+    if (explicitTransaction) {
+        DbResult snapshot = _tx->beginStatement(savepoint);
+        if (!snapshot.isOk()) {
+            out.error = errorFromResult(snapshot, ast.table.line, ast.table.column);
+            return false;
+        }
+    }
+
     DbResult result = table->insert(values);
     if (!result.isOk()) {
+        if (explicitTransaction) {
+            DbResult rollback = _tx->rollbackStatement(savepoint);
+            ctx.tables.clear();
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, ast.table.line, ast.table.column);
+                return false;
+            }
+        }
         out.error = errorFromResult(result, ast.table.line, ast.table.column);
         return false;
+    }
+    if (explicitTransaction) {
+        _tx->releaseStatement(savepoint);
     }
     out.objectName = ast.table.name;
     out.affectedRows = 1;
@@ -3004,6 +3029,20 @@ bool SqlEngine::executeSelect(const SqlSelectAst& ast, ExecContext& ctx,
                                      1 + ast.joins.size();
     if (hasPreparedPlan) {
         sources = ctx.preparedPlan->select.sources;
+        // Prepared plans retain stable Table facades, but a transaction
+        // rollback can restore the Catalog by swapping its owned vectors.
+        // Refresh these short-lived column-vector references for each
+        // execution instead of dereferencing pointers captured at prepare time.
+        for (size_t i = 0; i < sources.size(); ++i) {
+            if (sources[i].table == nullptr) {
+                out.error = makeSemantic("prepared table source is unavailable",
+                                         ast.line, ast.column);
+                return false;
+            }
+            sources[i].columns = &sources[i].table->columns();
+            sources[i].columnCount =
+                static_cast<uint32_t>(sources[i].columns->size());
+        }
     } else {
         sources.reserve(1 + ast.joins.size());
         {
@@ -3632,10 +3671,14 @@ bool SqlEngine::applyMutationPlan(Table* table, ExecContext& ctx,
     DbResult result = table->applyMutations(plan);
     if (!result.isOk()) {
         if (explicitTransaction) {
-            _tx->rollbackStatement(savepoint);
+            DbResult rollback = _tx->rollbackStatement(savepoint);
             // Cached Table objects may reference pages that no longer exist
             // after the overlay was restored.
             ctx.tables.clear();
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, line, column);
+                return false;
+            }
         }
         out.error = errorFromResult(result, line, column);
         return false;
@@ -3924,7 +3967,11 @@ bool SqlEngine::executeDropIndex(const SqlDropIndexAst& ast, SqlStatementResult&
     DbResult result = _db.dropIndex(ast.index.name);
     if (!result.isOk()) {
         if (explicitTransaction) {
-            _tx->rollbackStatement(savepoint);
+            DbResult rollback = _tx->rollbackStatement(savepoint);
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, ast.index.line, ast.index.column);
+                return false;
+            }
         }
         out.error = errorFromResult(result, ast.index.line, ast.index.column);
         return false;
@@ -3950,7 +3997,11 @@ bool SqlEngine::executeDropTable(const SqlDropTableAst& ast, SqlStatementResult&
     DbResult result = _db.dropTable(ast.table.name);
     if (!result.isOk()) {
         if (explicitTransaction) {
-            _tx->rollbackStatement(savepoint);
+            DbResult rollback = _tx->rollbackStatement(savepoint);
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, ast.table.line, ast.table.column);
+                return false;
+            }
         }
         out.error = errorFromResult(result, ast.table.line, ast.table.column);
         return false;
@@ -4008,7 +4059,11 @@ bool SqlEngine::executeAlterTableAddColumn(const SqlAlterTableAddColumnAst& ast,
     DbResult result = _db.alterTableAddColumn(ast.table.name, col);
     if (!result.isOk()) {
         if (explicitTransaction) {
-            _tx->rollbackStatement(savepoint);
+            DbResult rollback = _tx->rollbackStatement(savepoint);
+            if (!rollback.isOk()) {
+                out.error = errorFromResult(rollback, ast.table.line, ast.table.column);
+                return false;
+            }
         }
         out.error = errorFromResult(result, ast.table.line, ast.table.column);
         return false;

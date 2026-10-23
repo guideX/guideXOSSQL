@@ -321,7 +321,7 @@ void testProductionTransactionFailuresAndSavepoint() {
     thirdWrite.payload[1] ^= 0x67;
     CHECK_STATUS(tx->writePage(thirdWrite), DbStatus::Ok);
     failAfter(&state, 0);
-    tx->rollbackStatement(savepoint);
+    CHECK_STATUS(tx->rollbackStatement(savepoint), DbStatus::Ok);
     disableFailure(&state);
     CHECK(tx->modifiedPageCount() == 2);
     CHECK_STATUS(tx->readPage(1, overlay), DbStatus::Ok);

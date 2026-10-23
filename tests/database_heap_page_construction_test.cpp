@@ -4,14 +4,17 @@
 #include "database_index.h"
 #include "database_relational.h"
 #include "database_sql.h"
+#include "database_transaction.h"
 #include "database_wal.h"
 #include "gx_allocator_hosted.h"
 #include "gx_heap_page_builder.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -22,6 +25,80 @@
 #else
 #include <unistd.h>
 #endif
+
+namespace {
+
+struct HostedAllocationFault {
+    size_t targetSize;
+    size_t matchingAttempts;
+    size_t matchingSuccesses;
+    size_t matchingFailures;
+    size_t failAfterSuccesses;
+    bool armed;
+};
+
+thread_local HostedAllocationFault gHostedAllocationFault = {0, 0, 0, 0, 0, false};
+
+void* allocateHostedTestMemory(size_t size) {
+    HostedAllocationFault& fault = gHostedAllocationFault;
+    if (fault.armed && size == fault.targetSize) {
+        ++fault.matchingAttempts;
+        if (fault.matchingSuccesses >= fault.failAfterSuccesses) {
+            ++fault.matchingFailures;
+            fault.armed = false;
+            throw std::bad_alloc();
+        }
+        ++fault.matchingSuccesses;
+    }
+    void* memory = std::malloc(size == 0 ? 1 : size);
+    if (memory == nullptr) throw std::bad_alloc();
+    return memory;
+}
+
+class ScopedHostedAllocationFailure {
+public:
+    ScopedHostedAllocationFailure(size_t targetSize, size_t successfulMatches) {
+        gHostedAllocationFault.targetSize = targetSize;
+        gHostedAllocationFault.matchingAttempts = 0;
+        gHostedAllocationFault.matchingSuccesses = 0;
+        gHostedAllocationFault.matchingFailures = 0;
+        gHostedAllocationFault.failAfterSuccesses = successfulMatches;
+        gHostedAllocationFault.armed = true;
+    }
+
+    ~ScopedHostedAllocationFailure() { gHostedAllocationFault.armed = false; }
+
+    size_t matchingAttempts() const {
+        return gHostedAllocationFault.matchingAttempts;
+    }
+    size_t matchingSuccesses() const {
+        return gHostedAllocationFault.matchingSuccesses;
+    }
+    size_t matchingFailures() const {
+        return gHostedAllocationFault.matchingFailures;
+    }
+
+    ScopedHostedAllocationFailure(const ScopedHostedAllocationFailure&) = delete;
+    ScopedHostedAllocationFailure& operator=(
+        const ScopedHostedAllocationFailure&) = delete;
+};
+
+} // namespace
+
+// Keep deterministic hosted allocation failure injection local to this test
+// executable; production code uses the ordinary hosted allocator.
+void* operator new(std::size_t size) {
+    return allocateHostedTestMemory(size);
+}
+
+void* operator new[](std::size_t size) {
+    return allocateHostedTestMemory(size);
+}
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 using namespace gxos::db;
 
@@ -63,11 +140,15 @@ struct AllocationState {
     size_t matchingFailures;
     size_t failAtMatchingSuccess;
     bool failureEnabled;
+    size_t failAtAttempt;
+    bool failAtAttemptEnabled;
+    size_t allocationFailures;
 
     AllocationState()
         : attempts(0), successes(0), frees(0), outstanding(0),
           matchingSize(0), matchingSuccesses(0), matchingFailures(0),
-          failAtMatchingSuccess(0), failureEnabled(false) {}
+          failAtMatchingSuccess(0), failureEnabled(false), failAtAttempt(0),
+          failAtAttemptEnabled(false), allocationFailures(0) {}
 };
 
 bool allocateBytes(void* context, size_t size, size_t alignment,
@@ -75,6 +156,11 @@ bool allocateBytes(void* context, size_t size, size_t alignment,
     AllocationState* state = static_cast<AllocationState*>(context);
     ++state->attempts;
     *outPointer = 0;
+    if (state->failAtAttemptEnabled && state->attempts >= state->failAtAttempt) {
+        state->failAtAttemptEnabled = false;
+        ++state->allocationFailures;
+        return false;
+    }
     if (alignment == 0 || alignment > 8) return false;
     if (state->failureEnabled && size == state->matchingSize &&
         state->matchingSuccesses >= state->failAtMatchingSuccess) {
@@ -122,6 +208,12 @@ void failMatchingAfter(AllocationState* state, size_t size,
 
 void disableFailure(AllocationState* state) {
     state->failureEnabled = false;
+    state->failAtAttemptEnabled = false;
+}
+
+void failAtAttempt(AllocationState* state, size_t attemptsFromNow) {
+    state->failAtAttempt = state->attempts + attemptsFromNow;
+    state->failAtAttemptEnabled = true;
 }
 
 std::vector<uint8_t> makeRow(size_t length, uint8_t fill = 0x41) {
@@ -431,6 +523,17 @@ int64_t rowCount(SqlEngine& engine) {
     return result.statements[0].resultSet.value(0, 0).int64Value();
 }
 
+int64_t countRows(SqlEngine& engine, const std::string& table) {
+    const SqlExecutionResult result =
+        engine.execute("SELECT COUNT(*) FROM " + table + ";");
+    CHECK(result.ok && result.statements.size() == 1);
+    if (!result.ok || result.statements.size() != 1 ||
+        result.statements[0].resultSet.rowCount() != 1) {
+        return -1;
+    }
+    return result.statements[0].resultSet.value(0, 0).int64Value();
+}
+
 void checkIndexes(Database& db) {
     std::vector<IndexInfo> indexes;
     CHECK_DB(db.listIndexes(indexes), DbStatus::Ok);
@@ -584,12 +687,279 @@ void testProductionMutationFailureAndRelocation() {
     removeDatabase(path);
 }
 
+void testInsertSavepointFailureAtomicity() {
+    std::printf("NDB1R4P11R3I INSERT savepoint and checked index writer\n");
+    const std::string path = testPath() + ".r3i.gxdb";
+    removeDatabase(path);
+
+    AllocationState cacheState;
+    AllocationState transactionState;
+    GxAllocator cacheAllocator = makeAllocator(&cacheState);
+    GxAllocator transactionAllocator = makeAllocator(&transactionState);
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = 512;
+    createOptions.bufferCapacity = 128;
+    createOptions.pageCacheAllocator = &cacheAllocator;
+    createOptions.transactionPageAllocator = &transactionAllocator;
+
+    std::unique_ptr<Database> db;
+    CHECK_DB(Database::create(path, createOptions, db), DbStatus::Ok);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    {
+        SqlEngine engine(*db);
+        CHECK(runSql(engine,
+                     "CREATE TABLE ParentRows (Id INT64 PRIMARY KEY);"));
+        CHECK(runSql(engine, "INSERT INTO ParentRows VALUES (1);"));
+        CHECK(runSql(engine,
+                     "CREATE TABLE PriorRows (Id INT64 PRIMARY KEY, "
+                     "V TEXT NOT NULL);"));
+        CHECK(runSql(engine, "CREATE INDEX IX_PriorRows_V ON PriorRows (V);"));
+        CHECK(runSql(engine, "INSERT INTO PriorRows VALUES (1, 'before');"));
+        CHECK(runSql(engine,
+                     "CREATE TABLE ChildRows (Id INT64 PRIMARY KEY, "
+                     "ParentId INT64, Code TEXT NOT NULL, FOREIGN KEY (ParentId) "
+                     "REFERENCES ParentRows (Id));"));
+        CHECK(runSql(engine, "CREATE INDEX IX_ChildRows_Code ON ChildRows (Code);"));
+
+        SqlPreparedStatement insertChild;
+        CHECK(engine.prepare("INSERT INTO ChildRows VALUES (?, ?, ?);",
+                             insertChild).isOk());
+
+        // First prove a partially constructed later page snapshot is discarded
+        // before INSERT starts, while the preceding UPDATE remains visible.
+        CHECK(runSql(engine, "BEGIN;"));
+        CHECK(runSql(engine,
+                     "UPDATE PriorRows SET V = 'rollback-probe' WHERE Id = 1;"));
+        Transaction* tx = db->activeTransaction();
+        CHECK(tx != nullptr && tx->modifiedPageCount() >= 2);
+        const uint32_t snapshotPageCount =
+            tx ? tx->modifiedPageCount() : 0;
+        const uint64_t snapshotNextPage = tx ? tx->finalPageCount() : 0;
+        const size_t snapshotOwnedBytes = transactionState.outstanding;
+        const size_t snapshotAttempts = transactionState.attempts;
+        const size_t snapshotSuccesses = transactionState.successes;
+        const size_t snapshotFailures = transactionState.allocationFailures;
+        failAtAttempt(&transactionState, 3);
+        CHECK(insertChild.bindInt64(0, 10).isOk());
+        CHECK(insertChild.bindNull(1).isOk());
+        CHECK(insertChild.bindText(2, "snapshot-fail").isOk());
+        const SqlStatementResult snapshotFailure = insertChild.execute();
+        disableFailure(&transactionState);
+        CHECK(!snapshotFailure.ok && snapshotFailure.transactionActiveAfter);
+        CHECK(snapshotFailure.error.message ==
+              "statement page snapshot allocation failed");
+        CHECK(transactionState.attempts == snapshotAttempts + 3);
+        CHECK(transactionState.successes == snapshotSuccesses + 2);
+        CHECK(transactionState.allocationFailures == snapshotFailures + 1);
+        CHECK(transactionState.outstanding == snapshotOwnedBytes);
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->modifiedPageCount() == snapshotPageCount &&
+              db->activeTransaction()->finalPageCount() == snapshotNextPage);
+        CHECK(countRows(engine, "ChildRows") == 0);
+        const SqlExecutionResult priorAfterSnapshotFailure = engine.execute(
+            "SELECT V FROM PriorRows WHERE Id = 1;");
+        CHECK(priorAfterSnapshotFailure.ok &&
+              priorAfterSnapshotFailure.statements[0].resultSet.value(0, 0).textValue() ==
+                  "rollback-probe");
+        CHECK(runSql(engine, "ROLLBACK;"));
+        CHECK(countRows(engine, "ChildRows") == 0);
+        const SqlExecutionResult priorAfterExplicitRollback = engine.execute(
+            "SELECT V FROM PriorRows WHERE Id = 1;");
+        CHECK(priorAfterExplicitRollback.ok &&
+              priorAfterExplicitRollback.statements[0].resultSet.value(0, 0).textValue() ==
+                  "before");
+
+        // First fail the primary leaf's payload preparation after the heap
+        // page is staged. This also proves IndexTree::insert does not mistake
+        // allocation NoSpace for a leaf-overflow split request.
+        CHECK(runSql(engine, "BEGIN;"));
+        CHECK(runSql(engine,
+                     "UPDATE PriorRows SET V = 'commit-probe' WHERE Id = 1;"));
+        tx = db->activeTransaction();
+        CHECK(tx != nullptr && tx->modifiedPageCount() >= 2);
+        const uint32_t writerPageCount = tx ? tx->modifiedPageCount() : 0;
+        const uint64_t writerNextPage = tx ? tx->finalPageCount() : 0;
+        const size_t writerOwnedBytes = transactionState.outstanding;
+
+        // Two matching allocations prepare the savepoint's Catalog copy and
+        // stage the heap row; fail the next allocation in IndexTree::writeLeaf.
+        CHECK(insertChild.bindInt64(0, 10).isOk());
+        CHECK(insertChild.bindNull(1).isOk());
+        CHECK(insertChild.bindText(2, "first-writer-fail").isOk());
+        SqlStatementResult writerFailure;
+        {
+            ScopedHostedAllocationFailure failure(480, 2);
+            writerFailure = insertChild.execute();
+            CHECK(failure.matchingAttempts() == 3);
+            CHECK(failure.matchingSuccesses() == 2);
+            CHECK(failure.matchingFailures() == 1);
+        }
+        CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
+        CHECK(writerFailure.error.message ==
+              "index leaf payload allocation failed");
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->modifiedPageCount() == writerPageCount &&
+              db->activeTransaction()->finalPageCount() == writerNextPage);
+        CHECK(transactionState.outstanding == writerOwnedBytes);
+        CHECK(countRows(engine, "ChildRows") == 0);
+
+        // Fail a later writeLeaf while IndexTree::insert is publishing the
+        // primary entry. The error must stay an allocation failure rather
+        // than being reinterpreted as a leaf split request.
+        CHECK(insertChild.bindText(2, "insert-writer-fail").isOk());
+        {
+            ScopedHostedAllocationFailure failure(480, 7);
+            writerFailure = insertChild.execute();
+            CHECK(failure.matchingAttempts() == 8);
+            CHECK(failure.matchingSuccesses() == 7);
+            CHECK(failure.matchingFailures() == 1);
+        }
+        CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
+        CHECK(writerFailure.error.message ==
+              "index leaf payload allocation failed");
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->modifiedPageCount() == writerPageCount &&
+              db->activeTransaction()->finalPageCount() == writerNextPage);
+        CHECK(transactionState.outstanding == writerOwnedBytes);
+        CHECK(countRows(engine, "ChildRows") == 0);
+
+        // Twelve successful page-sized allocations also let the first index
+        // finish. Fail the next index leaf after that prior index publication.
+        CHECK(insertChild.bindText(2, "writer-fail").isOk());
+        {
+            ScopedHostedAllocationFailure failure(480, 12);
+            writerFailure = insertChild.execute();
+            CHECK(failure.matchingAttempts() == 13);
+            CHECK(failure.matchingSuccesses() == 12);
+            CHECK(failure.matchingFailures() == 1);
+        }
+        CHECK(!writerFailure.ok && writerFailure.transactionActiveAfter);
+        CHECK(writerFailure.error.message ==
+              "index leaf payload allocation failed");
+        CHECK(db->activeTransaction() != nullptr &&
+              db->activeTransaction()->modifiedPageCount() == writerPageCount &&
+              db->activeTransaction()->finalPageCount() == writerNextPage);
+        CHECK(transactionState.outstanding == writerOwnedBytes);
+        CHECK(countRows(engine, "ChildRows") == 0);
+
+        std::vector<IndexInfo> stagedIndexes;
+        CHECK_DB(db->listIndexes(stagedIndexes), DbStatus::Ok);
+        for (size_t i = 0; i < stagedIndexes.size(); ++i) {
+            if (stagedIndexes[i].tableName == "ChildRows") {
+                CHECK(stagedIndexes[i].entryCount == 0);
+                IndexValidation validation;
+                CHECK_DB(db->validateIndex(stagedIndexes[i].indexId, validation),
+                         DbStatus::Ok);
+                CHECK(validation.ok && validation.entryCount == 0);
+            }
+        }
+        const SqlExecutionResult priorAfterWriterFailure = engine.execute(
+            "SELECT V FROM PriorRows WHERE V = 'commit-probe';");
+        CHECK(priorAfterWriterFailure.ok &&
+              priorAfterWriterFailure.statements[0].resultSet.rowCount() == 1 &&
+              priorAfterWriterFailure.statements[0].accessPath == "IndexLookup");
+
+        // The failed statement left the explicit transaction usable. FK
+        // rejection still happens before mutation, then a prepared retry with
+        // a valid parent updates every child index and can commit.
+        const SqlExecutionResult invalidForeignKey = engine.execute(
+            "INSERT INTO ChildRows VALUES (11, 999, 'bad-fk');");
+        CHECK(!invalidForeignKey.ok && invalidForeignKey.transactionActiveAfter);
+        CHECK(invalidForeignKey.error.message.find("foreign key constraint violation") !=
+              std::string::npos);
+        CHECK(countRows(engine, "ChildRows") == 0);
+
+        CHECK(insertChild.bindInt64(0, 10).isOk());
+        CHECK(insertChild.bindInt64(1, 1).isOk());
+        CHECK(insertChild.bindText(2, "valid-code").isOk());
+        CHECK(insertChild.execute().ok);
+        CHECK(countRows(engine, "ChildRows") == 1);
+        checkIndexes(*db);
+        std::string integrity;
+        CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
+
+        std::vector<IndexInfo> indexes;
+        CHECK_DB(db->listIndexes(indexes), DbStatus::Ok);
+        uint32_t primaryIndexId = 0;
+        uint32_t codeIndexId = 0;
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            if (indexes[i].tableName == "ChildRows") {
+                CHECK(indexes[i].entryCount == 1);
+                if (indexes[i].columnName == "Id") primaryIndexId = indexes[i].indexId;
+                if (indexes[i].columnName == "Code") codeIndexId = indexes[i].indexId;
+            }
+        }
+        CHECK(primaryIndexId != 0 && codeIndexId != 0);
+        std::vector<uint8_t> encodedKey;
+        std::vector<RowLocator> primaryLocators;
+        std::vector<RowLocator> codeLocators;
+        CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(10), encodedKey));
+        CHECK_DB(db->indexLookup(primaryIndexId, encodedKey, primaryLocators),
+                 DbStatus::Ok);
+        CHECK(encodeIndexKey(DbType::Text, DbValue::text("valid-code"), encodedKey));
+        CHECK_DB(db->indexLookup(codeIndexId, encodedKey, codeLocators), DbStatus::Ok);
+        CHECK(primaryLocators.size() == 1 && codeLocators.size() == 1);
+        if (primaryLocators.size() == 1 && codeLocators.size() == 1) {
+            CHECK(primaryLocators[0].pageId == codeLocators[0].pageId &&
+                  primaryLocators[0].slot == codeLocators[0].slot);
+        }
+        CHECK(runSql(engine, "COMMIT;"));
+        CHECK(!engine.inTransaction());
+    }
+
+    CHECK_DB(db->close(), DbStatus::Ok);
+    db.reset();
+    CHECK(cacheState.outstanding == 0);
+    CHECK(transactionState.outstanding == 0);
+
+    DatabaseOpenOptions openOptions;
+    openOptions.pageCacheAllocator = &cacheAllocator;
+    openOptions.transactionPageAllocator = &transactionAllocator;
+    std::unique_ptr<Database> reopened;
+    CHECK_DB(Database::open(path, openOptions, reopened), DbStatus::Ok);
+    if (reopened) {
+        {
+            SqlEngine engine(*reopened);
+            CHECK(countRows(engine, "ChildRows") == 1);
+            const SqlExecutionResult prior = engine.execute(
+                "SELECT V FROM PriorRows WHERE Id = 1;");
+            CHECK(prior.ok && prior.statements.size() == 1 &&
+                  prior.statements[0].resultSet.value(0, 0).textValue() ==
+                      "commit-probe");
+            const SqlExecutionResult byPrimary = engine.execute(
+                "SELECT Code FROM ChildRows WHERE Id = 10;");
+            CHECK(byPrimary.ok && byPrimary.statements.size() == 1 &&
+                  byPrimary.statements[0].accessPath == "IndexLookup" &&
+                  byPrimary.statements[0].resultSet.rowCount() == 1 &&
+                  byPrimary.statements[0].resultSet.value(0, 0).textValue() ==
+                      "valid-code");
+            const SqlExecutionResult bySecondary = engine.execute(
+                "SELECT Id FROM ChildRows WHERE Code = 'valid-code';");
+            CHECK(bySecondary.ok && bySecondary.statements.size() == 1 &&
+                  bySecondary.statements[0].accessPath == "IndexLookup" &&
+                  bySecondary.statements[0].resultSet.rowCount() == 1 &&
+                  bySecondary.statements[0].resultSet.value(0, 0).int64Value() == 10);
+            checkIndexes(*reopened);
+            std::string integrity;
+            CHECK_DB(reopened->validateIntegrity(integrity), DbStatus::Ok);
+        }
+        CHECK_DB(reopened->close(), DbStatus::Ok);
+    }
+    reopened.reset();
+    CHECK(cacheState.outstanding == 0);
+    CHECK(transactionState.outstanding == 0);
+    removeDatabase(path);
+}
+
 } // namespace
 
 int main() {
     testHeapByteConstruction();
     testAllocationFailureAndRetry();
     testProductionMutationFailureAndRelocation();
+    testInsertSavepointFailureAtomicity();
     std::printf("NDB1R4P11R2 heap page construction: %d checks, %d failures\n",
                 gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;

@@ -638,7 +638,7 @@ void testProductionIndexAllocationAndSavepointRestore() {
     CHECK_STATUS(tx->allocatePage(PageType::Data, secondAllocated), DbStatus::Ok);
     const size_t outstandingBeforeRestore = state.outstanding;
     failAfter(&state, 0);
-    tx->rollbackStatement(savepoint);
+    CHECK_STATUS(tx->rollbackStatement(savepoint), DbStatus::Ok);
     disableFailure(&state);
     CHECK(state.outstanding < outstandingBeforeRestore);
     CHECK(tx->modifiedPageCount() == 2);

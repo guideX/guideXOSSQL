@@ -330,19 +330,33 @@ DbResult Transaction::beginStatement(TransactionSavepoint& out) {
     return DbResult::ok();
 }
 
-void Transaction::rollbackStatement(TransactionSavepoint& savepoint) {
-    // The snapshot has already paid every allocation cost. Swap/move restores
-    // the prior statement state without a fallible allocation.
+DbResult Transaction::rollbackStatement(TransactionSavepoint& savepoint) {
+    // The snapshot has already paid every allocation cost. Move restores the
+    // page overlay without allocation; reject an unusable snapshot instead of
+    // silently reporting an ordinary statement rollback.
+    if (!_active) {
+        return DbResult::error(DbStatus::RollbackFailed,
+                               "transaction is not active during statement rollback");
+    }
     const GxTransactionPageStats observedPages = _pageOverlay.pages.stats;
     const GxTransactionPageIndexStats observedIndex = _pageOverlay.index.stats;
-    (void)gxTransactionPageOverlayMove(&_pageOverlay, &savepoint.pageOverlay);
+    const GxStatus moveStatus = gxTransactionPageOverlayMove(
+        &_pageOverlay, &savepoint.pageOverlay);
+    if (moveStatus != GxStatus::Ok) {
+        return DbResult::error(DbStatus::RollbackFailed,
+                               "statement page snapshot could not be restored");
+    }
     const size_t restoredBytes = _pageOverlay.pages.stats.currentBytes;
     _pageOverlay.pages.stats = observedPages;
     _pageOverlay.pages.stats.currentBytes = restoredBytes;
     _pageOverlay.index.stats = observedIndex;
-    _db.catalog() = savepoint.catalog;
+    _db.catalog().swap(savepoint.catalog);
     _nextPageId = savepoint.nextPageId;
     _catalogChanged = savepoint.catalogChanged;
+    // Table facades cache the resolved heap tail against this epoch. The page
+    // overlay may have contained a newly allocated tail that was just removed.
+    ++_db._dataEpoch;
+    return DbResult::ok();
 }
 
 void Transaction::releaseStatement(const TransactionSavepoint&) {}
@@ -351,7 +365,7 @@ DbResult Transaction::rollback() {
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
-    _db.catalog() = _catalogSnapshot;
+    _db.catalog().swap(_catalogSnapshot);
     gxTransactionPageOverlayClear(&_pageOverlay);
     _catalogChanged = false;
     _db.finishTransaction(this, false);

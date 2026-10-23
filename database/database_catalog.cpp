@@ -1,6 +1,7 @@
 #include "database_catalog.h"
 
 #include <cstring>
+#include <utility>
 
 #include "database_endian.h"
 #include "database_format.h"
@@ -45,6 +46,17 @@ std::string makeReservedIndexName(IndexKind kind, uint32_t indexId) {
 
 Catalog::Catalog() : _tables(), _indexes(), _foreignKeys(), _nextTableId(1),
                      _nextIndexId(1), _nextForeignKeyId(1), _version(kCatalogVersion) {}
+
+void Catalog::swap(Catalog& other) noexcept {
+    _tables.swap(other._tables);
+    _indexes.swap(other._indexes);
+    _foreignKeys.swap(other._foreignKeys);
+    std::swap(_nextTableId, other._nextTableId);
+    std::swap(_nextIndexId, other._nextIndexId);
+    std::swap(_nextForeignKeyId, other._nextForeignKeyId);
+    std::swap(_version, other._version);
+    _continuationPageIds.swap(other._continuationPageIds);
+}
 
 bool Catalog::validateName(const std::string& name, uint32_t maxBytes) const {
     if (name.empty() || name.size() > maxBytes) {

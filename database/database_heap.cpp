@@ -991,16 +991,31 @@ DbResult Table::insert(const std::vector<DbValue>& values) {
     // If an explicit transaction is active the insert participates in it;
     // otherwise wrap the single operation in an implicit transaction.
     if (_db.activeTransaction() != nullptr) {
-        return insertInTransaction(values);
+        try {
+            return insertInTransaction(values);
+        } catch (const std::bad_alloc&) {
+            return DbResult::error(DbStatus::NoSpace,
+                                   "INSERT page or index allocation failed");
+        }
     }
     std::unique_ptr<Transaction> tx;
     DbResult begin = _db.beginTransaction(tx);
     if (!begin.isOk()) {
         return begin;
     }
-    DbResult result = insertInTransaction(values);
+    DbResult result;
+    try {
+        result = insertInTransaction(values);
+    } catch (const std::bad_alloc&) {
+        result = DbResult::error(DbStatus::NoSpace,
+                                 "INSERT page or index allocation failed");
+    }
     if (!result.isOk()) {
-        tx->rollback();
+        DbResult rollback = tx->rollback();
+        if (!rollback.isOk()) {
+            return DbResult::error(DbStatus::RollbackFailed,
+                                   "INSERT failed and implicit transaction rollback failed");
+        }
         return result;
     }
     return tx->commit();

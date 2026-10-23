@@ -89,7 +89,7 @@ public:
     // the overlay + catalog before a mutation statement, restore it if the
     // statement fails, or release it once the statement succeeds.
     DbResult beginStatement(TransactionSavepoint& out);
-    void rollbackStatement(TransactionSavepoint& savepoint);
+    DbResult rollbackStatement(TransactionSavepoint& savepoint);
     void releaseStatement(const TransactionSavepoint& savepoint);
 
     uint64_t id() const { return _id; }

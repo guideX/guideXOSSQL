@@ -103,6 +103,9 @@ public:
 
     Catalog();
 
+    // Nonallocating restoration primitive for transaction/savepoint rollback.
+    void swap(Catalog& other) noexcept;
+
     // Loads the catalog from the root page and its continuation chain.
     DbResult load(PageAccess& pages, uint64_t rootPageId, uint32_t pageSize,
                   uint64_t pageCount);
