@@ -102,8 +102,8 @@ public:
     // `pages` is the page view; `keyType` is the indexed column type; `indexId`
     // is the durable index id recorded in every page so traversal can reject
     // pages that belong to another index. Mutation callers may supply the
-    // matching active transaction to prepare fitting leaf replacements with
-    // its allocator and publish them through its checked payload staging API.
+    // matching active transaction to prepare bounded leaf and internal split
+    // images with its allocator and publish them through checked staging.
     IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
               Transaction* transaction = nullptr);
 
@@ -202,7 +202,7 @@ private:
         const std::vector<IndexEntry>& left,
         const std::vector<IndexEntry>& right,
         uint64_t& outNewLeafPageId, bool& outHandled);
-    DbResult stageRootInternalSplit(
+    DbResult stageInternalParentSplit(
         uint64_t rootPageId, uint64_t leafPageId,
         const DatabasePage& leafPage, const LeafInfo& leafInfo,
         const std::vector<uint64_t>& path,

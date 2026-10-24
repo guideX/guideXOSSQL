@@ -1767,6 +1767,34 @@ bool readInternalChildren(Database& db, uint64_t pageId, uint32_t pageCapacity,
     return true;
 }
 
+bool internalCanAcceptSeparator(Database& db, uint64_t pageId,
+                                uint32_t pageCapacity,
+                                size_t separatorBytes) {
+    DatabasePage page;
+    if (!db.pages().readPage(pageId, page).isOk() ||
+        page.type != PageType::IndexInternal ||
+        page.payload.size() != pageCapacity) {
+        return false;
+    }
+    const uint32_t childCount = loadLe32(page.payload.data() + 16);
+    uint64_t used = kIndexInternalHeaderSize +
+        static_cast<uint64_t>(childCount + 1) * kIndexSlotSize +
+        kIndexInternalEntryOverhead + separatorBytes;
+    for (uint32_t i = 0; i < childCount; ++i) {
+        const uint32_t slotOffset =
+            pageCapacity - kIndexSlotSize * (i + 1u);
+        const uint32_t offset = loadLe32(page.payload.data() + slotOffset);
+        const uint32_t length =
+            loadLe32(page.payload.data() + slotOffset + 4);
+        if (offset > pageCapacity || length > pageCapacity - offset ||
+            length < kIndexInternalEntryOverhead) {
+            return false;
+        }
+        used += length;
+    }
+    return used <= pageCapacity;
+}
+
 size_t rootInsertHeapStageCount(Database& db, uint32_t pageSize,
                                 uint32_t textBytes, bool& outAllocatesPage) {
     outAllocatesPage = false;
@@ -2033,6 +2061,125 @@ void checkCheckedRootSplitShape(Database& db, const IndexInfo& index,
     CHECK(validation.ok && validation.entryCount == expectedEntries &&
           validation.height == 3 &&
           validation.pagesVisited == oldLeafIds.size() + 4);
+}
+
+void checkCheckedGrandparentSplitShape(
+    Database& db, const IndexInfo& index, uint64_t oldRootPageId,
+    uint64_t oldParentPageId,
+    const std::vector<uint64_t>& oldRootChildren,
+    const std::vector<std::vector<uint8_t> >& oldRootBounds,
+    const std::vector<uint64_t>& oldParentChildren,
+    const std::vector<uint64_t>& oldLeafIds, uint64_t expectedEntries,
+    uint32_t pageSize, uint64_t* outNewLeafPageId,
+    std::vector<uint8_t>* outPromotedSeparator) {
+    const uint32_t pageCapacity = pageSize - kPageHeaderSize;
+    const uint32_t maxPhysicalBytes = maxIndexKeyBytes(pageSize) + 12u;
+    CHECK(index.rootPageId == oldRootPageId);
+
+    DatabasePage root;
+    CHECK_DB(db.pages().readPage(index.rootPageId, root), DbStatus::Ok);
+    CHECK(root.type == PageType::IndexInternal &&
+          root.payload.size() == pageCapacity &&
+          loadLe32(root.payload.data() + 16) == oldRootChildren.size() + 1);
+
+    std::vector<uint64_t> rootChildren;
+    std::vector<std::vector<uint8_t> > rootBounds;
+    CHECK(readInternalChildren(db, index.rootPageId, pageCapacity,
+                               rootChildren, rootBounds));
+    CHECK(rootChildren.size() == oldRootChildren.size() + 1 &&
+          rootBounds.size() == rootChildren.size());
+    if (rootChildren.size() != oldRootChildren.size() + 1 ||
+        rootBounds.size() != rootChildren.size() || oldRootChildren.size() != 2) {
+        return;
+    }
+    CHECK(rootChildren[0] == oldRootChildren[0] &&
+          rootChildren[1] == oldParentPageId &&
+          rootBounds[0] == oldRootBounds[0] &&
+          rootBounds[1] == oldRootBounds[1]);
+    const uint64_t newRightParentId = rootChildren[2];
+    CHECK(newRightParentId != oldRootChildren[0] &&
+          newRightParentId != oldParentPageId &&
+          !rootBounds[2].empty() &&
+          rootBounds[2].size() == maxPhysicalBytes);
+
+    std::vector<uint64_t> leftChildren;
+    std::vector<uint64_t> rightChildren;
+    std::vector<std::vector<uint8_t> > leftBounds;
+    std::vector<std::vector<uint8_t> > rightBounds;
+    CHECK(readInternalChildren(db, oldParentPageId, pageCapacity,
+                               leftChildren, leftBounds));
+    CHECK(readInternalChildren(db, newRightParentId, pageCapacity,
+                               rightChildren, rightBounds));
+    CHECK(leftChildren.size() == 2 && rightChildren.size() == 2 &&
+          oldParentChildren.size() == 3);
+    if (leftChildren.size() != 2 || rightChildren.size() != 2 ||
+        oldParentChildren.size() != 3) {
+        return;
+    }
+    CHECK(leftChildren[0] == oldParentChildren[0] &&
+          leftChildren[1] == oldParentChildren[1] &&
+          rightChildren[0] == oldParentChildren[2]);
+    CHECK(rootBounds[2] == rightBounds[0]);
+
+    uint64_t newLeafId = UINT64_MAX;
+    for (size_t i = 0; i < oldParentChildren.size(); ++i) {
+        CHECK(std::count(leftChildren.begin(), leftChildren.end(),
+                         oldParentChildren[i]) +
+              std::count(rightChildren.begin(), rightChildren.end(),
+                         oldParentChildren[i]) == 1);
+    }
+    for (size_t i = 0; i < rightChildren.size(); ++i) {
+        if (std::find(oldLeafIds.begin(), oldLeafIds.end(),
+                      rightChildren[i]) == oldLeafIds.end()) {
+            CHECK(newLeafId == UINT64_MAX);
+            newLeafId = rightChildren[i];
+        }
+    }
+    CHECK(newLeafId != UINT64_MAX);
+    if (newLeafId == UINT64_MAX) return;
+    if (outNewLeafPageId != nullptr) *outNewLeafPageId = newLeafId;
+    if (outPromotedSeparator != nullptr) *outPromotedSeparator = rootBounds[2];
+
+    std::vector<uint64_t> allLeafIds;
+    for (size_t i = 0; i < rootChildren.size(); ++i) {
+        std::vector<uint64_t> childIds;
+        std::vector<std::vector<uint8_t> > childBounds;
+        CHECK(readInternalChildren(db, rootChildren[i], pageCapacity,
+                                   childIds, childBounds));
+        CHECK(!childIds.empty() && childIds.size() == childBounds.size());
+        if (childIds.empty() || childIds.size() != childBounds.size()) continue;
+        if (i != 0) CHECK(rootBounds[i] == childBounds[0]);
+        for (size_t j = 0; j < childIds.size(); ++j) {
+            CHECK(std::find(allLeafIds.begin(), allLeafIds.end(),
+                            childIds[j]) == allLeafIds.end());
+            allLeafIds.push_back(childIds[j]);
+            DatabasePage leaf;
+            CHECK_DB(db.pages().readPage(childIds[j], leaf), DbStatus::Ok);
+            CHECK(leaf.type == PageType::IndexLeaf);
+            std::vector<uint8_t> firstPhysical;
+            CHECK(readLeafFirstPhysicalKey(leaf, pageCapacity, firstPhysical));
+            if (j != 0 || i != 0) CHECK(childBounds[j] == firstPhysical);
+        }
+    }
+    CHECK(allLeafIds.size() == oldLeafIds.size() + 1);
+    for (size_t i = 0; i < oldLeafIds.size(); ++i) {
+        CHECK(std::count(allLeafIds.begin(), allLeafIds.end(),
+                         oldLeafIds[i]) == 1);
+    }
+    CHECK(std::count(allLeafIds.begin(), allLeafIds.end(), newLeafId) == 1);
+    for (size_t i = 0; i < allLeafIds.size(); ++i) {
+        DatabasePage leaf;
+        CHECK_DB(db.pages().readPage(allLeafIds[i], leaf), DbStatus::Ok);
+        const uint64_t expectedNext = i + 1 < allLeafIds.size()
+            ? allLeafIds[i + 1] : 0;
+        CHECK(loadLe64(leaf.payload.data() + 8) == expectedNext);
+    }
+
+    IndexValidation validation;
+    CHECK_DB(db.validateIndex(index.indexId, validation), DbStatus::Ok);
+    CHECK(validation.ok && validation.entryCount == expectedEntries &&
+          validation.height == 3 &&
+          validation.pagesVisited == allLeafIds.size() + 4);
 }
 
 void testCheckedNonCascadingLeafSplit(uint32_t pageSize, bool injectFailures) {
@@ -3167,6 +3314,691 @@ void testCheckedInternalRootSplit(uint32_t pageSize, bool injectFailures) {
     removeDatabase(path);
 }
 
+void testCheckedInternalGrandparentSplit(uint32_t pageSize,
+                                         bool injectFailures) {
+    std::printf("NDB1R4P11R3N checked nonroot internal split (%u-byte pages)\n",
+                pageSize);
+    const std::string path = testPath() +
+        (pageSize == 512 ? ".r3n512.gxdb" : ".r3n4096.gxdb");
+    removeDatabase(path);
+
+    AllocationState cacheState;
+    AllocationState transactionState;
+    GxAllocator cacheAllocator = makeAllocator(&cacheState);
+    GxAllocator transactionAllocator = makeAllocator(&transactionState);
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = pageSize;
+    createOptions.bufferCapacity = injectFailures ? 1 : 128;
+    createOptions.pageCacheAllocator = &cacheAllocator;
+    createOptions.transactionPageAllocator = &transactionAllocator;
+    std::unique_ptr<Database> db;
+    CHECK_DB(Database::create(path, createOptions, db), DbStatus::Ok);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    struct SavedTree {
+        IndexInfo index;
+        uint64_t rootPageId;
+        uint64_t parentPageId;
+        uint64_t splitLeafPageId;
+        std::vector<uint64_t> rootChildren;
+        std::vector<std::vector<uint8_t> > rootBounds;
+        std::vector<uint64_t> parentChildren;
+        std::vector<uint64_t> leafIds;
+        DatabasePage rootImage;
+        DatabasePage parentImage;
+        DatabasePage splitLeafImage;
+
+        SavedTree()
+            : rootPageId(0), parentPageId(0), splitLeafPageId(0) {}
+    } primary, secondary;
+
+    const uint32_t pageCapacity = pageSize - kPageHeaderSize;
+    const uint32_t maxTextKeyBytes = maxIndexKeyBytes(pageSize);
+    const uint32_t textBytes = maxTextKeyBytes - 1;
+    const uint32_t physicalSeparatorBytes = maxTextKeyBytes + 12u;
+    const uint32_t maxLeafEntries = maxLeafEntriesForKey(
+        pageCapacity, maxTextKeyBytes);
+    CHECK(maxLeafEntries == 4);
+    CHECK(physicalSeparatorBytes == (pageSize == 512 ? 102u : 998u));
+
+    auto captureTree = [&](const IndexInfo& index, SavedTree& saved) {
+        saved.index = index;
+        saved.rootPageId = index.rootPageId;
+        CHECK_DB(db->pages().readPage(saved.rootPageId, saved.rootImage),
+                 DbStatus::Ok);
+        CHECK(saved.rootImage.type == PageType::IndexInternal);
+        CHECK(readInternalChildren(*db, saved.rootPageId, pageCapacity,
+                                   saved.rootChildren, saved.rootBounds));
+        CHECK(saved.rootChildren.size() == 2 && saved.rootBounds.size() == 2);
+        if (saved.rootChildren.size() != 2) return;
+        saved.parentPageId = saved.rootChildren[1];
+        CHECK_DB(db->pages().readPage(saved.parentPageId, saved.parentImage),
+                 DbStatus::Ok);
+        std::vector<std::vector<uint8_t> > parentBounds;
+        CHECK(readInternalChildren(*db, saved.parentPageId, pageCapacity,
+                                   saved.parentChildren, parentBounds));
+        CHECK(saved.parentChildren.size() == 3);
+        if (saved.parentChildren.size() != 3) return;
+        saved.splitLeafPageId = saved.parentChildren.back();
+        CHECK_DB(db->pages().readPage(saved.splitLeafPageId,
+                                      saved.splitLeafImage), DbStatus::Ok);
+        CHECK(saved.splitLeafImage.type == PageType::IndexLeaf &&
+              loadLe32(saved.splitLeafImage.payload.data() + 16) ==
+                  maxLeafEntries);
+        for (size_t i = 0; i < saved.rootChildren.size(); ++i) {
+            std::vector<uint64_t> childIds;
+            std::vector<std::vector<uint8_t> > childBounds;
+            CHECK(readInternalChildren(*db, saved.rootChildren[i], pageCapacity,
+                                       childIds, childBounds));
+            saved.leafIds.insert(saved.leafIds.end(), childIds.begin(),
+                                 childIds.end());
+        }
+    };
+
+    {
+        SqlEngine engine(*db);
+        CHECK(runSql(engine,
+                     "CREATE TABLE ParentRows (Id INT32 PRIMARY KEY);"));
+        CHECK(runSql(engine, "INSERT INTO ParentRows VALUES (1);"));
+        CHECK(runSql(engine,
+                     "CREATE TABLE PriorRows (Id INT32 PRIMARY KEY, ParentId INT32 NOT NULL, V TEXT NOT NULL, FOREIGN KEY (ParentId) REFERENCES ParentRows (Id));"));
+        CHECK(runSql(engine,
+                     "INSERT INTO PriorRows VALUES (1, 1, 'before');"));
+        CHECK(runSql(engine,
+                     "CREATE TABLE RootRows (K TEXT PRIMARY KEY, Mirror TEXT NOT NULL);"));
+        CHECK(runSql(engine,
+                     "CREATE UNIQUE INDEX IX_RootRows_Mirror ON RootRows (Mirror);"));
+        CHECK(runSql(engine, "BEGIN;"));
+        for (uint32_t ordinal = 1; ordinal <= 8; ++ordinal) {
+            const std::string key = rootSplitTextKey(textBytes, ordinal);
+            CHECK(key.size() == textBytes);
+            CHECK(runSql(engine, "INSERT INTO RootRows VALUES ('" + key +
+                                 "', '" + key + "');"));
+        }
+        CHECK(runSql(engine, "COMMIT;"));
+        CHECK(findIndexInfo(*db, "RootRows", "K", primary.index));
+        CHECK(findIndexInfo(*db, "RootRows", "Mirror", secondary.index));
+        captureTree(primary.index, primary);
+        captureTree(secondary.index, secondary);
+
+        CHECK(primary.rootPageId == (pageSize == 512 ? 24u : 23u));
+        CHECK(primary.parentPageId == (pageSize == 512 ? 23u : 22u));
+        CHECK(primary.splitLeafPageId == (pageSize == 512 ? 22u : 21u));
+        CHECK(db->pageCount() == (pageSize == 512 ? 28u : 27u));
+        CHECK(primary.rootChildren[0] != primary.parentPageId &&
+              primary.rootChildren[1] == primary.parentPageId);
+        CHECK(!internalCanAcceptSeparator(*db, primary.parentPageId,
+                                          pageCapacity,
+                                          physicalSeparatorBytes));
+        CHECK(internalCanAcceptSeparator(*db, primary.rootPageId,
+                                         pageCapacity,
+                                         physicalSeparatorBytes));
+        CHECK(secondary.rootChildren.size() == 2 &&
+              secondary.parentChildren.size() == 3 &&
+              loadLe32(secondary.splitLeafImage.payload.data() + 16) ==
+                  maxLeafEntries);
+        IndexValidation beforePrimary;
+        IndexValidation beforeSecondary;
+        CHECK_DB(db->validateIndex(primary.index.indexId, beforePrimary),
+                 DbStatus::Ok);
+        CHECK_DB(db->validateIndex(secondary.index.indexId, beforeSecondary),
+                 DbStatus::Ok);
+        CHECK(beforePrimary.ok && beforePrimary.entryCount == 8 &&
+              beforePrimary.height == 3);
+        CHECK(beforeSecondary.ok && beforeSecondary.entryCount == 8 &&
+              beforeSecondary.height == 3);
+    }
+
+    const uint64_t originalPageCount = db->pageCount();
+    bool appendAllocatesNewPage = false;
+    const size_t appendStageCount = rootInsertHeapStageCount(
+        *db, pageSize, textBytes, appendAllocatesNewPage);
+    CHECK(appendStageCount == (appendAllocatesNewPage ? 2u : 1u));
+    const int32_t baselineRows = 8;
+    const int32_t splitId = baselineRows + 1;
+    const std::string splitKey =
+        rootSplitTextKey(textBytes, static_cast<uint32_t>(splitId));
+    const std::string splitSql = "INSERT INTO RootRows VALUES ('" + splitKey +
+        "', '" + splitKey + "');";
+
+    const auto verifyBaselineAfterFailure = [&](SqlEngine& engine,
+                                                Transaction* tx,
+                                                const std::string& expectedPrior) {
+        IndexInfo currentPrimary;
+        IndexInfo currentSecondary;
+        CHECK(findIndexInfo(*db, "RootRows", "K", currentPrimary));
+        CHECK(findIndexInfo(*db, "RootRows", "Mirror", currentSecondary));
+        CHECK(currentPrimary.rootPageId == primary.rootPageId &&
+              currentSecondary.rootPageId == secondary.rootPageId &&
+              currentPrimary.entryCount == baselineRows &&
+              currentSecondary.entryCount == baselineRows);
+        DatabasePage rootPage;
+        DatabasePage parentPage;
+        DatabasePage leafPage;
+        CHECK_DB(db->pages().readPage(primary.rootPageId, rootPage),
+                 DbStatus::Ok);
+        CHECK_DB(db->pages().readPage(primary.parentPageId, parentPage),
+                 DbStatus::Ok);
+        CHECK_DB(db->pages().readPage(primary.splitLeafPageId, leafPage),
+                 DbStatus::Ok);
+        CHECK(rootPage.payload == primary.rootImage.payload &&
+              parentPage.payload == primary.parentImage.payload &&
+              leafPage.payload == primary.splitLeafImage.payload);
+        CHECK_DB(db->pages().readPage(secondary.rootPageId, rootPage),
+                 DbStatus::Ok);
+        CHECK_DB(db->pages().readPage(secondary.parentPageId, parentPage),
+                 DbStatus::Ok);
+        CHECK_DB(db->pages().readPage(secondary.splitLeafPageId, leafPage),
+                 DbStatus::Ok);
+        CHECK(rootPage.payload == secondary.rootImage.payload &&
+              parentPage.payload == secondary.parentImage.payload &&
+              leafPage.payload == secondary.splitLeafImage.payload);
+        CHECK(countRows(engine, "RootRows") == baselineRows);
+        if (tx != nullptr) CHECK(tx->finalPageCount() == originalPageCount);
+        IndexValidation primaryValidation;
+        IndexValidation secondaryValidation;
+        CHECK_DB(db->validateIndex(primary.index.indexId, primaryValidation),
+                 DbStatus::Ok);
+        CHECK_DB(db->validateIndex(secondary.index.indexId,
+                                   secondaryValidation), DbStatus::Ok);
+        CHECK(primaryValidation.ok && primaryValidation.height == 3 &&
+              primaryValidation.entryCount == baselineRows);
+        CHECK(secondaryValidation.ok && secondaryValidation.height == 3 &&
+              secondaryValidation.entryCount == baselineRows);
+        for (size_t i = 0; i < 2; ++i) {
+            const char* column = i == 0 ? "K" : "Mirror";
+            const SqlExecutionResult absent = engine.execute(
+                "SELECT K FROM RootRows WHERE " + std::string(column) +
+                " = '" + splitKey + "';");
+            CHECK(absent.ok && absent.statements.size() == 1 &&
+                  absent.statements[0].accessPath == "IndexLookup" &&
+                  absent.statements[0].resultSet.rowCount() == 0);
+        }
+        const SqlExecutionResult prior = engine.execute(
+            "SELECT V FROM PriorRows WHERE Id = 1;");
+        CHECK(prior.ok && prior.statements.size() == 1 &&
+              prior.statements[0].resultSet.value(0, 0).textValue() ==
+                  expectedPrior);
+        std::string integrity;
+        CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
+    };
+
+    if (injectFailures) {
+        // Five allocator-owned candidates are prepared in order: left/right
+        // leaf, left/right internal parent, then the grandparent replacement.
+        const size_t candidateFailureAfter[] = {0, 1, 2, 3, 4, 5, 6};
+        for (size_t fault = 0; fault < 7; ++fault) {
+            SqlEngine engine(*db);
+            CHECK(runSql(engine, "BEGIN;"));
+            CHECK(runSql(engine,
+                         "UPDATE PriorRows SET V = 'prior-update' WHERE Id = 1;"));
+            Transaction* tx = db->activeTransaction();
+            CHECK(tx != nullptr);
+            if (tx == nullptr) break;
+            const uint32_t modifiedBefore = tx->modifiedPageCount();
+            const uint64_t pageCountBefore = tx->finalPageCount();
+            const size_t ownedBefore = transactionState.outstanding;
+            const uint64_t imageAllocationsBefore =
+                tx->pageStats().imageAllocations;
+            const size_t attemptsBefore = transactionState.matchingAttempts;
+            const size_t successesBefore = transactionState.matchingSuccesses;
+            const size_t failuresBefore = transactionState.matchingFailures;
+            const size_t allowed = candidateFailureAfter[fault];
+            failMatchingAfter(&transactionState, pageCapacity, allowed);
+            const SqlExecutionResult failedInsert = engine.execute(splitSql);
+            disableFailure(&transactionState);
+            std::printf("R3N candidate fault pageSize=%u allowed=%lu error=%s matches=%lu/%lu imageStages=%llu\n",
+                        pageSize, static_cast<unsigned long>(allowed),
+                        failedInsert.error.message.c_str(),
+                        static_cast<unsigned long>(transactionState.matchingSuccesses - successesBefore),
+                        static_cast<unsigned long>(transactionState.matchingAttempts - attemptsBefore),
+                        static_cast<unsigned long long>(tx->pageStats().imageAllocations - imageAllocationsBefore));
+            const char* expectedError = allowed == 0
+                ? "heap page preparation allocation failed"
+                : ((allowed <= 2 || allowed == 6)
+                    ? "index leaf preparation allocation failed"
+                    : "index internal preparation allocation failed");
+            CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                  failedInsert.error.message == expectedError);
+            CHECK(transactionState.matchingAttempts - attemptsBefore ==
+                      allowed + 1 &&
+                  transactionState.matchingSuccesses - successesBefore ==
+                      allowed &&
+                  transactionState.matchingFailures == failuresBefore + 1);
+            CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                  tx->finalPageCount() == pageCountBefore &&
+                  transactionState.outstanding == ownedBefore);
+            if (allowed == 6) {
+                CHECK(tx->pageStats().imageAllocations >=
+                          imageAllocationsBefore + appendStageCount + 5);
+            }
+            verifyBaselineAfterFailure(engine, tx, "prior-update");
+
+            CHECK(runSql(engine, splitSql));
+            IndexInfo grownPrimary;
+            IndexInfo grownSecondary;
+            CHECK(findIndexInfo(*db, "RootRows", "K", grownPrimary));
+            CHECK(findIndexInfo(*db, "RootRows", "Mirror", grownSecondary));
+            checkCheckedGrandparentSplitShape(
+                *db, grownPrimary, primary.rootPageId, primary.parentPageId,
+                primary.rootChildren, primary.rootBounds,
+                primary.parentChildren, primary.leafIds,
+                static_cast<uint64_t>(baselineRows + 1), pageSize,
+                nullptr, nullptr);
+            checkCheckedGrandparentSplitShape(
+                *db, grownSecondary, secondary.rootPageId,
+                secondary.parentPageId, secondary.rootChildren,
+                secondary.rootBounds, secondary.parentChildren,
+                secondary.leafIds,
+                static_cast<uint64_t>(baselineRows + 1), pageSize,
+                nullptr, nullptr);
+            CHECK(tx->finalPageCount() == pageCountBefore +
+                  (appendAllocatesNewPage ? 1u : 0u) + 4u);
+            CHECK(runSql(engine, "ROLLBACK;"));
+            verifyBaselineAfterFailure(engine, nullptr, "before");
+        }
+
+        // Fail after the new leaf has staged, then after both new pages and
+        // the old leaf/parent replacements have staged but before the fitting
+        // grandparent replacement. Both must restore the INSERT savepoint.
+        const size_t stageSuccesses[] = {1, 4};
+        for (size_t fault = 0; fault < 2; ++fault) {
+            SqlEngine engine(*db);
+            CHECK(runSql(engine, "BEGIN;"));
+            CHECK(runSql(engine,
+                         "UPDATE PriorRows SET V = 'prior-update' WHERE Id = 1;"));
+            Transaction* tx = db->activeTransaction();
+            CHECK(tx != nullptr);
+            if (tx == nullptr) break;
+            const uint32_t modifiedBefore = tx->modifiedPageCount();
+            const uint64_t pageCountBefore = tx->finalPageCount();
+            const size_t ownedBefore = transactionState.outstanding;
+            const size_t attemptsBefore = transactionState.matchingAttempts;
+            const size_t successesBefore = transactionState.matchingSuccesses;
+            const size_t failuresBefore = transactionState.matchingFailures;
+            const size_t allowed = modifiedBefore + appendStageCount +
+                stageSuccesses[fault];
+            failMatchingAfter(&transactionState, pageSize, allowed);
+            const SqlExecutionResult failedInsert = engine.execute(splitSql);
+            disableFailure(&transactionState);
+            std::printf("R3N stage fault pageSize=%u structuralStagesBeforeFailure=%lu error=%s\n",
+                        pageSize,
+                        static_cast<unsigned long>(stageSuccesses[fault]),
+                        failedInsert.error.message.c_str());
+            CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                  failedInsert.error.message ==
+                      "transaction page staging failed");
+            CHECK(transactionState.matchingAttempts - attemptsBefore ==
+                      allowed + 1 &&
+                  transactionState.matchingSuccesses - successesBefore ==
+                      allowed &&
+                  transactionState.matchingFailures == failuresBefore + 1);
+            CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                  tx->finalPageCount() == pageCountBefore &&
+                  transactionState.outstanding == ownedBefore);
+            verifyBaselineAfterFailure(engine, tx, "prior-update");
+            CHECK(runSql(engine, splitSql));
+            CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+            CHECK(runSql(engine, "ROLLBACK;"));
+            verifyBaselineAfterFailure(engine, nullptr, "before");
+        }
+    }
+
+    uint64_t finalPageCount = 0;
+    uint64_t finalPrimaryRootId = 0;
+    uint64_t finalSecondaryRootId = 0;
+    uint64_t finalPrimaryNewLeafId = 0;
+    std::vector<uint8_t> finalPromotedSeparator;
+    const std::string finalPriorValue = "committed-grandparent-split";
+    {
+        SqlEngine engine(*db);
+        CHECK(runSql(engine, "BEGIN;"));
+        CHECK(runSql(engine,
+                     "UPDATE PriorRows SET V = 'committed-grandparent-split' WHERE Id = 1;"));
+        Transaction* tx = db->activeTransaction();
+        CHECK(tx != nullptr);
+        const uint64_t pageCountBefore =
+            tx == nullptr ? 0 : tx->finalPageCount();
+        CHECK(runSql(engine, splitSql));
+        CHECK(findIndexInfo(*db, "RootRows", "K", primary.index));
+        CHECK(findIndexInfo(*db, "RootRows", "Mirror", secondary.index));
+        finalPrimaryRootId = primary.index.rootPageId;
+        finalSecondaryRootId = secondary.index.rootPageId;
+        uint64_t secondaryNewLeafId = 0;
+        std::vector<uint8_t> secondaryPromoted;
+        checkCheckedGrandparentSplitShape(
+            *db, primary.index, primary.rootPageId, primary.parentPageId,
+            primary.rootChildren, primary.rootBounds, primary.parentChildren,
+            primary.leafIds, static_cast<uint64_t>(baselineRows + 1),
+            pageSize, &finalPrimaryNewLeafId, &finalPromotedSeparator);
+        checkCheckedGrandparentSplitShape(
+            *db, secondary.index, secondary.rootPageId,
+            secondary.parentPageId, secondary.rootChildren,
+            secondary.rootBounds, secondary.parentChildren,
+            secondary.leafIds, static_cast<uint64_t>(baselineRows + 1),
+            pageSize, &secondaryNewLeafId, &secondaryPromoted);
+        CHECK(finalPromotedSeparator == secondaryPromoted);
+        CHECK(tx != nullptr && tx->finalPageCount() == pageCountBefore +
+              (appendAllocatesNewPage ? 1u : 0u) + 4u);
+        CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+
+        for (int32_t ordinal = 1; ordinal <= baselineRows + 1; ++ordinal) {
+            const std::string key = rootSplitTextKey(
+                textBytes, static_cast<uint32_t>(ordinal));
+            std::vector<uint8_t> encoded;
+            CHECK(encodeIndexKey(DbType::Text, DbValue::text(key), encoded));
+            std::vector<RowLocator> primaryLocators;
+            std::vector<RowLocator> secondaryLocators;
+            CHECK_DB(db->indexLookup(primary.index.indexId, encoded,
+                                     primaryLocators), DbStatus::Ok);
+            CHECK_DB(db->indexLookup(secondary.index.indexId, encoded,
+                                     secondaryLocators), DbStatus::Ok);
+            CHECK(primaryLocators.size() == 1 &&
+                  secondaryLocators.size() == 1 &&
+                  primaryLocators[0].pageId == secondaryLocators[0].pageId &&
+                  primaryLocators[0].slot == secondaryLocators[0].slot);
+        }
+        IndexTree primaryTree(db->pages(), DbType::Text,
+                              primary.index.indexId, tx);
+        IndexTree secondaryTree(db->pages(), DbType::Text,
+                                secondary.index.indexId, tx);
+        IndexRangeBound allKeys;
+        std::vector<IndexEntry> primaryOrdered;
+        std::vector<IndexEntry> secondaryOrdered;
+        CHECK_DB(primaryTree.rangeScan(allKeys, finalPrimaryRootId,
+                                       primaryOrdered), DbStatus::Ok);
+        CHECK_DB(secondaryTree.rangeScan(allKeys, finalSecondaryRootId,
+                                         secondaryOrdered), DbStatus::Ok);
+        CHECK(primaryOrdered.size() == baselineRows + 1 &&
+              secondaryOrdered.size() == primaryOrdered.size());
+        for (size_t i = 0; i < primaryOrdered.size(); ++i) {
+            const std::string key = rootSplitTextKey(
+                textBytes, static_cast<uint32_t>(i + 1));
+            std::vector<uint8_t> encoded;
+            CHECK(encodeIndexKey(DbType::Text, DbValue::text(key), encoded));
+            CHECK(primaryOrdered[i].key == encoded &&
+                  secondaryOrdered[i].key == encoded &&
+                  primaryOrdered[i].locator.pageId ==
+                      secondaryOrdered[i].locator.pageId &&
+                  primaryOrdered[i].locator.slot ==
+                      secondaryOrdered[i].locator.slot);
+        }
+
+        DbValue promotedValue;
+        CHECK(finalPromotedSeparator.size() == physicalSeparatorBytes &&
+              decodeIndexKey(DbType::Text, finalPromotedSeparator.data(),
+                             finalPromotedSeparator.size() - 12,
+                             promotedValue));
+        if (finalPromotedSeparator.size() >= 12) {
+            const std::string promotedText = promotedValue.textValue();
+            const std::string suffix =
+                promotedText.substr(promotedText.size() - 8);
+            const int32_t boundaryOrdinal = static_cast<int32_t>(
+                std::strtol(suffix.c_str(), nullptr, 10));
+            CHECK(promotedText == rootSplitTextKey(
+                      textBytes, static_cast<uint32_t>(boundaryOrdinal)));
+            for (int32_t ordinal = boundaryOrdinal - 1;
+                 ordinal <= boundaryOrdinal + 1; ++ordinal) {
+                if (ordinal < 1 || ordinal > baselineRows + 1) continue;
+                const std::string key = rootSplitTextKey(
+                    textBytes, static_cast<uint32_t>(ordinal));
+                const SqlExecutionResult primaryLookup = engine.execute(
+                    "SELECT K FROM RootRows WHERE K = '" + key + "';");
+                const SqlExecutionResult secondaryLookup = engine.execute(
+                    "SELECT K FROM RootRows WHERE Mirror = '" + key + "';");
+                CHECK(primaryLookup.ok && primaryLookup.statements.size() == 1 &&
+                      primaryLookup.statements[0].accessPath == "IndexLookup" &&
+                      primaryLookup.statements[0].resultSet.rowCount() == 1);
+                CHECK(secondaryLookup.ok && secondaryLookup.statements.size() == 1 &&
+                      secondaryLookup.statements[0].accessPath == "IndexLookup" &&
+                      secondaryLookup.statements[0].resultSet.rowCount() == 1);
+            }
+        }
+        const SqlExecutionResult duplicate = engine.execute(
+            "INSERT INTO RootRows VALUES ('" +
+            rootSplitTextKey(textBytes, 1) + "', '" + splitKey + "');");
+        CHECK(!duplicate.ok && duplicate.transactionActiveAfter &&
+              duplicate.error.message.find(
+                  "unique index constraint violation") != std::string::npos);
+        CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+        std::string integrity;
+        CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
+        finalPageCount = tx == nullptr ? 0 : tx->finalPageCount();
+        std::vector<uint64_t> finalRootChildren;
+        std::vector<std::vector<uint8_t> > finalRootBounds;
+        CHECK(readInternalChildren(*db, finalPrimaryRootId, pageCapacity,
+                                   finalRootChildren, finalRootBounds));
+        CHECK(finalRootChildren.size() == 3);
+        std::printf("R3N observed pageSize=%u rows=%d->%d root=%llu parent=%llu splitLeaf=%llu newLeaf=%llu newRightParent=%llu children=3/2+2 height=3 pageCount=%llu->%llu promotedBytes=%lu\n",
+                    pageSize, baselineRows, baselineRows + 1,
+                    static_cast<unsigned long long>(finalPrimaryRootId),
+                    static_cast<unsigned long long>(primary.parentPageId),
+                    static_cast<unsigned long long>(primary.splitLeafPageId),
+                    static_cast<unsigned long long>(finalPrimaryNewLeafId),
+                    static_cast<unsigned long long>(finalRootChildren.size() > 2
+                        ? finalRootChildren[2] : 0),
+                    static_cast<unsigned long long>(originalPageCount),
+                    static_cast<unsigned long long>(finalPageCount),
+                    static_cast<unsigned long>(finalPromotedSeparator.size()));
+
+        if (injectFailures) {
+            const size_t cacheAttemptsBeforeCatalog = cacheState.attempts;
+            if (tx != nullptr) {
+                CHECK_DB(db->catalog().save(*tx, db->file().rootPageId(),
+                                            tx->pageSize()), DbStatus::Ok);
+            }
+            const size_t catalogCacheReads =
+                cacheState.attempts - cacheAttemptsBeforeCatalog;
+            std::printf("R3N catalog serialization cache allocations=%lu\n",
+                        static_cast<unsigned long>(catalogCacheReads));
+            const size_t attemptsBefore = cacheState.attempts;
+            const size_t successesBefore = cacheState.successes;
+            const size_t failuresBefore = cacheState.allocationFailures;
+            failAtAttempt(&cacheState, 1);
+            const SqlExecutionResult durableCommitFailure =
+                engine.execute("COMMIT;");
+            disableFailure(&cacheState);
+            std::printf("R3N durable commit pageSize=%u ok=%u error=%s attempts=+%lu successes=+%lu failures=+%lu recovery=%u root=%llu pageCount=%llu\n",
+                        pageSize, durableCommitFailure.ok ? 1u : 0u,
+                        durableCommitFailure.error.message.c_str(),
+                        static_cast<unsigned long>(cacheState.attempts - attemptsBefore),
+                        static_cast<unsigned long>(cacheState.successes - successesBefore),
+                        static_cast<unsigned long>(cacheState.allocationFailures - failuresBefore),
+                        db->diagnostics().recoveryRequired ? 1u : 0u,
+                        static_cast<unsigned long long>(finalPrimaryRootId),
+                        static_cast<unsigned long long>(finalPageCount));
+            CHECK(!durableCommitFailure.ok &&
+                  db->diagnostics().recoveryRequired);
+            CHECK(cacheState.attempts == attemptsBefore + 1 &&
+                  cacheState.successes == successesBefore &&
+                  cacheState.allocationFailures == failuresBefore + 1);
+        } else {
+            CHECK(runSql(engine, "COMMIT;"));
+            IndexValidation primaryAfterCommit;
+            IndexValidation secondaryAfterCommit;
+            CHECK_DB(db->validateIndex(primary.index.indexId,
+                                       primaryAfterCommit), DbStatus::Ok);
+            CHECK_DB(db->validateIndex(secondary.index.indexId,
+                                       secondaryAfterCommit), DbStatus::Ok);
+            CHECK(primaryAfterCommit.ok && primaryAfterCommit.height == 3 &&
+                  secondaryAfterCommit.ok && secondaryAfterCommit.height == 3);
+        }
+        DatabasePage finalRoot;
+        CHECK_DB(db->readPage(finalPrimaryRootId, finalRoot),
+                 injectFailures ? DbStatus::RecoveryRequired : DbStatus::Ok);
+    }
+
+    CHECK_DB(db->close(), injectFailures ? DbStatus::RecoveryRequired
+                                        : DbStatus::Ok);
+    if (injectFailures) {
+        std::ifstream wal(walPathFor(path).c_str(),
+                          std::ios::in | std::ios::binary | std::ios::ate);
+        CHECK(wal.is_open() && wal.tellg() > 32);
+    }
+    db.reset();
+    CHECK(cacheState.outstanding == 0 && transactionState.outstanding == 0);
+
+    DatabaseOpenOptions openOptions;
+    openOptions.bufferCapacity = injectFailures ? 1 : 128;
+    openOptions.pageCacheAllocator = &cacheAllocator;
+    openOptions.transactionPageAllocator = &transactionAllocator;
+    std::unique_ptr<Database> reopened;
+    CHECK_DB(Database::open(path, openOptions, reopened), DbStatus::Ok);
+    for (int reopenPass = 0; reopened && reopenPass < 2; ++reopenPass) {
+        {
+            SqlEngine engine(*reopened);
+            CHECK(reopened->pageCount() == finalPageCount);
+            CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+            CHECK(findIndexInfo(*reopened, "RootRows", "K", primary.index));
+            CHECK(findIndexInfo(*reopened, "RootRows", "Mirror", secondary.index));
+            CHECK(primary.index.rootPageId == finalPrimaryRootId &&
+                  secondary.index.rootPageId == finalSecondaryRootId &&
+                  finalPrimaryRootId == primary.rootPageId &&
+                  finalSecondaryRootId == secondary.rootPageId);
+            checkCheckedGrandparentSplitShape(
+                *reopened, primary.index, primary.rootPageId,
+                primary.parentPageId, primary.rootChildren, primary.rootBounds,
+                primary.parentChildren, primary.leafIds,
+                static_cast<uint64_t>(baselineRows + 1), pageSize,
+                nullptr, &finalPromotedSeparator);
+            checkCheckedGrandparentSplitShape(
+                *reopened, secondary.index, secondary.rootPageId,
+                secondary.parentPageId, secondary.rootChildren,
+                secondary.rootBounds, secondary.parentChildren,
+                secondary.leafIds,
+                static_cast<uint64_t>(baselineRows + 1), pageSize,
+                nullptr, nullptr);
+            for (int32_t ordinal = 1; ordinal <= baselineRows + 1; ++ordinal) {
+                const std::string key = rootSplitTextKey(
+                    textBytes, static_cast<uint32_t>(ordinal));
+                std::vector<uint8_t> encoded;
+                CHECK(encodeIndexKey(DbType::Text, DbValue::text(key), encoded));
+                std::vector<RowLocator> primaryLocators;
+                std::vector<RowLocator> secondaryLocators;
+                CHECK_DB(reopened->indexLookup(primary.index.indexId, encoded,
+                                               primaryLocators), DbStatus::Ok);
+                CHECK_DB(reopened->indexLookup(secondary.index.indexId, encoded,
+                                               secondaryLocators), DbStatus::Ok);
+                CHECK(primaryLocators.size() == 1 &&
+                      secondaryLocators.size() == 1 &&
+                      primaryLocators[0].pageId == secondaryLocators[0].pageId &&
+                      primaryLocators[0].slot == secondaryLocators[0].slot);
+            }
+            DbValue promotedValue;
+            CHECK(finalPromotedSeparator.size() == physicalSeparatorBytes &&
+                  decodeIndexKey(DbType::Text, finalPromotedSeparator.data(),
+                                 finalPromotedSeparator.size() - 12,
+                                 promotedValue));
+            if (finalPromotedSeparator.size() >= 12) {
+                const std::string promotedText = promotedValue.textValue();
+                const std::string suffix = promotedText.substr(
+                    promotedText.size() - 8);
+                const int32_t boundaryOrdinal = static_cast<int32_t>(
+                    std::strtol(suffix.c_str(), nullptr, 10));
+                CHECK(promotedText == rootSplitTextKey(
+                          textBytes, static_cast<uint32_t>(boundaryOrdinal)));
+                for (int32_t ordinal = boundaryOrdinal - 1;
+                     ordinal <= boundaryOrdinal + 1; ++ordinal) {
+                    if (ordinal < 1 || ordinal > baselineRows + 1) continue;
+                    const std::string key = rootSplitTextKey(
+                        textBytes, static_cast<uint32_t>(ordinal));
+                    const SqlExecutionResult primaryLookup = engine.execute(
+                        "SELECT K FROM RootRows WHERE K = '" + key + "';");
+                    const SqlExecutionResult secondaryLookup = engine.execute(
+                        "SELECT K FROM RootRows WHERE Mirror = '" + key + "';");
+                    CHECK(primaryLookup.ok && primaryLookup.statements.size() == 1 &&
+                          primaryLookup.statements[0].accessPath == "IndexLookup" &&
+                          primaryLookup.statements[0].resultSet.rowCount() == 1);
+                    CHECK(secondaryLookup.ok && secondaryLookup.statements.size() == 1 &&
+                          secondaryLookup.statements[0].accessPath == "IndexLookup" &&
+                          secondaryLookup.statements[0].resultSet.rowCount() == 1);
+                }
+            }
+            const SqlExecutionResult prior = engine.execute(
+                "SELECT V FROM PriorRows WHERE Id = 1;");
+            CHECK(prior.ok && prior.statements.size() == 1 &&
+                  prior.statements[0].resultSet.value(0, 0).textValue() ==
+                      finalPriorValue);
+
+            // Exercise index operations after the split, including a reused
+            // prepared UPDATE and DELETE, then roll the verification transaction
+            // back so the recovered committed tree remains the fixture.
+            CHECK(runSql(engine, "BEGIN;"));
+            const std::string firstKey = rootSplitTextKey(textBytes, 1);
+            const std::string lowerMirror = firstKey.substr(
+                0, firstKey.size() - 8) + "00000000";
+            SqlPreparedStatement indexedUpdate;
+            CHECK(engine.prepare(
+                "UPDATE RootRows SET Mirror = ? WHERE K = ?;",
+                indexedUpdate).isOk());
+            CHECK(indexedUpdate.bindText(0, lowerMirror).isOk());
+            CHECK(indexedUpdate.bindText(1, firstKey).isOk());
+            SqlStatementResult updateResult = indexedUpdate.execute();
+            CHECK(updateResult.ok && updateResult.affectedRows == 1);
+            const SqlExecutionResult changedSecondary = engine.execute(
+                "SELECT K FROM RootRows WHERE Mirror = '" + lowerMirror + "';");
+            CHECK(changedSecondary.ok && changedSecondary.statements.size() == 1 &&
+                  changedSecondary.statements[0].accessPath == "IndexLookup" &&
+                  changedSecondary.statements[0].resultSet.rowCount() == 1);
+            CHECK(indexedUpdate.bindText(0, firstKey).isOk());
+            CHECK(indexedUpdate.bindText(1, firstKey).isOk());
+            updateResult = indexedUpdate.execute();
+            CHECK(updateResult.ok && updateResult.affectedRows == 1);
+
+            const std::string extraKey = rootSplitTextKey(
+                textBytes, static_cast<uint32_t>(baselineRows + 2));
+            SqlPreparedStatement indexedInsert;
+            CHECK(engine.prepare(
+                "INSERT INTO RootRows VALUES (?, ?);", indexedInsert).isOk());
+            CHECK(indexedInsert.bindText(0, extraKey).isOk());
+            CHECK(indexedInsert.bindText(1, extraKey).isOk());
+            SqlStatementResult insertResult = indexedInsert.execute();
+            CHECK(insertResult.ok && insertResult.affectedRows == 1);
+            IndexValidation afterInsert;
+            CHECK_DB(reopened->validateIndex(primary.index.indexId, afterInsert),
+                     DbStatus::Ok);
+            CHECK(afterInsert.ok && afterInsert.entryCount == baselineRows + 2 &&
+                  afterInsert.height == 3);
+            SqlPreparedStatement indexedDelete;
+            CHECK(engine.prepare("DELETE FROM RootRows WHERE K = ?;",
+                                 indexedDelete).isOk());
+            CHECK(indexedDelete.bindText(0, extraKey).isOk());
+            SqlStatementResult deleteResult = indexedDelete.execute();
+            CHECK(deleteResult.ok && deleteResult.affectedRows == 1);
+            IndexValidation afterDelete;
+            CHECK_DB(reopened->validateIndex(primary.index.indexId, afterDelete),
+                     DbStatus::Ok);
+            CHECK(afterDelete.ok && afterDelete.entryCount == baselineRows + 1 &&
+                  afterDelete.height == 3);
+            CHECK(indexedDelete.bindText(0,
+                                         rootSplitTextKey(textBytes, 2)).isOk());
+            deleteResult = indexedDelete.execute();
+            CHECK(deleteResult.ok && deleteResult.affectedRows == 1);
+            IndexValidation afterExistingDelete;
+            CHECK_DB(reopened->validateIndex(primary.index.indexId,
+                                             afterExistingDelete), DbStatus::Ok);
+            CHECK(afterExistingDelete.ok &&
+                  afterExistingDelete.entryCount == baselineRows &&
+                  afterExistingDelete.height == 3);
+            CHECK(runSql(engine, "ROLLBACK;"));
+            CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+            checkIndexes(*reopened);
+            std::string integrity;
+            CHECK_DB(reopened->validateIntegrity(integrity), DbStatus::Ok);
+        }
+        CHECK_DB(reopened->close(), DbStatus::Ok);
+        reopened.reset();
+        CHECK(cacheState.outstanding == 0 && transactionState.outstanding == 0);
+        if (reopenPass == 0) {
+            CHECK_DB(Database::open(path, openOptions, reopened), DbStatus::Ok);
+        }
+    }
+
+    CHECK(cacheState.outstanding == 0 && transactionState.outstanding == 0);
+    removeDatabase(path);
+}
+
 void testVariableWidthExactFitSplit() {
     std::printf("NDB1R4P11R3L variable-width and exact-fit index split\n");
     const std::string path = testPath() + ".r3l-text.gxdb";
@@ -3363,6 +4195,8 @@ int main() {
     testCheckedNonCascadingLeafSplit(4096, false);
     testCheckedInternalRootSplit(512, true);
     testCheckedInternalRootSplit(4096, false);
+    testCheckedInternalGrandparentSplit(512, true);
+    testCheckedInternalGrandparentSplit(4096, false);
     testVariableWidthExactFitSplit();
     testCheckedHeapAppendPublication();
     std::printf("NDB1R4P11R3J heap append publication: %d checks, %d failures\n",
