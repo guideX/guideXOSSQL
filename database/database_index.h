@@ -188,13 +188,23 @@ private:
     DbResult readInternal(uint64_t pageId, DatabasePage& page, InternalInfo& info) const;
     DbResult readInternalChildren(const DatabasePage& page, const InternalInfo& info,
                                   std::vector<Child>& out) const;
+    DbResult readInternalChildPlan(const DatabasePage& page,
+                                   const InternalInfo& info, GxArray& out,
+                                   size_t& outCount) const;
     DbResult writeInternal(uint64_t pageId, const std::vector<Child>& children);
     bool internalChildrenFit(const std::vector<Child>& children,
                              uint32_t pageCapacity, uint32_t maxKeyBytes,
                              uint64_t& outUsed) const;
+    bool internalChildPlanFits(const GxArray& children, size_t first,
+                               size_t count, uint32_t pageCapacity,
+                               uint32_t maxKeyBytes, uint64_t& outUsed) const;
     DbResult prepareInternalPayload(const std::vector<Child>& children,
                                     uint64_t candidatePageCount,
                                     GxArray& outPayload) const;
+    DbResult prepareInternalPlanPayload(const GxArray& children,
+                                        size_t first, size_t count,
+                                        uint64_t candidatePageCount,
+                                        GxArray& outPayload) const;
     DbResult stageNonCascadingLeafSplit(
         uint64_t leafPageId, const DatabasePage& leafPage,
         const LeafInfo& leafInfo,

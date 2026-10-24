@@ -3599,6 +3599,68 @@ void testCheckedInternalGrandparentSplit(uint32_t pageSize,
             verifyBaselineAfterFailure(engine, nullptr, "before");
         }
 
+        // The converted parent/grandparent plans and their physical separator
+        // each reserve one bounded transaction-allocator buffer before the
+        // first structural page image is staged.
+        struct SplitPlanRecordLayout {
+            uint64_t pageId;
+            const uint8_t* lowerBound;
+            uint32_t lowerBoundSize;
+        };
+        const size_t plannerAllocationSizes[] = {
+            (primary.parentChildren.size() + 1) * sizeof(SplitPlanRecordLayout),
+            physicalSeparatorBytes,
+            (primary.rootChildren.size() + 1) * sizeof(SplitPlanRecordLayout)
+        };
+        const char* plannerAllocationErrors[] = {
+            "index parent split planning allocation failed",
+            "index split separator allocation failed",
+            "index grandparent split planning allocation failed"
+        };
+        for (size_t fault = 0; fault < 3; ++fault) {
+            SqlEngine engine(*db);
+            CHECK(runSql(engine, "BEGIN;"));
+            CHECK(runSql(engine,
+                         "UPDATE PriorRows SET V = 'prior-update' WHERE Id = 1;"));
+            Transaction* tx = db->activeTransaction();
+            CHECK(tx != nullptr);
+            if (tx == nullptr) break;
+            const uint32_t modifiedBefore = tx->modifiedPageCount();
+            const uint64_t pageCountBefore = tx->finalPageCount();
+            const size_t ownedBefore = transactionState.outstanding;
+            const uint64_t imageAllocationsBefore =
+                tx->pageStats().imageAllocations;
+            const size_t attemptsBefore = transactionState.matchingAttempts;
+            const size_t successesBefore = transactionState.matchingSuccesses;
+            const size_t failuresBefore = transactionState.matchingFailures;
+            failMatchingAfter(&transactionState,
+                              plannerAllocationSizes[fault], 0);
+            const SqlExecutionResult failedInsert = engine.execute(splitSql);
+            disableFailure(&transactionState);
+
+            CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                  failedInsert.error.code == SqlErrorCode::ResourceLimit &&
+                  failedInsert.error.message == plannerAllocationErrors[fault]);
+            CHECK(transactionState.matchingAttempts - attemptsBefore == 1 &&
+                  transactionState.matchingSuccesses - successesBefore == 0 &&
+                  transactionState.matchingFailures == failuresBefore + 1);
+            CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                  tx->finalPageCount() == pageCountBefore &&
+                  tx->pageStats().imageAllocations ==
+                      imageAllocationsBefore + appendStageCount &&
+                  transactionState.outstanding == ownedBefore);
+            std::printf("R3O planner fault pageSize=%u site=%s bytes=%lu error=%s structuralImages=0\n",
+                        pageSize, plannerAllocationErrors[fault],
+                        static_cast<unsigned long>(plannerAllocationSizes[fault]),
+                        failedInsert.error.message.c_str());
+            verifyBaselineAfterFailure(engine, tx, "prior-update");
+
+            CHECK(runSql(engine, splitSql));
+            CHECK(countRows(engine, "RootRows") == baselineRows + 1);
+            CHECK(runSql(engine, "ROLLBACK;"));
+            verifyBaselineAfterFailure(engine, nullptr, "before");
+        }
+
         // Fail after the new leaf has staged, then after both new pages and
         // the old leaf/parent replacements have staged but before the fitting
         // grandparent replacement. Both must restore the INSERT savepoint.
@@ -4196,7 +4258,7 @@ int main() {
     testCheckedInternalRootSplit(512, true);
     testCheckedInternalRootSplit(4096, false);
     testCheckedInternalGrandparentSplit(512, true);
-    testCheckedInternalGrandparentSplit(4096, false);
+    testCheckedInternalGrandparentSplit(4096, true);
     testVariableWidthExactFitSplit();
     testCheckedHeapAppendPublication();
     std::printf("NDB1R4P11R3J heap append publication: %d checks, %d failures\n",
