@@ -1020,6 +1020,190 @@ DbResult IndexTree::stageNonCascadingLeafSplit(
     return DbResult::ok();
 }
 
+DbResult IndexTree::stageRootInternalSplit(
+    uint64_t rootPageId, uint64_t leafPageId, const DatabasePage& leafPage,
+    const LeafInfo& leafInfo, const std::vector<uint64_t>& path,
+    const std::vector<IndexEntry>& left, const std::vector<IndexEntry>& right,
+    uint64_t& outNewRootPageId, bool& outHandled) {
+    outHandled = false;
+    if (_transaction == nullptr || path.size() != 1) return DbResult::ok();
+    if (static_cast<PageAccess*>(_transaction) != &_pages) {
+        return DbResult::error(DbStatus::Internal,
+                               "index root split transaction does not own its page view");
+    }
+
+    const uint64_t rootPage = path[0];
+    if (rootPage != rootPageId) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index one-level split path does not begin at its root");
+    }
+    if (_transaction->pageCount() > kMaxPageCount - 3) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "database reached the page count limit");
+    }
+
+    const uint64_t plannedNewLeafId = _transaction->pageCount();
+    const uint64_t plannedRightInternalId = plannedNewLeafId + 1;
+    const uint64_t plannedNewRootId = plannedNewLeafId + 2;
+    const uint64_t plannedPageCount = plannedNewLeafId + 3;
+
+    DatabasePage rootPageImage;
+    InternalInfo rootInfo;
+    DbResult result = readInternal(rootPage, rootPageImage, rootInfo);
+    if (!result.isOk()) return result;
+    std::vector<Child> allChildren;
+    result = readInternalChildren(rootPageImage, rootInfo, allChildren);
+    if (!result.isOk()) return result;
+    if (allChildren.size() < 2) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index root split parent has too few children");
+    }
+
+    size_t position = allChildren.size();
+    for (size_t i = 0; i < allChildren.size(); ++i) {
+        if (allChildren[i].pageId == leafPageId) {
+            position = i;
+            break;
+        }
+    }
+    if (position == allChildren.size()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index root does not reference split child");
+    }
+    if (right.empty()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index split produced an empty right leaf");
+    }
+
+    Child newLeafChild;
+    newLeafChild.pageId = plannedNewLeafId;
+    newLeafChild.lowerBound = makePhysicalKey(right[0].key, right[0].locator);
+    allChildren.insert(allChildren.begin() + static_cast<long>(position + 1),
+                       newLeafChild);
+
+    uint64_t combinedUsed = 0;
+    if (internalChildrenFit(allChildren, capacity(),
+                            maxPhysicalIndexKeyBytes(_pages.pageSize()),
+                            combinedUsed)) {
+        // The fitting-parent case belongs to R3L. Leave it untouched here.
+        return DbResult::ok();
+    }
+
+    size_t splitPoint = 0;
+    bool foundSplit = false;
+    const uint32_t maxKeyBytes = maxPhysicalIndexKeyBytes(_pages.pageSize());
+    for (size_t candidate = 2; candidate + 1 < allChildren.size(); ++candidate) {
+        std::vector<Child> leftTry(
+            allChildren.begin(), allChildren.begin() + static_cast<long>(candidate));
+        std::vector<Child> rightTry(
+            allChildren.begin() + static_cast<long>(candidate), allChildren.end());
+        uint64_t leftUsed = 0;
+        uint64_t rightUsed = 0;
+        if (internalChildrenFit(leftTry, capacity(), maxKeyBytes, leftUsed) &&
+            internalChildrenFit(rightTry, capacity(), maxKeyBytes, rightUsed)) {
+            splitPoint = candidate;
+            foundSplit = true;
+            break;
+        }
+    }
+    if (!foundSplit) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index internal root cannot be split");
+    }
+
+    std::vector<Child> leftChildren(
+        allChildren.begin(), allChildren.begin() + static_cast<long>(splitPoint));
+    std::vector<Child> rightChildren(
+        allChildren.begin() + static_cast<long>(splitPoint), allChildren.end());
+    if (rightChildren.empty() || rightChildren[0].lowerBound.empty()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index promoted root separator is empty");
+    }
+
+    Child rootLeft;
+    rootLeft.pageId = rootPage;
+    Child rootRight;
+    rootRight.pageId = plannedRightInternalId;
+    rootRight.lowerBound = rightChildren[0].lowerBound;
+    std::vector<Child> newRootChildren;
+    newRootChildren.push_back(rootLeft);
+    newRootChildren.push_back(rootRight);
+
+    ScopedIndexPayload leftLeafPayload;
+    ScopedIndexPayload rightLeafPayload;
+    ScopedIndexPayload leftInternalPayload;
+    ScopedIndexPayload rightInternalPayload;
+    ScopedIndexPayload newRootPayload;
+    result = prepareLeafPayload(plannedNewLeafId, left, plannedPageCount,
+                                leftLeafPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareLeafPayload(leafInfo.nextLeaf, right, plannedPageCount,
+                                rightLeafPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareInternalPayload(leftChildren, plannedPageCount,
+                                    leftInternalPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareInternalPayload(rightChildren, plannedPageCount,
+                                    rightInternalPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareInternalPayload(newRootChildren, plannedPageCount,
+                                    newRootPayload.bytes);
+    if (!result.isOk()) return result;
+
+    // All final images are complete and validated before the first transaction
+    // page is staged. The active INSERT savepoint owns recovery from any later
+    // P7/P8 failure in this multi-page group.
+    uint64_t allocatedPageId = 0;
+    const uint8_t* rightLeafBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&rightLeafPayload.bytes, 0));
+    result = _transaction->allocatePagePayload(
+        PageType::IndexLeaf, 0, 0, rightLeafBytes, capacity(), allocatedPageId);
+    if (!result.isOk()) return result;
+    if (allocatedPageId != plannedNewLeafId) {
+        return DbResult::error(DbStatus::Internal,
+                               "index root split leaf reservation changed unexpectedly");
+    }
+
+    const uint8_t* rightInternalBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&rightInternalPayload.bytes, 0));
+    result = _transaction->allocatePagePayload(
+        PageType::IndexInternal, 0, 0, rightInternalBytes, capacity(),
+        allocatedPageId);
+    if (!result.isOk()) return result;
+    if (allocatedPageId != plannedRightInternalId) {
+        return DbResult::error(DbStatus::Internal,
+                               "index root split internal reservation changed unexpectedly");
+    }
+
+    const uint8_t* newRootBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&newRootPayload.bytes, 0));
+    result = _transaction->allocatePagePayload(
+        PageType::IndexInternal, 0, 0, newRootBytes, capacity(), allocatedPageId);
+    if (!result.isOk()) return result;
+    if (allocatedPageId != plannedNewRootId) {
+        return DbResult::error(DbStatus::Internal,
+                               "index new root reservation changed unexpectedly");
+    }
+
+    const uint8_t* leftLeafBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&leftLeafPayload.bytes, 0));
+    result = _transaction->writePagePayload(
+        leafPageId, PageType::IndexLeaf, leafPage.flags,
+        leafPage.generation, leftLeafBytes, capacity());
+    if (!result.isOk()) return result;
+
+    const uint8_t* leftInternalBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&leftInternalPayload.bytes, 0));
+    result = _transaction->writePagePayload(
+        rootPage, PageType::IndexInternal, rootPageImage.flags,
+        rootPageImage.generation, leftInternalBytes, capacity());
+    if (!result.isOk()) return result;
+
+    outNewRootPageId = plannedNewRootId;
+    outHandled = true;
+    return DbResult::ok();
+}
+
 DbResult IndexTree::allocateInternal(uint64_t& outPageId) {
     uint64_t pageId = 0;
     DbResult result = _pages.allocatePage(PageType::IndexInternal, pageId);
@@ -1302,6 +1486,20 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
                                             checkedSplit);
         if (!result.isOk()) return result;
         if (checkedSplit) {
+            outInserted = true;
+            return DbResult::ok();
+        }
+    }
+
+    if (_transaction != nullptr && path.size() == 1) {
+        uint64_t checkedNewRoot = 0;
+        bool checkedRootSplit = false;
+        result = stageRootInternalSplit(rootPageId, leaf, leafPage, leafInfo,
+                                        path, left, right, checkedNewRoot,
+                                        checkedRootSplit);
+        if (!result.isOk()) return result;
+        if (checkedRootSplit) {
+            outRootPageId = checkedNewRoot;
             outInserted = true;
             return DbResult::ok();
         }

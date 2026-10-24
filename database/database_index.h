@@ -202,6 +202,13 @@ private:
         const std::vector<IndexEntry>& left,
         const std::vector<IndexEntry>& right,
         uint64_t& outNewLeafPageId, bool& outHandled);
+    DbResult stageRootInternalSplit(
+        uint64_t rootPageId, uint64_t leafPageId,
+        const DatabasePage& leafPage, const LeafInfo& leafInfo,
+        const std::vector<uint64_t>& path,
+        const std::vector<IndexEntry>& left,
+        const std::vector<IndexEntry>& right,
+        uint64_t& outNewRootPageId, bool& outHandled);
     DbResult allocateInternal(uint64_t& outPageId);
 
     // Descends from `rootPageId` to the leaf that would contain `physicalKey`,
