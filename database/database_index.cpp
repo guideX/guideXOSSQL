@@ -15,6 +15,14 @@ namespace db {
 
 namespace {
 
+const uint32_t kIndexPhysicalLocatorBytes = 12;
+
+uint32_t maxPhysicalIndexKeyBytes(uint32_t pageSize) {
+    const uint32_t logicalLimit = maxIndexKeyBytes(pageSize);
+    return logicalLimit > UINT32_MAX - kIndexPhysicalLocatorBytes
+        ? UINT32_MAX : logicalLimit + kIndexPhysicalLocatorBytes;
+}
+
 void appendU32Big(std::vector<uint8_t>& out, uint32_t value) {
     out.push_back(static_cast<uint8_t>((value >> 24) & 0xFFu));
     out.push_back(static_cast<uint8_t>((value >> 16) & 0xFFu));
@@ -111,6 +119,39 @@ DbResult leafPreparationStatus(GxStatus status) {
                            "index leaf preparation failed unexpectedly");
 }
 
+DbResult internalPreparationStatus(GxStatus status) {
+    switch (status) {
+    case GxStatus::Ok:
+        return DbResult::ok();
+    case GxStatus::OutOfMemory:
+        return DbResult::error(DbStatus::NoSpace,
+                               "index internal preparation allocation failed");
+    case GxStatus::ResourceLimit:
+    case GxStatus::Overflow:
+        return DbResult::error(DbStatus::TransactionTooLarge,
+                               "index internal preparation exceeds its bound");
+    case GxStatus::CorruptData:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index internal preparation produced invalid data");
+    case GxStatus::InvalidArgument:
+    case GxStatus::UnsupportedAlignment:
+        return DbResult::error(DbStatus::Internal,
+                               "index internal preparation allocator is invalid");
+    }
+    return DbResult::error(DbStatus::Internal,
+                           "index internal preparation failed unexpectedly");
+}
+
+struct ScopedIndexPayload {
+    GxArray bytes;
+
+    ScopedIndexPayload() : bytes() {}
+    ~ScopedIndexPayload() { gxArrayDestroy(&bytes); }
+
+    ScopedIndexPayload(const ScopedIndexPayload&) = delete;
+    ScopedIndexPayload& operator=(const ScopedIndexPayload&) = delete;
+};
+
 bool validatePreparedLeaf(const uint8_t* bytes, uint32_t capacity,
                            uint64_t nextLeaf, uint32_t indexId,
                            const std::vector<IndexEntry>& entries,
@@ -119,6 +160,7 @@ bool validatePreparedLeaf(const uint8_t* bytes, uint32_t capacity,
         loadLe32(bytes) != kIndexLeafMagic ||
         loadLe16(bytes + 4) != kIndexPageVersion ||
         loadLe16(bytes + 6) != 0 || loadLe64(bytes + 8) != nextLeaf ||
+        (nextLeaf != 0 && nextLeaf >= pageCount) ||
         loadLe32(bytes + 16) != entries.size() ||
         loadLe32(bytes + 20) != indexId ||
         entries.size() > (capacity - kIndexLeafHeaderSize) / kIndexSlotSize) {
@@ -483,9 +525,45 @@ DbResult IndexTree::stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
         return DbResult::error(DbStatus::Internal,
                                "index leaf transaction does not own its page view");
     }
+    GxArray candidate = {};
+    DbResult prepared = prepareLeafPayload(nextLeaf, entries,
+                                           _transaction->pageCount(), candidate);
+    if (!prepared.isOk()) {
+        gxArrayDestroy(&candidate);
+        return prepared;
+    }
+
     const uint32_t cap = capacity();
+    const uint8_t* bytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&candidate, 0));
+    DbResult staged = _transaction->writePagePayload(
+        pageId, PageType::IndexLeaf, flags, generation, bytes, cap);
+    gxArrayDestroy(&candidate);
+    return staged;
+}
+
+DbResult IndexTree::prepareLeafPayload(
+    uint64_t nextLeaf, const std::vector<IndexEntry>& entries,
+    uint64_t candidatePageCount, GxArray& outPayload) const {
+    if (_transaction == nullptr ||
+        static_cast<const PageAccess*>(_transaction) != &_pages) {
+        return DbResult::error(DbStatus::Internal,
+                               "checked index leaf preparation requires its transaction");
+    }
+    if (outPayload.initialized) {
+        return DbResult::error(DbStatus::Internal,
+                               "index leaf candidate output is already owned");
+    }
+    const uint32_t cap = capacity();
+    const uint32_t maxKey = maxIndexKeyBytes(_pages.pageSize());
     uint64_t used = 0;
-    if (!leafEntriesFit(entries, cap, maxIndexKeyBytes(_pages.pageSize()), used)) {
+    if (candidatePageCount == 0 ||
+        (nextLeaf != 0 && nextLeaf >= candidatePageCount)) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf candidate sibling is out of range");
+    }
+    if (entries.size() > UINT32_MAX ||
+        !leafEntriesFit(entries, cap, maxKey, used)) {
         return DbResult::error(DbStatus::NoSpace,
                                "index leaf entries do not fit");
     }
@@ -493,9 +571,7 @@ DbResult IndexTree::stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
     GxArray candidate = {};
     GxStatus status = gxArrayInit(&candidate, &_transaction->pageAllocator(),
                                   sizeof(uint8_t), cap);
-    if (status == GxStatus::Ok) {
-        status = gxArrayResize(&candidate, cap);
-    }
+    if (status == GxStatus::Ok) status = gxArrayResize(&candidate, cap);
     if (status != GxStatus::Ok) {
         gxArrayDestroy(&candidate);
         return leafPreparationStatus(status);
@@ -518,8 +594,7 @@ DbResult IndexTree::stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
     uint32_t offset = kIndexLeafHeaderSize;
     for (size_t i = 0; i < entries.size(); ++i) {
         const uint32_t keyLength = static_cast<uint32_t>(entries[i].key.size());
-        const uint32_t entryLength =
-            kIndexLeafEntryOverhead + keyLength;
+        const uint32_t entryLength = kIndexLeafEntryOverhead + keyLength;
         storeLe32(bytes + offset, keyLength);
         if (keyLength != 0) {
             std::memcpy(bytes + offset + 4, entries[i].key.data(), keyLength);
@@ -537,17 +612,14 @@ DbResult IndexTree::stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
 
     if (offset + entries.size() * kIndexSlotSize != used ||
         !validatePreparedLeaf(bytes, cap, nextLeaf, _indexId, entries,
-                              maxIndexKeyBytes(_pages.pageSize()),
-                              _transaction->pageCount())) {
+                              maxKey, candidatePageCount)) {
         gxArrayDestroy(&candidate);
         return DbResult::error(DbStatus::CorruptPage,
                                "index leaf candidate validation failed");
     }
-
-    DbResult staged = _transaction->writePagePayload(
-        pageId, PageType::IndexLeaf, flags, generation, bytes, cap);
-    gxArrayDestroy(&candidate);
-    return staged;
+    outPayload = candidate;
+    candidate = {};
+    return DbResult::ok();
 }
 
 DbResult IndexTree::allocateLeaf(uint64_t nextLeaf, uint64_t& outPageId) {
@@ -609,7 +681,7 @@ DbResult IndexTree::readInternalChildren(const DatabasePage& page,
     out.clear();
     out.reserve(info.childCount);
     const uint32_t cap = capacity();
-    const uint32_t maxKey = maxIndexKeyBytes(_pages.pageSize());
+    const uint32_t maxKey = maxPhysicalIndexKeyBytes(_pages.pageSize());
     const uint64_t pageCount = _pages.pageCount();
     for (uint32_t i = 0; i < info.childCount; ++i) {
         const uint32_t slotOffset = cap - kIndexSlotSize * (i + 1);
@@ -689,6 +761,263 @@ DbResult IndexTree::writeInternal(uint64_t pageId, const std::vector<Child>& chi
     }
     page.payloadSize = cap;
     return _pages.writePage(page);
+}
+
+bool IndexTree::internalChildrenFit(const std::vector<Child>& children,
+                                   uint32_t pageCapacity,
+                                   uint32_t maxKeyBytes,
+                                   uint64_t& outUsed) const {
+    outUsed = 0;
+    if (pageCapacity < kIndexInternalHeaderSize ||
+        children.size() < 2 ||
+        children.size() >
+            (pageCapacity - kIndexInternalHeaderSize) / kIndexSlotSize) {
+        return false;
+    }
+    uint64_t used = kIndexInternalHeaderSize +
+        static_cast<uint64_t>(children.size()) * kIndexSlotSize;
+    for (size_t i = 0; i < children.size(); ++i) {
+        const size_t keyLength = children[i].lowerBound.size();
+        if (keyLength > maxKeyBytes || keyLength > UINT32_MAX ||
+            keyLength > pageCapacity ||
+            kIndexInternalEntryOverhead > pageCapacity - keyLength) {
+            return false;
+        }
+        const uint64_t entryLength =
+            kIndexInternalEntryOverhead + static_cast<uint64_t>(keyLength);
+        if (used > pageCapacity || entryLength > pageCapacity - used) {
+            return false;
+        }
+        used += entryLength;
+    }
+    outUsed = used;
+    return true;
+}
+
+DbResult IndexTree::prepareInternalPayload(
+    const std::vector<Child>& children, uint64_t candidatePageCount,
+    GxArray& outPayload) const {
+    if (_transaction == nullptr ||
+        static_cast<const PageAccess*>(_transaction) != &_pages) {
+        return DbResult::error(DbStatus::Internal,
+                               "checked index parent preparation requires its transaction");
+    }
+    if (outPayload.initialized) {
+        return DbResult::error(DbStatus::Internal,
+                               "index parent candidate output is already owned");
+    }
+    const uint32_t cap = capacity();
+    const uint32_t maxKey = maxPhysicalIndexKeyBytes(_pages.pageSize());
+    uint64_t used = 0;
+    if (candidatePageCount == 0 ||
+        !internalChildrenFit(children, cap, maxKey, used)) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index internal children do not fit");
+    }
+    for (size_t i = 0; i < children.size(); ++i) {
+        if (children[i].pageId == 0 ||
+            children[i].pageId >= candidatePageCount) {
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index internal candidate child is out of range");
+        }
+        if (i != 0 && (children[i].lowerBound.empty() ||
+            compareEncodedKeys(children[i - 1].lowerBound.data(),
+                               children[i - 1].lowerBound.size(),
+                               children[i].lowerBound.data(),
+                               children[i].lowerBound.size()) >= 0)) {
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index internal candidate bounds are not increasing");
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (children[j].pageId == children[i].pageId) {
+                return DbResult::error(DbStatus::CorruptPage,
+                                       "index internal candidate repeats a child");
+            }
+        }
+    }
+
+    GxArray candidate = {};
+    GxStatus status = gxArrayInit(&candidate, &_transaction->pageAllocator(),
+                                  sizeof(uint8_t), cap);
+    if (status == GxStatus::Ok) status = gxArrayResize(&candidate, cap);
+    if (status != GxStatus::Ok) {
+        gxArrayDestroy(&candidate);
+        return internalPreparationStatus(status);
+    }
+    uint8_t* bytes = static_cast<uint8_t*>(gxArrayAt(&candidate, 0));
+    if (bytes == nullptr || gxArraySize(&candidate) != cap) {
+        gxArrayDestroy(&candidate);
+        return DbResult::error(DbStatus::Internal,
+                               "index internal candidate storage is inconsistent");
+    }
+    std::memset(bytes, 0, cap);
+    storeLe32(bytes + 0, kIndexInternalMagic);
+    storeLe16(bytes + 4, kIndexPageVersion);
+    storeLe16(bytes + 6, 0);
+    storeLe64(bytes + 8, 0);
+    storeLe32(bytes + 16, static_cast<uint32_t>(children.size()));
+    storeLe32(bytes + 20, _indexId);
+
+    uint32_t offset = kIndexInternalHeaderSize;
+    for (size_t i = 0; i < children.size(); ++i) {
+        const uint32_t keyLength =
+            static_cast<uint32_t>(children[i].lowerBound.size());
+        const uint32_t entryLength = kIndexInternalEntryOverhead + keyLength;
+        storeLe64(bytes + offset, children[i].pageId);
+        storeLe32(bytes + offset + 8, keyLength);
+        if (keyLength != 0) {
+            std::memcpy(bytes + offset + 12, children[i].lowerBound.data(),
+                        keyLength);
+        }
+        const uint32_t slotOffset =
+            cap - kIndexSlotSize * (static_cast<uint32_t>(i) + 1);
+        storeLe32(bytes + slotOffset, offset);
+        storeLe32(bytes + slotOffset + 4, entryLength);
+        offset += entryLength;
+    }
+
+    bool valid = offset + children.size() * kIndexSlotSize == used &&
+        loadLe32(bytes) == kIndexInternalMagic &&
+        loadLe16(bytes + 4) == kIndexPageVersion &&
+        loadLe16(bytes + 6) == 0 && loadLe64(bytes + 8) == 0 &&
+        loadLe32(bytes + 16) == children.size() &&
+        loadLe32(bytes + 20) == _indexId;
+    uint32_t expectedOffset = kIndexInternalHeaderSize;
+    for (size_t i = 0; valid && i < children.size(); ++i) {
+        const uint32_t slotOffset =
+            cap - kIndexSlotSize * (static_cast<uint32_t>(i) + 1);
+        const uint32_t entryOffset = loadLe32(bytes + slotOffset);
+        const uint32_t entryLength = loadLe32(bytes + slotOffset + 4);
+        const uint32_t keyLength = static_cast<uint32_t>(
+            children[i].lowerBound.size());
+        valid = entryOffset == expectedOffset && entryOffset <= cap &&
+            entryLength >= kIndexInternalEntryOverhead &&
+            entryLength <= cap - entryOffset &&
+            entryOffset <= slotOffset && entryLength <= slotOffset - entryOffset &&
+            loadLe64(bytes + entryOffset) == children[i].pageId &&
+            loadLe32(bytes + entryOffset + 8) == keyLength &&
+            keyLength + kIndexInternalEntryOverhead == entryLength &&
+            (keyLength == 0 ||
+             std::memcmp(bytes + entryOffset + 12,
+                         children[i].lowerBound.data(), keyLength) == 0);
+        expectedOffset += entryLength;
+    }
+    valid = valid && expectedOffset <= cap - children.size() * kIndexSlotSize;
+    if (!valid) {
+        gxArrayDestroy(&candidate);
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index internal candidate validation failed");
+    }
+    outPayload = candidate;
+    candidate = {};
+    return DbResult::ok();
+}
+
+DbResult IndexTree::stageNonCascadingLeafSplit(
+    uint64_t leafPageId, const DatabasePage& leafPage,
+    const LeafInfo& leafInfo,
+    const std::vector<uint64_t>& path,
+    const std::vector<IndexEntry>& left,
+    const std::vector<IndexEntry>& right,
+    uint64_t& outNewLeafPageId, bool& outHandled) {
+    outHandled = false;
+    if (_transaction == nullptr || path.empty()) return DbResult::ok();
+    if (static_cast<PageAccess*>(_transaction) != &_pages) {
+        return DbResult::error(DbStatus::Internal,
+                               "index split transaction does not own its page view");
+    }
+    if (_transaction->pageCount() >= kMaxPageCount) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "database reached the page count limit");
+    }
+
+    const uint64_t plannedNewLeafId = _transaction->pageCount();
+    const uint64_t plannedPageCount = plannedNewLeafId + 1;
+    const uint64_t parentId = path.back();
+    DatabasePage parentPage;
+    InternalInfo parentInfo;
+    DbResult result = readInternal(parentId, parentPage, parentInfo);
+    if (!result.isOk()) return result;
+    std::vector<Child> children;
+    result = readInternalChildren(parentPage, parentInfo, children);
+    if (!result.isOk()) return result;
+    if (children.size() < 2) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index split parent has too few children");
+    }
+
+    size_t position = children.size();
+    for (size_t i = 0; i < children.size(); ++i) {
+        if (children[i].pageId == leafPageId) {
+            position = i;
+            break;
+        }
+    }
+    if (position == children.size()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index parent does not reference split child");
+    }
+    if (right.empty()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index split produced an empty right leaf");
+    }
+    Child inserted;
+    inserted.pageId = plannedNewLeafId;
+    inserted.lowerBound = makePhysicalKey(right[0].key, right[0].locator);
+    children.insert(children.begin() + static_cast<long>(position + 1), inserted);
+
+    uint64_t internalUsedBytes = 0;
+    if (!internalChildrenFit(children, capacity(),
+                             maxPhysicalIndexKeyBytes(_pages.pageSize()),
+                             internalUsedBytes)) {
+        // Parent recursion remains on the existing path. Nothing has been
+        // staged or reserved, so the legacy cascading split can proceed.
+        return DbResult::ok();
+    }
+
+    ScopedIndexPayload leftPayload;
+    ScopedIndexPayload rightPayload;
+    ScopedIndexPayload parentPayload;
+    result = prepareLeafPayload(plannedNewLeafId, left, plannedPageCount,
+                                leftPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareLeafPayload(leafInfo.nextLeaf, right, plannedPageCount,
+                                rightPayload.bytes);
+    if (!result.isOk()) return result;
+    result = prepareInternalPayload(children, plannedPageCount,
+                                    parentPayload.bytes);
+    if (!result.isOk()) return result;
+
+    const uint8_t* rightBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&rightPayload.bytes, 0));
+    uint64_t allocatedLeafId = 0;
+    result = _transaction->allocatePagePayload(
+        PageType::IndexLeaf, 0, 0, rightBytes, capacity(), allocatedLeafId);
+    if (!result.isOk()) return result;
+    if (allocatedLeafId != plannedNewLeafId) {
+        return DbResult::error(DbStatus::Internal,
+                               "index split page reservation changed unexpectedly");
+    }
+
+    // These calls are individually checked. A later failure is restored as a
+    // complete logical group by executeInsert's active statement savepoint.
+    const uint8_t* leftBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&leftPayload.bytes, 0));
+    result = _transaction->writePagePayload(
+        leafPageId, PageType::IndexLeaf, leafPage.flags,
+        leafPage.generation, leftBytes, capacity());
+    if (!result.isOk()) return result;
+
+    const uint8_t* parentBytes = static_cast<const uint8_t*>(
+        gxArrayAtConst(&parentPayload.bytes, 0));
+    result = _transaction->writePagePayload(
+        parentId, PageType::IndexInternal, parentPage.flags,
+        parentPage.generation, parentBytes, capacity());
+    if (!result.isOk()) return result;
+
+    outNewLeafPageId = allocatedLeafId;
+    outHandled = true;
+    return DbResult::ok();
 }
 
 DbResult IndexTree::allocateInternal(uint64_t& outPageId) {
@@ -964,6 +1293,19 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
     }
     std::vector<IndexEntry> left(entries.begin(), entries.begin() + mid);
     std::vector<IndexEntry> right(entries.begin() + mid, entries.end());
+
+    if (_transaction != nullptr && !path.empty()) {
+        uint64_t checkedNewLeaf = 0;
+        bool checkedSplit = false;
+        result = stageNonCascadingLeafSplit(leaf, leafPage, leafInfo, path,
+                                            left, right, checkedNewLeaf,
+                                            checkedSplit);
+        if (!result.isOk()) return result;
+        if (checkedSplit) {
+            outInserted = true;
+            return DbResult::ok();
+        }
+    }
 
     uint64_t newLeaf = 0;
     result = allocateLeaf(leafInfo.nextLeaf, newLeaf);

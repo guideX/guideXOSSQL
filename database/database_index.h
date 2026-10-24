@@ -35,6 +35,8 @@
 #include "database_schema.h"
 #include "database_types.h"
 
+struct GxArray;
+
 namespace gxos {
 namespace db {
 
@@ -178,11 +180,28 @@ private:
     DbResult stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
                                uint16_t flags, uint32_t generation,
                                const std::vector<IndexEntry>& entries);
+    DbResult prepareLeafPayload(uint64_t nextLeaf,
+                                const std::vector<IndexEntry>& entries,
+                                uint64_t candidatePageCount,
+                                GxArray& outPayload) const;
     DbResult allocateLeaf(uint64_t nextLeaf, uint64_t& outPageId);
     DbResult readInternal(uint64_t pageId, DatabasePage& page, InternalInfo& info) const;
     DbResult readInternalChildren(const DatabasePage& page, const InternalInfo& info,
                                   std::vector<Child>& out) const;
     DbResult writeInternal(uint64_t pageId, const std::vector<Child>& children);
+    bool internalChildrenFit(const std::vector<Child>& children,
+                             uint32_t pageCapacity, uint32_t maxKeyBytes,
+                             uint64_t& outUsed) const;
+    DbResult prepareInternalPayload(const std::vector<Child>& children,
+                                    uint64_t candidatePageCount,
+                                    GxArray& outPayload) const;
+    DbResult stageNonCascadingLeafSplit(
+        uint64_t leafPageId, const DatabasePage& leafPage,
+        const LeafInfo& leafInfo,
+        const std::vector<uint64_t>& path,
+        const std::vector<IndexEntry>& left,
+        const std::vector<IndexEntry>& right,
+        uint64_t& outNewLeafPageId, bool& outHandled);
     DbResult allocateInternal(uint64_t& outPageId);
 
     // Descends from `rootPageId` to the leaf that would contain `physicalKey`,
