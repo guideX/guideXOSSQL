@@ -2276,7 +2276,7 @@ void testCheckedNonCascadingLeafSplit(uint32_t pageSize, bool injectFailures) {
         CHECK_DB(db->pages().readPage(rootChildIdsBefore[1], originalRightLeaf),
                  DbStatus::Ok);
 
-        if (injectFailures) {
+        if (injectFailures || pageSize == 4096) {
             // A malformed separator that still routes the target into the
             // right leaf must be rejected while preparing the complete parent
             // replacement. Statement rollback keeps the prior UPDATE and the
@@ -2340,6 +2340,177 @@ void testCheckedNonCascadingLeafSplit(uint32_t pageSize, bool injectFailures) {
                      DbStatus::Ok);
             CHECK(beforePrimary.ok &&
                   beforePrimary.entryCount == static_cast<uint64_t>(baselineRows));
+
+            const char* leafCorruptionErrors[] = {
+                "index leaf entry out of range",
+                "index leaf key length invalid",
+                "impossible index leaf entry count"
+            };
+            for (size_t corruption = 0; corruption < 3; ++corruption) {
+                CHECK(runSql(engine, "BEGIN;"));
+                CHECK(runSql(engine,
+                             "UPDATE PriorRows SET V = 'prior-update' WHERE Id = 1;"));
+                tx = db->activeTransaction();
+                CHECK(tx != nullptr);
+                if (tx == nullptr) break;
+                DatabasePage corruptLeaf = originalRightLeaf;
+                if (corruption < 2) {
+                    const uint32_t slotOffset =
+                        payloadCapacity - kIndexSlotSize;
+                    const uint32_t entryOffset =
+                        loadLe32(corruptLeaf.payload.data() + slotOffset);
+                    const uint32_t entryLength =
+                        loadLe32(corruptLeaf.payload.data() + slotOffset + 4);
+                    CHECK(entryOffset >= kIndexLeafHeaderSize &&
+                          entryOffset < payloadCapacity &&
+                          entryLength <= payloadCapacity - entryOffset);
+                    if (corruption == 0) {
+                        storeLe32(corruptLeaf.payload.data() + slotOffset + 4,
+                                  UINT32_MAX);
+                    } else {
+                        // This large length must be rejected before adding the
+                        // entry overhead or capacity totals can wrap.
+                        storeLe32(corruptLeaf.payload.data() + entryOffset,
+                                  UINT32_MAX);
+                    }
+                } else {
+                    storeLe32(corruptLeaf.payload.data() + 16, UINT32_MAX);
+                }
+                CHECK_DB(tx->writePage(corruptLeaf), DbStatus::Ok);
+                const uint32_t modifiedBefore = tx->modifiedPageCount();
+                const uint64_t pageCountBefore = tx->finalPageCount();
+                const size_t ownedBefore = transactionState.outstanding;
+                const SqlExecutionResult failedInsert = engine.execute(
+                    "INSERT INTO SplitRows VALUES (" + std::to_string(splitId) +
+                    ", TRUE);");
+                CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                      failedInsert.error.code == SqlErrorCode::ExecutionError &&
+                      failedInsert.error.message.find(
+                          leafCorruptionErrors[corruption]) != std::string::npos);
+                CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                      tx->finalPageCount() == pageCountBefore &&
+                      transactionState.outstanding == ownedBefore);
+                DatabasePage retainedCorruptLeaf;
+                DatabasePage retainedParent;
+                CHECK(tx->readPage(rootChildIdsBefore[1],
+                                   retainedCorruptLeaf).isOk());
+                CHECK(tx->readPage(primaryIndex.rootPageId,
+                                   retainedParent).isOk());
+                CHECK(retainedCorruptLeaf.payload == corruptLeaf.payload &&
+                      retainedParent.payload == originalParent.payload);
+                CHECK(countRows(engine, "SplitRows") == baselineRows);
+                const SqlExecutionResult priorValue = engine.execute(
+                    "SELECT V FROM PriorRows WHERE Id = 1;");
+                CHECK(priorValue.ok && priorValue.statements.size() == 1 &&
+                      priorValue.statements[0].resultSet.value(0, 0).textValue() ==
+                          "prior-update");
+                CHECK(runSql(engine, "ROLLBACK;"));
+                CHECK_DB(db->validateIndex(primaryIndex.indexId, beforePrimary),
+                         DbStatus::Ok);
+                CHECK(beforePrimary.ok &&
+                      beforePrimary.entryCount ==
+                          static_cast<uint64_t>(baselineRows));
+            }
+
+            struct LeafPlanRecordLayout {
+                const uint8_t* key;
+                uint64_t locatorPageId;
+                uint32_t keyLength;
+                uint32_t locatorSlot;
+            };
+            CHECK(sizeof(LeafPlanRecordLayout) == 24);
+            const size_t sourceLeafEntries = loadLe32(
+                originalRightLeaf.payload.data() + 16);
+            const size_t maximumLegalLeafEntries =
+                (payloadCapacity - kIndexLeafHeaderSize) /
+                (kIndexLeafEntryOverhead + 1 + kIndexSlotSize);
+            size_t finalPlanCapacity = 1;
+            size_t entriesBeforeFinalGrowth = 0;
+            while (finalPlanCapacity < sourceLeafEntries) {
+                entriesBeforeFinalGrowth = finalPlanCapacity;
+                const size_t doubled = finalPlanCapacity * 2;
+                finalPlanCapacity = doubled > maximumLegalLeafEntries + 1
+                    ? maximumLegalLeafEntries + 1 : doubled;
+            }
+            const size_t leafPlanFaultSizes[] = {
+                sizeof(LeafPlanRecordLayout),
+                8 * sizeof(LeafPlanRecordLayout),
+                finalPlanCapacity * sizeof(LeafPlanRecordLayout)
+            };
+            const size_t leafPlanEntriesBeforeFailure[] = {
+                0, 4, entriesBeforeFinalGrowth
+            };
+            for (size_t faultIndex = 0; faultIndex < 3; ++faultIndex) {
+                CHECK(runSql(engine, "BEGIN;"));
+                CHECK(runSql(engine,
+                             "UPDATE PriorRows SET V = 'prior-update' WHERE Id = 1;"));
+                tx = db->activeTransaction();
+                CHECK(tx != nullptr);
+                if (tx == nullptr) break;
+                const uint32_t modifiedBefore = tx->modifiedPageCount();
+                const uint64_t pageCountBefore = tx->finalPageCount();
+                const size_t ownedBefore = transactionState.outstanding;
+                const uint64_t imageAllocationsBefore =
+                    tx->pageStats().imageAllocations;
+                const size_t attemptsBefore = transactionState.matchingAttempts;
+                const size_t successesBefore = transactionState.matchingSuccesses;
+                const size_t failuresBefore = transactionState.matchingFailures;
+                failMatchingAfter(&transactionState,
+                                  leafPlanFaultSizes[faultIndex], 0);
+                const SqlExecutionResult failedInsert = engine.execute(
+                    "INSERT INTO SplitRows VALUES (" + std::to_string(splitId) +
+                    ", TRUE);");
+                disableFailure(&transactionState);
+
+                CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                      failedInsert.error.code == SqlErrorCode::ResourceLimit &&
+                      failedInsert.error.message ==
+                          "index leaf planning allocation failed");
+                CHECK(transactionState.matchingAttempts - attemptsBefore == 1 &&
+                      transactionState.matchingSuccesses - successesBefore == 0 &&
+                      transactionState.matchingFailures == failuresBefore + 1);
+                CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                      tx->finalPageCount() == pageCountBefore &&
+                      tx->pageStats().imageAllocations ==
+                          imageAllocationsBefore + 1 &&
+                      transactionState.outstanding == ownedBefore);
+                DatabasePage retainedParent;
+                DatabasePage retainedRightLeaf;
+                CHECK(tx->readPage(primaryIndex.rootPageId, retainedParent).isOk());
+                CHECK(tx->readPage(rootChildIdsBefore[1], retainedRightLeaf).isOk());
+                CHECK(retainedParent.payload == originalParent.payload &&
+                      retainedRightLeaf.payload == originalRightLeaf.payload);
+                CHECK(countRows(engine, "SplitRows") == baselineRows);
+                IndexValidation restored;
+                CHECK_DB(db->validateIndex(primaryIndex.indexId, restored),
+                         DbStatus::Ok);
+                CHECK(restored.ok &&
+                      restored.entryCount == static_cast<uint64_t>(baselineRows));
+                const SqlExecutionResult absent = engine.execute(
+                    "SELECT Id FROM SplitRows WHERE Id = " +
+                    std::to_string(splitId) + ";");
+                CHECK(absent.ok && absent.statements.size() == 1 &&
+                      absent.statements[0].accessPath == "IndexLookup" &&
+                      absent.statements[0].resultSet.rowCount() == 0);
+                checkIndexes(*db);
+                const SqlExecutionResult priorValue = engine.execute(
+                    "SELECT V FROM PriorRows WHERE Id = 1;");
+                CHECK(priorValue.ok && priorValue.statements.size() == 1 &&
+                      priorValue.statements[0].resultSet.value(0, 0).textValue() ==
+                          "prior-update");
+                std::printf("R3P leaf plan fault pageSize=%u bytes=%lu entriesPrepared=%lu structuralStages=0\n",
+                            pageSize,
+                            static_cast<unsigned long>(leafPlanFaultSizes[faultIndex]),
+                            static_cast<unsigned long>(
+                                leafPlanEntriesBeforeFailure[faultIndex]));
+
+                CHECK(runSql(engine,
+                             "INSERT INTO SplitRows VALUES (" + std::to_string(splitId) +
+                             ", TRUE);"));
+                CHECK(countRows(engine, "SplitRows") == splitId);
+                CHECK(runSql(engine, "ROLLBACK;"));
+                CHECK(countRows(engine, "SplitRows") == baselineRows);
+            }
 
             const int candidateFailureAfter[] = {1, 2, 3};
             for (size_t faultIndex = 0; faultIndex < 3; ++faultIndex) {
@@ -2499,7 +2670,7 @@ void testCheckedNonCascadingLeafSplit(uint32_t pageSize, bool injectFailures) {
         CHECK(!duplicate.ok && duplicate.error.message.find(
                   "unique index constraint violation") != std::string::npos);
         CHECK(countRows(engine, "SplitRows") ==
-              (splitRetriedInPriorUpdateTransaction ? finalInsertedId : baselineRows));
+              (splitRetriedInPriorUpdateTransaction ? splitId : baselineRows));
 
         uint64_t pageCountBeforeSplit = splitNewPageId;
         Transaction* tx = db->activeTransaction();
@@ -2520,7 +2691,7 @@ void testCheckedNonCascadingLeafSplit(uint32_t pageSize, bool injectFailures) {
         } else {
             CHECK(tx != nullptr &&
                   tx->finalPageCount() == pageCountBeforeSplit + 1);
-            CHECK(countRows(engine, "SplitRows") == finalInsertedId);
+            CHECK(countRows(engine, "SplitRows") == splitId);
         }
 
         const SqlExecutionResult insertedPrimary = engine.execute(
@@ -3612,6 +3783,11 @@ void testCheckedInternalGrandparentSplit(uint32_t pageSize,
             physicalSeparatorBytes,
             (primary.rootChildren.size() + 1) * sizeof(SplitPlanRecordLayout)
         };
+        // At these fixtures the 96-byte parent-plan request shares its size
+        // with the leaf descriptor plan's growth from four to eight entries.
+        // Allow that real leaf-plan allocation to succeed, then fail the
+        // parent-plan request at the same allocator boundary.
+        const size_t plannerPriorMatches[] = {1, 0, 0};
         const char* plannerAllocationErrors[] = {
             "index parent split planning allocation failed",
             "index split separator allocation failed",
@@ -3634,15 +3810,18 @@ void testCheckedInternalGrandparentSplit(uint32_t pageSize,
             const size_t successesBefore = transactionState.matchingSuccesses;
             const size_t failuresBefore = transactionState.matchingFailures;
             failMatchingAfter(&transactionState,
-                              plannerAllocationSizes[fault], 0);
+                              plannerAllocationSizes[fault],
+                              plannerPriorMatches[fault]);
             const SqlExecutionResult failedInsert = engine.execute(splitSql);
             disableFailure(&transactionState);
 
             CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
                   failedInsert.error.code == SqlErrorCode::ResourceLimit &&
                   failedInsert.error.message == plannerAllocationErrors[fault]);
-            CHECK(transactionState.matchingAttempts - attemptsBefore == 1 &&
-                  transactionState.matchingSuccesses - successesBefore == 0 &&
+            CHECK(transactionState.matchingAttempts - attemptsBefore ==
+                      plannerPriorMatches[fault] + 1 &&
+                  transactionState.matchingSuccesses - successesBefore ==
+                      plannerPriorMatches[fault] &&
                   transactionState.matchingFailures == failuresBefore + 1);
             CHECK(tx->modifiedPageCount() == modifiedBefore &&
                   tx->finalPageCount() == pageCountBefore &&
@@ -4061,6 +4240,140 @@ void testCheckedInternalGrandparentSplit(uint32_t pageSize,
     removeDatabase(path);
 }
 
+void testInsertedLeafPlanGrowthFailure() {
+    std::printf("NDB1R4P11R3P inserted leaf descriptor growth failure\n");
+    const std::string path = testPath() + ".r3p-inserted-plan.gxdb";
+    removeDatabase(path);
+
+    AllocationState cacheState;
+    AllocationState transactionState;
+    GxAllocator cacheAllocator = makeAllocator(&cacheState);
+    GxAllocator transactionAllocator = makeAllocator(&transactionState);
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = 512;
+    createOptions.bufferCapacity = 32;
+    createOptions.pageCacheAllocator = &cacheAllocator;
+    createOptions.transactionPageAllocator = &transactionAllocator;
+    std::unique_ptr<Database> db;
+    CHECK_DB(Database::create(path, createOptions, db), DbStatus::Ok);
+    CHECK(db != nullptr);
+    if (!db) return;
+
+    const uint32_t payloadCapacity = 512 - kPageHeaderSize;
+    std::vector<std::string> keys;
+    for (int i = 0; i < 9; ++i) {
+        std::string key = "key" + std::to_string(i);
+        key.append(31 - key.size(), static_cast<char>('a' + i));
+        keys.push_back(key);
+    }
+    size_t eightEntryBytes = kIndexLeafHeaderSize;
+    size_t nineEntryBytes = kIndexLeafHeaderSize;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<uint8_t> encoded;
+        CHECK(encodeIndexKey(DbType::Text, DbValue::text(keys[i]), encoded));
+        const size_t entryBytes = kIndexLeafEntryOverhead + encoded.size() +
+            kIndexSlotSize;
+        if (i < 8) eightEntryBytes += entryBytes;
+        nineEntryBytes += entryBytes;
+    }
+    CHECK(eightEntryBytes <= payloadCapacity &&
+          nineEntryBytes > payloadCapacity);
+
+    {
+        SqlEngine engine(*db);
+        CHECK(runSql(engine,
+                     "CREATE TABLE PlanGrowthRows (K TEXT PRIMARY KEY, V INT32 NOT NULL);"));
+        CHECK(runSql(engine, "BEGIN;"));
+        for (int i = 0; i < 8; ++i) {
+            CHECK(runSql(engine,
+                         "INSERT INTO PlanGrowthRows VALUES ('" + keys[i] + "', " +
+                         std::to_string(i + 1) + ");"));
+        }
+        CHECK(runSql(engine, "COMMIT;"));
+
+        IndexInfo primary;
+        CHECK(findIndexInfo(*db, "PlanGrowthRows", "K", primary));
+        IndexValidation before;
+        CHECK_DB(db->validateIndex(primary.indexId, before), DbStatus::Ok);
+        CHECK(before.ok && before.entryCount == 8 && before.height == 1 &&
+              before.pagesVisited == 1);
+        DatabasePage originalLeaf;
+        CHECK_DB(db->pages().readPage(primary.rootPageId, originalLeaf),
+                 DbStatus::Ok);
+        CHECK(originalLeaf.type == PageType::IndexLeaf &&
+              loadLe32(originalLeaf.payload.data() + 16) == 8);
+
+        CHECK(runSql(engine, "BEGIN;"));
+        CHECK(runSql(engine,
+                     "UPDATE PlanGrowthRows SET V = 99 WHERE K = '" + keys[0] + "';"));
+        Transaction* tx = db->activeTransaction();
+        CHECK(tx != nullptr);
+        if (tx == nullptr) {
+            CHECK(runSql(engine, "ROLLBACK;"));
+        } else {
+            const uint32_t modifiedBefore = tx->modifiedPageCount();
+            const uint64_t pageCountBefore = tx->finalPageCount();
+            const size_t ownedBefore = transactionState.outstanding;
+            const size_t attemptsBefore = transactionState.matchingAttempts;
+            const size_t successesBefore = transactionState.matchingSuccesses;
+            const size_t failuresBefore = transactionState.matchingFailures;
+            failMatchingAfter(&transactionState, 16 * 24, 0);
+            const SqlExecutionResult failedInsert = engine.execute(
+                "INSERT INTO PlanGrowthRows VALUES ('" + keys[8] + "', 9);");
+            disableFailure(&transactionState);
+
+            CHECK(!failedInsert.ok && failedInsert.transactionActiveAfter &&
+                  failedInsert.error.code == SqlErrorCode::ResourceLimit &&
+                  failedInsert.error.message ==
+                      "index leaf planning allocation failed");
+            CHECK(transactionState.matchingAttempts - attemptsBefore == 1 &&
+                  transactionState.matchingSuccesses - successesBefore == 0 &&
+                  transactionState.matchingFailures == failuresBefore + 1);
+            CHECK(tx->modifiedPageCount() == modifiedBefore &&
+                  tx->finalPageCount() == pageCountBefore &&
+                  transactionState.outstanding == ownedBefore);
+            DatabasePage retainedLeaf;
+            CHECK(tx->readPage(primary.rootPageId, retainedLeaf).isOk());
+            CHECK(retainedLeaf.payload == originalLeaf.payload);
+            CHECK(countRows(engine, "PlanGrowthRows") == 8);
+            const SqlExecutionResult priorValue = engine.execute(
+                "SELECT V FROM PlanGrowthRows WHERE K = '" + keys[0] + "';");
+            CHECK(priorValue.ok && priorValue.statements.size() == 1 &&
+                  priorValue.statements[0].resultSet.value(0, 0).int32Value() == 99);
+            const SqlExecutionResult absent = engine.execute(
+                "SELECT V FROM PlanGrowthRows WHERE K = '" + keys[8] + "';");
+            CHECK(absent.ok && absent.statements.size() == 1 &&
+                  absent.statements[0].accessPath == "IndexLookup" &&
+                  absent.statements[0].resultSet.rowCount() == 0);
+            IndexValidation unchanged;
+            CHECK_DB(db->validateIndex(primary.indexId, unchanged), DbStatus::Ok);
+            CHECK(unchanged.ok && unchanged.entryCount == 8 &&
+                  unchanged.height == 1);
+            std::printf("R3P inserted descriptor growth fault bytes=384 entriesPrepared=8\n");
+
+            CHECK(runSql(engine,
+                         "INSERT INTO PlanGrowthRows VALUES ('" + keys[8] + "', 9);"));
+            CHECK(countRows(engine, "PlanGrowthRows") == 9);
+            IndexValidation retried;
+            CHECK_DB(db->validateIndex(primary.indexId, retried), DbStatus::Ok);
+            CHECK(retried.ok && retried.entryCount == 9 && retried.height == 2);
+            CHECK(runSql(engine, "ROLLBACK;"));
+            CHECK(countRows(engine, "PlanGrowthRows") == 8);
+            IndexValidation rolledBack;
+            CHECK_DB(db->validateIndex(primary.indexId, rolledBack), DbStatus::Ok);
+            CHECK(rolledBack.ok && rolledBack.entryCount == 8 &&
+                  rolledBack.height == 1);
+        }
+        std::string integrity;
+        CHECK_DB(db->validateIntegrity(integrity), DbStatus::Ok);
+    }
+
+    CHECK_DB(db->close(), DbStatus::Ok);
+    db.reset();
+    CHECK(cacheState.outstanding == 0 && transactionState.outstanding == 0);
+    removeDatabase(path);
+}
+
 void testVariableWidthExactFitSplit() {
     std::printf("NDB1R4P11R3L variable-width and exact-fit index split\n");
     const std::string path = testPath() + ".r3l-text.gxdb";
@@ -4259,6 +4572,7 @@ int main() {
     testCheckedInternalRootSplit(4096, false);
     testCheckedInternalGrandparentSplit(512, true);
     testCheckedInternalGrandparentSplit(4096, true);
+    testInsertedLeafPlanGrowthFailure();
     testVariableWidthExactFitSplit();
     testCheckedHeapAppendPublication();
     std::printf("NDB1R4P11R3J heap append publication: %d checks, %d failures\n",

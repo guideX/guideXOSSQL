@@ -175,6 +175,8 @@ private:
     DbResult readLeaf(uint64_t pageId, DatabasePage& page, LeafInfo& info) const;
     DbResult readLeafEntries(const DatabasePage& page, const LeafInfo& info,
                              std::vector<IndexEntry>& out) const;
+    DbResult readLeafPlan(const DatabasePage& page, const LeafInfo& info,
+                          GxArray& out, size_t& outCount) const;
     DbResult writeLeaf(uint64_t pageId, uint64_t nextLeaf,
                        const std::vector<IndexEntry>& entries);
     DbResult stagePreparedLeaf(uint64_t pageId, uint64_t nextLeaf,
@@ -184,6 +186,22 @@ private:
                                 const std::vector<IndexEntry>& entries,
                                 uint64_t candidatePageCount,
                                 GxArray& outPayload) const;
+    DbResult prepareLeafPlanPayload(uint64_t nextLeaf,
+                                    const GxArray& entries, size_t first,
+                                    size_t count,
+                                    uint64_t candidatePageCount,
+                                    GxArray& outPayload) const;
+    DbResult stagePreparedLeafPlan(uint64_t pageId, uint64_t nextLeaf,
+                                   uint16_t flags, uint32_t generation,
+                                   const GxArray& entries, size_t count);
+    DbResult insertTransactionPlan(
+        const std::vector<uint8_t>& logicalKey, const RowLocator& locator,
+        uint64_t rootPageId, bool unique, uint64_t& outRootPageId,
+        bool& outInserted);
+    DbResult insertCompatibility(
+        const std::vector<uint8_t>& logicalKey, const RowLocator& locator,
+        uint64_t rootPageId, bool unique, uint64_t& outRootPageId,
+        bool& outInserted);
     DbResult allocateLeaf(uint64_t nextLeaf, uint64_t& outPageId);
     DbResult readInternal(uint64_t pageId, DatabasePage& page, InternalInfo& info) const;
     DbResult readInternalChildren(const DatabasePage& page, const InternalInfo& info,
@@ -209,15 +227,13 @@ private:
         uint64_t leafPageId, const DatabasePage& leafPage,
         const LeafInfo& leafInfo,
         const std::vector<uint64_t>& path,
-        const std::vector<IndexEntry>& left,
-        const std::vector<IndexEntry>& right,
+        const GxArray& entries, size_t splitPoint, size_t entryCount,
         uint64_t& outNewLeafPageId, bool& outHandled);
     DbResult stageInternalParentSplit(
         uint64_t rootPageId, uint64_t leafPageId,
         const DatabasePage& leafPage, const LeafInfo& leafInfo,
         const std::vector<uint64_t>& path,
-        const std::vector<IndexEntry>& left,
-        const std::vector<IndexEntry>& right,
+        const GxArray& entries, size_t splitPoint, size_t entryCount,
         uint64_t& outNewRootPageId, bool& outHandled);
     DbResult allocateInternal(uint64_t& outPageId);
 
@@ -225,10 +241,18 @@ private:
     // recording the internal pages visited in `path`.
     DbResult findLeaf(uint64_t rootPageId, const std::vector<uint8_t>& physicalKey,
                       uint64_t& outLeafPageId, std::vector<uint64_t>& outPath) const;
+    DbResult findLeafForInsert(uint64_t rootPageId,
+                               const std::vector<uint8_t>& logicalKey,
+                               const RowLocator& locator,
+                               uint64_t& outLeafPageId,
+                               std::vector<uint64_t>& outPath) const;
 
     // Returns the index of the child to follow for `physicalKey`.
     static size_t chooseChild(const std::vector<Child>& children,
                               const std::vector<uint8_t>& physicalKey);
+    static size_t chooseChildForInsert(const std::vector<Child>& children,
+                                       const std::vector<uint8_t>& logicalKey,
+                                       const RowLocator& locator);
 
     DbResult splitRootLeaf(uint64_t oldLeaf, uint64_t newLeaf,
                            const std::vector<uint8_t>& separator,
