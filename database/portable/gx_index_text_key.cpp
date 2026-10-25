@@ -48,3 +48,34 @@ GxStatus gxEncodeIndexTextKey(const uint8_t* textBytes, size_t textLength,
     *outEncodedLength = required;
     return GxStatus::Ok;
 }
+
+GxStatus gxDecodeIndexTextKey(const uint8_t* encodedBytes,
+                              size_t encodedLength,
+                              GxTextByteView* outText,
+                              bool* outIsNull) {
+    if (outText) {
+        outText->data = 0;
+        outText->length = 0;
+    }
+    if (outIsNull) *outIsNull = false;
+    if (!outText || !outIsNull) return GxStatus::InvalidArgument;
+    if (!encodedBytes) {
+        return encodedLength == 0 ? GxStatus::CorruptData
+                                  : GxStatus::InvalidArgument;
+    }
+    if (encodedLength == 0) return GxStatus::CorruptData;
+
+    const uint8_t tag = encodedBytes[0];
+    if (tag == 0x00u) {
+        if (encodedLength != 1) return GxStatus::CorruptData;
+        *outIsNull = true;
+        return GxStatus::Ok;
+    }
+    if (tag != 0x01u) return GxStatus::CorruptData;
+
+    // encodedLength is nonzero, so this subtraction cannot underflow. Text
+    // has no stored payload length: the caller-supplied span bounds the view.
+    outText->data = encodedBytes + 1;
+    outText->length = encodedLength - 1;
+    return GxStatus::Ok;
+}

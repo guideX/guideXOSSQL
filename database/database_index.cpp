@@ -874,6 +874,24 @@ int compareEncodedKeys(const uint8_t* a, size_t aLength, const uint8_t* b,
 }
 
 bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out) {
+    if (type == DbType::Text) {
+        GxTextByteView text = {nullptr, 0};
+        bool isNull = false;
+        const GxStatus status =
+            gxDecodeIndexTextKey(key, length, &text, &isNull);
+        if (status != GxStatus::Ok) return false;
+        if (isNull) {
+            out = DbValue::null();
+        } else {
+            // The portable result borrows the encoded bytes. DbValue owns its
+            // Text, so copy only at this hosted API boundary.
+            const std::string ownedText(
+                reinterpret_cast<const char*>(text.data), text.length);
+            out = DbValue::text(ownedText);
+        }
+        return true;
+    }
+
     if (length == 0) {
         return false;
     }
@@ -922,10 +940,6 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
         out = DbValue::float64(d);
         return true;
     }
-    case DbType::Text:
-        out = DbValue::text(std::string(reinterpret_cast<const char*>(key + 1),
-                                        length - 1));
-        return true;
     default:
         return false;
     }

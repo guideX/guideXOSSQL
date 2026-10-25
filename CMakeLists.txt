@@ -118,6 +118,20 @@ else()
 endif()
 add_test(NAME database_ndb1r4p11r3r_test COMMAND database_ndb1r4p11r3r_test)
 
+add_executable(database_ndb1r4p11r3s_test
+    tests/database_ndb1r4p11r3s_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3s_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3s_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3s_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3s_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3s_test COMMAND database_ndb1r4p11r3s_test)
+
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
 if(MSVC)
