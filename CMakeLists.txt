@@ -24,6 +24,7 @@ add_library(gxos_database STATIC
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
     database/portable/gx_page_visit_set.cpp
+    database/portable/gx_index_text_key.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
@@ -103,6 +104,20 @@ endif()
 
 add_test(NAME database_index_test COMMAND database_index_test)
 
+add_executable(database_ndb1r4p11r3r_test
+    tests/database_ndb1r4p11r3r_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3r_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3r_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3r_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3r_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3r_test COMMAND database_ndb1r4p11r3r_test)
+
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
 if(MSVC)
@@ -159,6 +174,7 @@ add_executable(database_portable_runtime_test
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
     database/portable/gx_page_visit_set.cpp
+    database/portable/gx_index_text_key.cpp
     database/portable/gx_owner.cpp
     database/portable/gx_string.cpp
     tests/gx_test_allocator.cpp

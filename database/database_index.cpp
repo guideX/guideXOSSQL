@@ -8,6 +8,7 @@
 #include "database_endian.h"
 #include "database_transaction.h"
 #include "portable/gx_array.h"
+#include "portable/gx_index_text_key.h"
 #include "portable/gx_page_visit_set.h"
 
 namespace gxos {
@@ -829,7 +830,24 @@ bool encodeIndexKey(DbType type, const DbValue& value, std::vector<uint8_t>& out
             return false;
         }
         const std::string& text = value.textValue();
-        out.insert(out.end(), text.begin(), text.end());
+        size_t encodedLength = 0;
+        if (gxIndexTextKeyEncodedSize(text.size(), &encodedLength) !=
+            GxStatus::Ok) {
+            return false;
+        }
+        if (encodedLength > out.max_size()) {
+            return false;
+        }
+        out.resize(encodedLength);
+        size_t written = 0;
+        const GxStatus status = gxEncodeIndexTextKey(
+            reinterpret_cast<const uint8_t*>(text.data()), text.size(),
+            out.data(), encodedLength, &written);
+        if (status != GxStatus::Ok || written != encodedLength) {
+            out.resize(1);
+            out[0] = 0x01u;
+            return false;
+        }
         return true;
     }
     default:
