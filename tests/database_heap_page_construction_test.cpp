@@ -3941,9 +3941,11 @@ void testCheckedInternalGrandparentSplit(uint32_t pageSize,
                   primaryLocators[0].slot == secondaryLocators[0].slot);
         }
         IndexTree primaryTree(db->pages(), DbType::Text,
-                              primary.index.indexId, tx);
+                              primary.index.indexId, tx,
+                              db->scratchAllocator());
         IndexTree secondaryTree(db->pages(), DbType::Text,
-                                secondary.index.indexId, tx);
+                                secondary.index.indexId, tx,
+                                db->scratchAllocator());
         IndexRangeBound allKeys;
         std::vector<IndexEntry> primaryOrdered;
         std::vector<IndexEntry> secondaryOrdered;
@@ -4500,7 +4502,8 @@ void testVariableWidthExactFitSplit() {
             if (i > 0) CHECK(separators[i] == firstPhysical);
         }
 
-        IndexTree tree(db->pages(), DbType::Text, indexId, tx);
+        IndexTree tree(db->pages(), DbType::Text, indexId, tx,
+                       db->scratchAllocator());
         IndexRangeBound allKeys;
         std::vector<IndexEntry> ordered;
         CHECK_DB(tree.rangeScan(allKeys, rootPageId, ordered), DbStatus::Ok);

@@ -132,6 +132,83 @@ void fixPageCrc(std::vector<uint8_t>& bytes, uint64_t pageId, uint32_t pageSize)
     storeLe32(page + page_offset::PageCrc32, crc);
 }
 
+struct SizeFaultAllocatorState {
+    size_t maximumAllocation;
+    size_t attempts;
+    size_t successfulAllocations;
+    size_t frees;
+    size_t outstanding;
+    size_t failSize;
+    size_t failOccurrence;
+    size_t matchingAllocations;
+    size_t failures;
+    bool failureEnabled;
+
+    SizeFaultAllocatorState()
+        : maximumAllocation(static_cast<size_t>(-1)), attempts(0),
+          successfulAllocations(0), frees(0), outstanding(0), failSize(0),
+          failOccurrence(0), matchingAllocations(0), failures(0),
+          failureEnabled(false) {}
+};
+
+bool sizeFaultAllocate(void* context, size_t size, size_t alignment,
+                       void** outPointer) {
+    SizeFaultAllocatorState* state =
+        static_cast<SizeFaultAllocatorState*>(context);
+    ++state->attempts;
+    *outPointer = nullptr;
+    if (size > state->maximumAllocation || alignment == 0 || alignment > 8 ||
+        (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    if (state->failureEnabled && size == state->failSize &&
+        ++state->matchingAllocations == state->failOccurrence) {
+        ++state->failures;
+        return false;
+    }
+    void* allocation = std::malloc(size);
+    if (allocation == nullptr) return false;
+    if (reinterpret_cast<uintptr_t>(allocation) % alignment != 0) {
+        std::free(allocation);
+        return false;
+    }
+    *outPointer = allocation;
+    ++state->successfulAllocations;
+    ++state->outstanding;
+    return true;
+}
+
+void sizeFaultFree(void* context, void* allocation) {
+    if (allocation == nullptr) return;
+    SizeFaultAllocatorState* state =
+        static_cast<SizeFaultAllocatorState*>(context);
+    std::free(allocation);
+    ++state->frees;
+    --state->outstanding;
+}
+
+GxAllocator makeSizeFaultAllocator(SizeFaultAllocatorState& state) {
+    GxAllocator allocator = {};
+    allocator.context = &state;
+    allocator.allocate = sizeFaultAllocate;
+    allocator.deallocate = sizeFaultFree;
+    allocator.maxAllocation = state.maximumAllocation;
+    allocator.maxAlignment = 8;
+    return allocator;
+}
+
+void failOnSizeOccurrence(SizeFaultAllocatorState& state, size_t size,
+                          size_t occurrence) {
+    state.failSize = size;
+    state.failOccurrence = occurrence;
+    state.matchingAllocations = 0;
+    state.failureEnabled = true;
+}
+
+void disableSizeFailure(SizeFaultAllocatorState& state) {
+    state.failureEnabled = false;
+}
+
 // ---------------------------------------------------------------------------
 // Byte-budgeted crash-injection backend (same model as the SQL3-SQL5 suites).
 
@@ -1031,8 +1108,11 @@ void testCatalogPersistenceAndCompat() {
 
 // Builds a database with a multi-page index and returns the path plus the root
 // page id and a leaf page id for corruption tests.
-bool buildCorruptibleIndex(const std::string& path, uint32_t& rootOut,
-                           uint64_t& leafOut) {
+bool buildCorruptibleIndex(const std::string& path, uint32_t& indexIdOut,
+                           uint64_t& rootOut, uint64_t& leafOut) {
+    indexIdOut = 0;
+    rootOut = 0;
+    leafOut = 0;
     std::unique_ptr<Database> db = newDbWithPageSize(path, 512);
     if (!db) return false;
     {
@@ -1046,9 +1126,9 @@ bool buildCorruptibleIndex(const std::string& path, uint32_t& rootOut,
             return false;
         }
         uint32_t inserted = 0;
-        while (inserted < 200) {
+        while (inserted < 1600) {
             std::string script = "BEGIN;\n";
-            for (uint32_t i = 0; i < 80 && inserted < 200; ++i, ++inserted) {
+            for (uint32_t i = 0; i < 80 && inserted < 1600; ++i, ++inserted) {
                 script += "INSERT INTO T VALUES (" + std::to_string(inserted) + ", " +
                           std::to_string(inserted) + ");\n";
             }
@@ -1064,10 +1144,11 @@ bool buildCorruptibleIndex(const std::string& path, uint32_t& rootOut,
         db->close();
         return false;
     }
-    rootOut = static_cast<uint32_t>(rec->rootPageId);
+    indexIdOut = rec->indexId;
+    rootOut = rec->rootPageId;
     // Find a leaf by following child 0 from the root.
     uint64_t current = rec->rootPageId;
-    for (int depth = 0; depth < 8; ++depth) {
+    for (uint32_t depth = 0; depth <= kMaxIndexDepth; ++depth) {
         DatabasePage page;
         if (!db->readPage(current, page).isOk()) break;
         if (page.type == PageType::IndexLeaf) {
@@ -1083,13 +1164,568 @@ bool buildCorruptibleIndex(const std::string& path, uint32_t& rootOut,
     return true;
 }
 
+uint64_t pageCountFromImage(const std::vector<uint8_t>& bytes) {
+    return bytes.size() >= header_offset::PageCount + sizeof(uint64_t)
+        ? loadLe64(bytes.data() + header_offset::PageCount) : 0;
+}
+
+bool imagePagePayload(const std::vector<uint8_t>& bytes, uint64_t pageId,
+                      uint32_t pageSize, const uint8_t*& outPayload) {
+    outPayload = nullptr;
+    if (pageId > static_cast<uint64_t>(-1) / pageSize) return false;
+    const uint64_t pageBase64 = pageId * pageSize;
+    if (pageBase64 > bytes.size() || pageSize > bytes.size() - pageBase64) {
+        return false;
+    }
+    const size_t pageBase = static_cast<size_t>(pageBase64);
+    outPayload = bytes.data() + pageBase + kPageHeaderSize;
+    return true;
+}
+
+bool collectLeafChain(const std::vector<uint8_t>& bytes, uint32_t pageSize,
+                      uint64_t firstLeaf, std::vector<uint64_t>& outLeaves) {
+    outLeaves.clear();
+    const uint64_t pageCount = pageCountFromImage(bytes);
+    uint64_t current = firstLeaf;
+    while (current != 0 && outLeaves.size() < pageCount) {
+        const uint8_t* payload = nullptr;
+        if (current >= pageCount ||
+            !imagePagePayload(bytes, current, pageSize, payload) ||
+            loadLe16(bytes.data() + static_cast<size_t>(current) * pageSize +
+                     page_offset::PageType) !=
+                static_cast<uint16_t>(PageType::IndexLeaf)) {
+            return false;
+        }
+        outLeaves.push_back(current);
+        current = loadLe64(payload + 8);
+    }
+    return current == 0;
+}
+
+bool lastLeafLogicalKey(const std::vector<uint8_t>& bytes, uint64_t leafPageId,
+                        uint32_t pageSize, std::vector<uint8_t>& outKey) {
+    const uint8_t* payload = nullptr;
+    if (!imagePagePayload(bytes, leafPageId, pageSize, payload)) return false;
+    const uint32_t payloadCapacity = pageSize - kPageHeaderSize;
+    const uint32_t entryCount = loadLe32(payload + 16);
+    if (entryCount == 0 || entryCount > payloadCapacity / kIndexSlotSize) {
+        return false;
+    }
+    const uint32_t slotOffset =
+        payloadCapacity - kIndexSlotSize * entryCount;
+    const uint32_t entryOffset = loadLe32(payload + slotOffset);
+    if (entryOffset > payloadCapacity ||
+        payloadCapacity - entryOffset < kIndexLeafEntryOverhead) {
+        return false;
+    }
+    const uint32_t keyLength = loadLe32(payload + entryOffset);
+    if (keyLength == 0 || keyLength > payloadCapacity - entryOffset -
+                                          kIndexLeafEntryOverhead) {
+        return false;
+    }
+    outKey.assign(payload + entryOffset + 4,
+                  payload + entryOffset + 4 + keyLength);
+    return true;
+}
+
+bool setLeafNext(std::vector<uint8_t>& bytes, uint64_t leafPageId,
+                 uint64_t nextLeaf, uint32_t pageSize) {
+    const uint64_t pageCount = pageCountFromImage(bytes);
+    const uint8_t* ignored = nullptr;
+    if (leafPageId >= pageCount ||
+        !imagePagePayload(bytes, leafPageId, pageSize, ignored)) {
+        return false;
+    }
+    uint8_t* payload = bytes.data() + static_cast<size_t>(leafPageId) * pageSize +
+                       kPageHeaderSize;
+    storeLe64(payload + 8, nextLeaf);
+    fixPageCrc(bytes, leafPageId, pageSize);
+    return true;
+}
+
+uint64_t firstInternalChild(const std::vector<uint8_t>& bytes,
+                            uint64_t parentPageId, uint32_t pageSize,
+                            uint32_t childIndex = 0) {
+    const uint8_t* payload = nullptr;
+    if (!imagePagePayload(bytes, parentPageId, pageSize, payload)) return 0;
+    const uint32_t payloadCapacity = pageSize - kPageHeaderSize;
+    const uint32_t childCount = loadLe32(payload + 16);
+    if (childIndex >= childCount ||
+        static_cast<uint64_t>(kIndexSlotSize) * (childIndex + 1) >
+            payloadCapacity) {
+        return 0;
+    }
+    const uint32_t slotOffset =
+        payloadCapacity - kIndexSlotSize * (childIndex + 1);
+    const uint32_t childOffset = loadLe32(payload + slotOffset);
+    if (childOffset > payloadCapacity ||
+        payloadCapacity - childOffset < kIndexInternalEntryOverhead) {
+        return 0;
+    }
+    return loadLe64(payload + childOffset);
+}
+
+bool setInternalChild(std::vector<uint8_t>& bytes, uint64_t parentPageId,
+                      uint32_t childIndex, uint64_t childPageId,
+                      uint32_t pageSize) {
+    const uint64_t pageCount = pageCountFromImage(bytes);
+    const uint8_t* payloadView = nullptr;
+    if (parentPageId >= pageCount ||
+        !imagePagePayload(bytes, parentPageId, pageSize, payloadView)) {
+        return false;
+    }
+    const uint32_t payloadCapacity = pageSize - kPageHeaderSize;
+    const uint32_t childCount = loadLe32(payloadView + 16);
+    if (childIndex >= childCount) return false;
+    const uint32_t slotOffset =
+        payloadCapacity - kIndexSlotSize * (childIndex + 1);
+    const uint32_t childOffset = loadLe32(payloadView + slotOffset);
+    if (childOffset > payloadCapacity ||
+        payloadCapacity - childOffset < kIndexInternalEntryOverhead) {
+        return false;
+    }
+    uint8_t* payload = bytes.data() + static_cast<size_t>(parentPageId) * pageSize +
+                       kPageHeaderSize;
+    storeLe64(payload + childOffset, childPageId);
+    fixPageCrc(bytes, parentPageId, pageSize);
+    return true;
+}
+
+uint64_t findDataPage(const std::vector<uint8_t>& bytes, uint32_t pageSize) {
+    const uint64_t pageCount = pageCountFromImage(bytes);
+    for (uint64_t pageId = 1; pageId < pageCount; ++pageId) {
+        if (loadLe16(bytes.data() + static_cast<size_t>(pageId) * pageSize +
+                     page_offset::PageType) ==
+            static_cast<uint16_t>(PageType::Data)) {
+            return pageId;
+        }
+    }
+    return 0;
+}
+
+void testIndexPageVisitCycles() {
+    std::printf("index page visit tracker rejects CRC-valid graph cycles\n");
+    const uint32_t pageSize = 512;
+    const std::string base = uniquePath("r3qcyclebase");
+    uint32_t indexId = 0;
+    uint64_t rootPageId = 0;
+    uint64_t firstLeaf = 0;
+    CHECK(buildCorruptibleIndex(base, indexId, rootPageId, firstLeaf));
+    const std::vector<uint8_t> baseBytes = readFileBytes(base);
+    std::vector<uint64_t> leaves;
+    CHECK(collectLeafChain(baseBytes, pageSize, firstLeaf, leaves));
+    CHECK(leaves.size() >= 3);
+    std::vector<uint8_t> key;
+    CHECK(lastLeafLogicalKey(baseBytes, leaves.back(), pageSize, key));
+    std::vector<uint8_t> leftmostKey;
+    CHECK(lastLeafLogicalKey(baseBytes, leaves[0], pageSize, leftmostKey));
+
+    {
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(base, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation), DbStatus::Ok);
+            CHECK(validation.ok);
+            CHECK(validation.height >= 4);
+            std::vector<RowLocator> locators;
+            CHECK_STATUS(db->indexLookup(indexId, key, locators), DbStatus::Ok);
+            CHECK(locators.size() == 1);
+            IndexRangeBound unbounded;
+            CHECK_STATUS(db->indexRange(indexId, unbounded, locators), DbStatus::Ok);
+            CHECK(locators.size() == 1600);
+            db->close();
+        }
+    }
+
+    struct SiblingCycle {
+        const char* label;
+        size_t nextFromEnd;
+    } siblingCycles[] = {
+        {"self", 0},
+        {"two-page", 1},
+        {"three-page", 2},
+    };
+    for (size_t c = 0; c < sizeof(siblingCycles) / sizeof(siblingCycles[0]); ++c) {
+        std::vector<uint8_t> bytes = baseBytes;
+        const size_t lastIndex = leaves.size() - 1;
+        const uint64_t nextLeaf =
+            leaves[lastIndex - siblingCycles[c].nextFromEnd];
+        CHECK(setLeafNext(bytes, leaves.back(), nextLeaf, pageSize));
+        const std::string work = uniquePath(std::string("r3q-sibling-") +
+                                            siblingCycles[c].label);
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            std::vector<RowLocator> locators;
+            CHECK_STATUS(db->indexLookup(indexId, key, locators),
+                         DbStatus::CorruptPage);
+            CHECK(locators.empty());
+            IndexRangeBound unbounded;
+            CHECK_STATUS(db->indexRange(indexId, unbounded, locators),
+                         DbStatus::CorruptPage);
+            CHECK(locators.empty());
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            CHECK(validation.message.find("leaf chain cycle") != std::string::npos);
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    {
+        std::vector<uint8_t> bytes = baseBytes;
+        CHECK(setLeafNext(bytes, leaves.back(), pageCountFromImage(baseBytes),
+                          pageSize));
+        const std::string work = uniquePath("r3q-sibling-out-of-range");
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            std::vector<RowLocator> locators;
+            CHECK_STATUS(db->indexLookup(indexId, key, locators),
+                         DbStatus::CorruptPage);
+            IndexRangeBound unbounded;
+            CHECK_STATUS(db->indexRange(indexId, unbounded, locators),
+                         DbStatus::CorruptPage);
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    const uint64_t rootChild = firstInternalChild(baseBytes, rootPageId,
+                                                   pageSize);
+    const uint64_t secondInternal = firstInternalChild(baseBytes, rootChild,
+                                                        pageSize);
+    CHECK(rootChild != 0 && secondInternal != 0);
+    CHECK(loadLe16(baseBytes.data() + static_cast<size_t>(rootChild) * pageSize +
+                   page_offset::PageType) ==
+          static_cast<uint16_t>(PageType::IndexInternal));
+    CHECK(loadLe16(baseBytes.data() + static_cast<size_t>(secondInternal) * pageSize +
+                   page_offset::PageType) ==
+          static_cast<uint16_t>(PageType::IndexInternal));
+
+    struct ChildCorruption {
+        const char* label;
+        uint64_t parent;
+        uint32_t childIndex;
+        uint64_t child;
+    } childCases[] = {
+        {"self", rootPageId, 0, rootPageId},
+        {"two-page", rootChild, 0, rootPageId},
+        {"three-page", secondInternal, 0, rootPageId},
+    };
+    for (size_t c = 0; c < sizeof(childCases) / sizeof(childCases[0]); ++c) {
+        std::vector<uint8_t> bytes = baseBytes;
+        CHECK(setInternalChild(bytes, childCases[c].parent,
+                               childCases[c].childIndex, childCases[c].child,
+                               pageSize));
+        const std::string work = uniquePath(std::string("r3q-child-") +
+                                            childCases[c].label);
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            CHECK(validation.message == "index tree cycle");
+            std::vector<RowLocator> locators;
+            CHECK_STATUS(db->indexLookup(indexId, leftmostKey, locators),
+                         DbStatus::CorruptPage);
+            IndexRangeBound unbounded;
+            CHECK_STATUS(db->indexRange(indexId, unbounded, locators),
+                         DbStatus::CorruptPage);
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    struct InvalidChild {
+        const char* label;
+        uint64_t child;
+    } invalidChildren[] = {
+        {"out-of-range", pageCountFromImage(baseBytes)},
+        {"wrong-page-type", findDataPage(baseBytes, pageSize)},
+    };
+    for (size_t c = 0; c < sizeof(invalidChildren) / sizeof(invalidChildren[0]); ++c) {
+        std::vector<uint8_t> bytes = baseBytes;
+        CHECK(invalidChildren[c].child != 0);
+        CHECK(setInternalChild(bytes, rootPageId, 0, invalidChildren[c].child,
+                               pageSize));
+        const std::string work = uniquePath(std::string("r3q-invalid-child-") +
+                                            invalidChildren[c].label);
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    {
+        std::vector<uint8_t> bytes = baseBytes;
+        CHECK(setInternalChild(bytes, rootPageId, 0, leaves[0], pageSize));
+        const std::string work = uniquePath("r3q-invalid-level");
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            CHECK(validation.message.find("differing heights") !=
+                  std::string::npos);
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    {
+        std::vector<uint8_t> bytes = baseBytes;
+        const uint64_t child0 = firstInternalChild(baseBytes, rootPageId,
+                                                   pageSize, 0);
+        CHECK(setInternalChild(bytes, rootPageId, 1, child0, pageSize));
+        const std::string work = uniquePath("r3q-repeated-child");
+        CHECK(writeFileBytes(work, bytes));
+        std::unique_ptr<Database> db;
+        CHECK_STATUS(Database::open(work, DatabaseOpenOptions(), db), DbStatus::Ok);
+        if (db) {
+            IndexValidation validation;
+            CHECK_STATUS(db->validateIndex(indexId, validation),
+                         DbStatus::CorruptPage);
+            CHECK(!validation.ok);
+            CHECK(validation.message == "index tree cycle");
+            db->close();
+        }
+        removeFile(work);
+        removeFile(walPath(work));
+    }
+
+    removeFile(base);
+    removeFile(walPath(base));
+}
+
+void testIndexVisitAllocatorFailures() {
+    std::printf("index page visit allocation failures propagate and retry\n");
+    SizeFaultAllocatorState allocatorState;
+    const GxAllocator allocator = makeSizeFaultAllocator(allocatorState);
+    const std::string path = uniquePath("r3q-allocator");
+    DatabaseCreateOptions createOptions;
+    createOptions.pageSize = 512;
+    createOptions.bufferCapacity = 64;
+    createOptions.pageCacheAllocator = &allocator;
+    createOptions.transactionPageAllocator = &allocator;
+    std::unique_ptr<Database> db;
+    CHECK_STATUS(Database::create(path, createOptions, db), DbStatus::Ok);
+    if (!db) return;
+
+    SqlEngine engine(*db);
+    CHECK(execOk(engine,
+                 "CREATE TABLE T (Id INT64 PRIMARY KEY, K INT64 NOT NULL);"));
+    CHECK(execOk(engine, "CREATE INDEX IX_T_K ON T (K);"));
+    for (int first = 0; first < 160; first += 16) {
+        std::string script = "BEGIN;\n";
+        for (int value = first; value < first + 16; ++value) {
+            script += "INSERT INTO T VALUES (" + std::to_string(value) + ", " +
+                      std::to_string(value) + ");\n";
+        }
+        script += "COMMIT;\n";
+        CHECK(execOk(engine, script));
+    }
+
+    const Catalog::IndexRecord* index = db->catalog().findIndex("IX_T_K");
+    CHECK(index != nullptr);
+    if (index == nullptr) {
+        db->close();
+        db.reset();
+        return;
+    }
+    const uint32_t indexId = index->indexId;
+    std::vector<uint8_t> key;
+    CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(137), key));
+    std::vector<RowLocator> locators;
+    CHECK_STATUS(db->indexLookup(indexId, key, locators), DbStatus::Ok);
+    CHECK(locators.size() == 1);
+    IndexRangeBound unbounded;
+    CHECK_STATUS(db->indexRange(indexId, unbounded, locators), DbStatus::Ok);
+    CHECK(locators.size() == 160);
+    IndexValidation validation;
+    CHECK_STATUS(db->validateIndex(indexId, validation), DbStatus::Ok);
+    CHECK(validation.ok);
+    CHECK(validation.entryCount == 160);
+
+    // All index pages are resident before injecting the first table growth
+    // allocation. A page visit table starts with sixteen 64-bit slots.
+    const std::vector<uint8_t> diskBeforeFailures = readFileBytes(path);
+    const size_t outstandingBeforeFailures = allocatorState.outstanding;
+    const uint32_t dirtyBeforeFailures = db->diagnostics().bufferDirty;
+    const size_t trackerBytes = 16 * sizeof(uint64_t);
+    failOnSizeOccurrence(allocatorState, trackerBytes, 1);
+    DbResult failedLookup = db->indexLookup(indexId, key, locators);
+    disableSizeFailure(allocatorState);
+    CHECK_STATUS(failedLookup, DbStatus::NoSpace);
+    CHECK(failedLookup.message() ==
+          "index page visit bookkeeping unavailable");
+    CHECK(allocatorState.failures == 1);
+    CHECK(locators.empty());
+    CHECK(allocatorState.outstanding == outstandingBeforeFailures);
+
+    failOnSizeOccurrence(allocatorState, trackerBytes, 1);
+    DbResult failedRange = db->indexRange(indexId, unbounded, locators);
+    disableSizeFailure(allocatorState);
+    CHECK_STATUS(failedRange, DbStatus::NoSpace);
+    CHECK(failedRange.message() ==
+          "index page visit bookkeeping unavailable");
+    CHECK(allocatorState.failures == 2);
+    CHECK(locators.empty());
+    CHECK(allocatorState.outstanding == outstandingBeforeFailures);
+
+    const size_t growthBytes = 32 * sizeof(uint64_t);
+    failOnSizeOccurrence(allocatorState, growthBytes, 1);
+    DbResult failedGrowthRange = db->indexRange(indexId, unbounded, locators);
+    disableSizeFailure(allocatorState);
+    CHECK_STATUS(failedGrowthRange, DbStatus::NoSpace);
+    CHECK(failedGrowthRange.message() ==
+          "index page visit bookkeeping unavailable");
+    CHECK(allocatorState.failures == 3);
+    CHECK(locators.empty());
+    CHECK(allocatorState.outstanding == outstandingBeforeFailures);
+
+    validation = IndexValidation();
+    failOnSizeOccurrence(allocatorState, trackerBytes, 1);
+    DbResult failedValidation = db->validateIndex(indexId, validation);
+    disableSizeFailure(allocatorState);
+    CHECK_STATUS(failedValidation, DbStatus::NoSpace);
+    CHECK(failedValidation.message() ==
+          "index page visit bookkeeping unavailable");
+    CHECK(allocatorState.failures == 4);
+    CHECK(!validation.ok);
+    CHECK(allocatorState.outstanding == outstandingBeforeFailures);
+    CHECK(readFileBytes(path) == diskBeforeFailures);
+    CHECK(db->diagnostics().bufferDirty == dirtyBeforeFailures);
+
+    CHECK_STATUS(db->indexLookup(indexId, key, locators), DbStatus::Ok);
+    CHECK(locators.size() == 1);
+    CHECK_STATUS(db->indexRange(indexId, unbounded, locators), DbStatus::Ok);
+    CHECK(locators.size() == 160);
+    CHECK_STATUS(db->validateIndex(indexId, validation), DbStatus::Ok);
+    CHECK(validation.ok);
+
+    CHECK(execOk(engine, "BEGIN;"));
+    CHECK(execOk(engine, "INSERT INTO T VALUES (1000, 1000);"));
+    Transaction* transaction = db->activeTransaction();
+    CHECK(transaction != nullptr);
+    const uint32_t priorModifiedPages = transaction
+        ? transaction->modifiedPageCount() : 0;
+    const uint64_t priorFinalPageCount = transaction
+        ? transaction->finalPageCount() : 0;
+    const size_t priorOutstanding = allocatorState.outstanding;
+
+    bool trackerFailureReached = false;
+    for (size_t occurrence = 1; occurrence <= 8 && !trackerFailureReached;
+         ++occurrence) {
+        failOnSizeOccurrence(allocatorState, trackerBytes, occurrence);
+        SqlExecutionResult failedInsert =
+            engine.execute("INSERT INTO T VALUES (1001, 1001);");
+        disableSizeFailure(allocatorState);
+        if (!failedInsert.ok && failedInsert.error.message.find(
+                "index page visit bookkeeping unavailable") != std::string::npos) {
+            trackerFailureReached = true;
+            CHECK(failedInsert.error.code == SqlErrorCode::ResourceLimit);
+            CHECK(allocatorState.failures == 4 + occurrence);
+        } else {
+            CHECK(!failedInsert.ok);
+            CHECK(failedInsert.error.code == SqlErrorCode::ResourceLimit);
+        }
+        transaction = db->activeTransaction();
+        CHECK(transaction != nullptr);
+        CHECK(transaction && transaction->modifiedPageCount() ==
+                                 priorModifiedPages);
+        CHECK(transaction && transaction->finalPageCount() ==
+                                 priorFinalPageCount);
+        CHECK(allocatorState.outstanding == priorOutstanding);
+    }
+    CHECK(trackerFailureReached);
+
+    bool queryOk = false;
+    CHECK(execRowCount(engine, "SELECT Id FROM T WHERE Id = 1000;", queryOk) == 1);
+    CHECK(queryOk);
+    CHECK(execRowCount(engine, "SELECT Id FROM T WHERE Id = 1001;", queryOk) == 0);
+    CHECK(queryOk);
+    CHECK(execOk(engine, "INSERT INTO T VALUES (1001, 1001);"));
+    CHECK(execOk(engine, "COMMIT;"));
+    CHECK_STATUS(db->validateIndex(indexId, validation), DbStatus::Ok);
+    CHECK(validation.ok);
+    CHECK(validation.entryCount == 162);
+    CHECK_STATUS(db->indexLookup(indexId, key, locators), DbStatus::Ok);
+    CHECK(locators.size() == 1);
+
+    CHECK(db->close().isOk());
+    db.reset();
+    CHECK(allocatorState.outstanding == 0);
+    CHECK(allocatorState.successfulAllocations == allocatorState.frees);
+
+    DatabaseOpenOptions openOptions;
+    openOptions.pageCacheAllocator = &allocator;
+    openOptions.transactionPageAllocator = &allocator;
+    std::unique_ptr<Database> reopened;
+    CHECK_STATUS(Database::open(path, openOptions, reopened), DbStatus::Ok);
+    if (reopened) {
+        const Catalog::IndexRecord* reopenedIndex =
+            reopened->catalog().findIndex("IX_T_K");
+        CHECK(reopenedIndex != nullptr);
+        if (reopenedIndex) {
+            CHECK_STATUS(reopened->validateIndex(reopenedIndex->indexId, validation),
+                         DbStatus::Ok);
+            CHECK(validation.ok);
+            CHECK(validation.entryCount == 162);
+            CHECK_STATUS(reopened->indexLookup(reopenedIndex->indexId, key,
+                                               locators), DbStatus::Ok);
+            CHECK(locators.size() == 1);
+        }
+        SqlEngine reopenedEngine(*reopened);
+        CHECK(execRowCount(reopenedEngine,
+                           "SELECT Id FROM T WHERE Id = 1000;", queryOk) == 1);
+        CHECK(queryOk);
+        CHECK(execRowCount(reopenedEngine,
+                           "SELECT Id FROM T WHERE Id = 1001;", queryOk) == 1);
+        CHECK(queryOk);
+        CHECK(reopened->close().isOk());
+    }
+    reopened.reset();
+    CHECK(allocatorState.outstanding == 0);
+    removeFile(path);
+    removeFile(walPath(path));
+}
+
 void testIndexCorruption() {
     std::printf("index page corruption fails safely\n");
     const uint32_t pageSize = 512;
     const std::string base = uniquePath("sql6corruptbase");
-    uint32_t root = 0;
+    uint32_t indexId = 0;
+    uint64_t root = 0;
     uint64_t leaf = 0;
-    CHECK(buildCorruptibleIndex(base, root, leaf));
+    CHECK(buildCorruptibleIndex(base, indexId, root, leaf));
     CHECK(root != 0 && leaf != 0);
     const std::vector<uint8_t> baseBytes = readFileBytes(base);
 
@@ -1099,24 +1735,29 @@ void testIndexCorruption() {
     struct Case {
         const char* name;
         uint64_t pageId;
-        size_t payloadOffset;
+        size_t byteOffset;
         uint8_t value;
+        bool pageHeader;
     };
     Case cases[] = {
-        {"root type", root, page_offset::PageType, 2},
-        {"leaf magic", leaf, 0, 0x00},
-        {"leaf version", leaf, 4, 99},
-        {"leaf entry count", leaf, 16, 0xFF},
-        {"leaf slot offset", leaf, 0, 0x00},
-        {"leaf owner id", leaf, 20, 0xAB},
+        {"root type", root, page_offset::PageType, 2, true},
+        {"leaf magic", leaf, 0, 0x00, false},
+        {"leaf version", leaf, 4, 99, false},
+        {"leaf entry count", leaf, 16, 0xFF, false},
+        {"leaf slot offset", leaf, 0, 0x00, false},
+        {"leaf owner id", leaf, 20, 0xAB, false},
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); ++c) {
         const std::string work = uniquePath("sql6corrupt");
         std::vector<uint8_t> bytes = baseBytes;
         const size_t pageBase =
             static_cast<size_t>(cases[c].pageId) * pageSize + kPageHeaderSize;
-        if (pageBase + cases[c].payloadOffset < bytes.size()) {
-            bytes[pageBase + cases[c].payloadOffset] = cases[c].value;
+        const size_t byteOffset = cases[c].pageHeader
+            ? static_cast<size_t>(cases[c].pageId) * pageSize +
+                  cases[c].byteOffset
+            : pageBase + cases[c].byteOffset;
+        if (byteOffset < bytes.size()) {
+            bytes[byteOffset] = cases[c].value;
             fixPageCrc(bytes, cases[c].pageId, pageSize);
         }
         writeFileBytes(work, bytes);
@@ -1130,7 +1771,7 @@ void testIndexCorruption() {
                 std::vector<RowLocator> locators;
                 std::vector<uint8_t> key;
                 encodeIndexKey(DbType::Int64, DbValue::int64(0), key);
-                DbResult r = db->indexLookup(root, key, locators);
+                DbResult r = db->indexLookup(indexId, key, locators);
                 if (!r.isOk()) failed = true;
             } else {
                 failed = true;
@@ -1640,6 +2281,15 @@ int main() {
     cmd = "del /q \"" + dir + "\\*.gxwal\" >nul 2>nul";
     std::system(cmd.c_str());
 
+    if (std::getenv("GXOS_SQL_R3Q_ONLY") != nullptr) {
+        const int r3qCheckStart = g_pass;
+        testIndexPageVisitCycles();
+        testIndexVisitAllocatorFailures();
+        std::printf("R3Q focused checks: %d passed, %d failed\n",
+                    g_pass - r3qCheckStart, g_fail);
+        return g_fail == 0 ? 0 : 1;
+    }
+
     testKeyEncoding();
     testPrimaryKeyAndUniqueSemantics();
     testMultiRowUniqueUpdate();
@@ -1655,6 +2305,10 @@ int main() {
     testAccessPathEquivalence();
     testCatalogPersistenceAndCompat();
     testIndexCorruption();
+    const int r3qCheckStart = g_pass;
+    testIndexPageVisitCycles();
+    testIndexVisitAllocatorFailures();
+    std::printf("R3Q focused checks: %d passed\n", g_pass - r3qCheckStart);
     testCrashMatrices();
     testHostileSql();
     testDeterministicDataset();

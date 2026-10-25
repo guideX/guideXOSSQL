@@ -561,7 +561,8 @@ DbResult maintainIndexes(Database& db, uint32_t tableId,
             continue;
         }
 
-        IndexTree tree(db.pages(), type, rec.indexId, db.activeTransaction());
+        IndexTree tree(db.pages(), type, rec.indexId, db.activeTransaction(),
+                       db.scratchAllocator());
         uint64_t root = rec.rootPageId;
         uint64_t removedCount = 0;
         for (size_t i = 0; i < removals.size(); ++i) {
@@ -721,7 +722,8 @@ DbResult enforceChildForeignKeys(Database& db, uint32_t tableId,
             return DbResult::error(DbStatus::Internal, "FK key encoding failed");
         }
         IndexTree tree(db.pages(), parentTable->columns[parentRec->columnOrdinal].type,
-                       parentRec->indexId);
+                       parentRec->indexId, db.activeTransaction(),
+                       db.scratchAllocator());
         std::vector<IndexEntry> entries;
         DbResult result = tree.lookupAll(key, parentRec->rootPageId, entries);
         if (!result.isOk()) {
@@ -837,7 +839,8 @@ DbResult enforceParentForeignKeys(Database& db, uint32_t tableId,
                 return DbResult::error(DbStatus::Internal, "FK key encoding failed");
             }
             IndexTree tree(db.pages(), childTable->columns[fk.childColumnOrdinal].type,
-                           supportRec->indexId);
+                           supportRec->indexId, db.activeTransaction(),
+                           db.scratchAllocator());
             std::vector<IndexEntry> entries;
             DbResult result = tree.lookupAll(key, supportRec->rootPageId, entries);
             if (!result.isOk()) {
@@ -1065,7 +1068,8 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
         if (targets[i].record.unique() &&
             !encodedKeyIsNull(keys[i].data(), keys[i].size()) &&
             targets[i].record.rootPageId != 0) {
-            IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId);
+            IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId,
+                           _db.activeTransaction(), _db.scratchAllocator());
             std::vector<IndexEntry> existing;
             result = tree.lookupAll(keys[i], targets[i].record.rootPageId, existing);
             if (!result.isOk()) {
@@ -1096,7 +1100,7 @@ DbResult Table::insertInTransaction(const std::vector<DbValue>& values) {
 
     for (size_t i = 0; i < targets.size(); ++i) {
         IndexTree tree(_db.pages(), targets[i].type, targets[i].record.indexId,
-                       _db.activeTransaction());
+                       _db.activeTransaction(), _db.scratchAllocator());
         uint64_t root = targets[i].record.rootPageId;
         if (root == 0) {
             result = tree.createEmpty(root);

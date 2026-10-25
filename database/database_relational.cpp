@@ -116,6 +116,11 @@ PageAccess& Database::pages() {
     return *this;
 }
 
+const GxAllocator* Database::scratchAllocator() const {
+    if (_activeTx != nullptr) return &_activeTx->pageAllocator();
+    return _buffer ? &_buffer->scratchAllocator() : nullptr;
+}
+
 DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
@@ -1119,7 +1124,8 @@ DbResult Database::buildIndex(uint32_t indexId) {
     const uint32_t maxKey = maxIndexKeyBytes(pageSize());
     const bool unique = rec->unique();
 
-    IndexTree tree(pages(), type, indexId, activeTransaction());
+    IndexTree tree(pages(), type, indexId, activeTransaction(),
+                   scratchAllocator());
     uint64_t root = rec->rootPageId;
     uint64_t entryCount = 0;
 
@@ -1254,7 +1260,8 @@ DbResult Database::indexLookup(uint32_t indexId, const std::vector<uint8_t>& log
     if (table == nullptr) {
         return DbResult::error(DbStatus::Internal, "index table not found");
     }
-    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId,
+                   activeTransaction(), scratchAllocator());
     std::vector<IndexEntry> entries;
     DbResult result = tree.lookupAll(logicalKey, rec->rootPageId, entries);
     if (!result.isOk()) {
@@ -1281,7 +1288,8 @@ DbResult Database::indexRange(uint32_t indexId, const IndexRangeBound& bound,
     if (table == nullptr) {
         return DbResult::error(DbStatus::Internal, "index table not found");
     }
-    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId,
+                   activeTransaction(), scratchAllocator());
     std::vector<IndexEntry> entries;
     DbResult result = tree.rangeScan(bound, rec->rootPageId, entries);
     if (!result.isOk()) {
@@ -1308,7 +1316,8 @@ DbResult Database::validateIndex(uint32_t indexId, IndexValidation& out) {
         out.ok = true;
         return DbResult::ok();
     }
-    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId);
+    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId,
+                   activeTransaction(), scratchAllocator());
     return tree.validate(rec->rootPageId, out);
 }
 

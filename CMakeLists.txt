@@ -23,6 +23,7 @@ add_library(gxos_database STATIC
     database/portable/gx_allocator.cpp
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
+    database/portable/gx_page_visit_set.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
@@ -157,6 +158,7 @@ add_executable(database_portable_runtime_test
     database/portable/gx_allocator.cpp
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
+    database/portable/gx_page_visit_set.cpp
     database/portable/gx_owner.cpp
     database/portable/gx_string.cpp
     tests/gx_test_allocator.cpp

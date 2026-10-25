@@ -46,6 +46,7 @@ $sources = @(
     "database/portable/gx_allocator.cpp",
     "database/portable/gx_allocator_hosted.cpp",
     "database/portable/gx_array.cpp",
+    "database/portable/gx_page_visit_set.cpp",
     "database/portable/gx_owned_page.cpp",
     "database/portable/gx_heap_page_builder.cpp",
     "database/portable/gx_recovered_pages.cpp",

@@ -8,6 +8,7 @@
 #include "gx_allocator_hosted.h"
 #include "gx_array.h"
 #include "gx_owner.h"
+#include "gx_page_visit_set.h"
 #include "gx_string.h"
 #include "gx_test_allocator.h"
 
@@ -171,6 +172,116 @@ void testAllocationFailure() {
     gxArenaDisableFailure(&arena);
     gxArrayDestroy(&firstFailure);
     CHECK(arena.outstanding == 0);
+}
+
+void testPageVisitSet() {
+    GxArena arena;
+    gxArenaInit(&arena, 8192);
+    GxAllocator allocator = {};
+    gxArenaMakeAllocator(&arena, &allocator);
+
+    GxPageVisitSet visits;
+    CHECK(visits.init(&allocator, 65, 64) == GxStatus::Ok);
+    CHECK(visits.initialized());
+    CHECK(visits.size() == 0);
+    CHECK(visits.capacity() == 0);
+    CHECK(visits.maximumVisits() == 64);
+    CHECK(arena.outstanding == 0);
+
+    bool revisited = true;
+    CHECK(visits.visit(1, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    CHECK(visits.size() == 1);
+    CHECK(visits.capacity() == 16);
+    CHECK(visits.visit(1, revisited) == GxStatus::Ok);
+    CHECK(revisited);
+    for (uint64_t pageId = 2; pageId <= 40; ++pageId) {
+        CHECK(visits.visit(pageId, revisited) == GxStatus::Ok);
+        CHECK(!revisited);
+    }
+    CHECK(visits.size() == 40);
+    CHECK(visits.capacity() <= visits.maximumCapacity());
+    CHECK(visits.capacity() >= 64);
+    for (uint64_t pageId = 1; pageId <= 40; ++pageId) {
+        CHECK(visits.visit(pageId, revisited) == GxStatus::Ok);
+        CHECK(revisited);
+    }
+    CHECK(visits.visit(0, revisited) == GxStatus::CorruptData);
+    CHECK(visits.visit(65, revisited) == GxStatus::CorruptData);
+    const size_t retainedCapacity = visits.capacity();
+    CHECK(visits.reset() == GxStatus::Ok);
+    CHECK(visits.size() == 0);
+    CHECK(visits.capacity() == retainedCapacity);
+    CHECK(visits.visit(40, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    visits.destroy();
+    visits.destroy();
+    CHECK(!visits.initialized());
+    CHECK(arena.outstanding == 0);
+    CHECK(arena.invalidFrees == 0);
+    CHECK(visits.init(&allocator, 65, 64) == GxStatus::Ok);
+    CHECK(visits.visit(40, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    visits.destroy();
+
+    GxPageVisitSet bounded;
+    CHECK(bounded.init(&allocator, 100, 2) == GxStatus::Ok);
+    CHECK(bounded.maximumCapacity() == 4);
+    CHECK(bounded.visit(1, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    CHECK(bounded.visit(99, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    CHECK(bounded.visit(2, revisited) == GxStatus::ResourceLimit);
+    CHECK(!revisited);
+    CHECK(bounded.size() == 2);
+    CHECK(bounded.visit(99, revisited) == GxStatus::Ok);
+    CHECK(revisited);
+    bounded.destroy();
+
+    GxArena initialFailureArena;
+    gxArenaInit(&initialFailureArena, 8192);
+    GxAllocator initialFailureAllocator = {};
+    gxArenaMakeAllocator(&initialFailureArena, &initialFailureAllocator);
+    GxPageVisitSet initialFailure;
+    CHECK(initialFailure.init(&initialFailureAllocator, 100, 99) == GxStatus::Ok);
+    gxArenaFailAfter(&initialFailureArena, 0);
+    CHECK(initialFailure.visit(1, revisited) == GxStatus::OutOfMemory);
+    CHECK(initialFailure.size() == 0);
+    CHECK(initialFailure.capacity() == 0);
+    CHECK(initialFailureArena.outstanding == 0);
+    gxArenaDisableFailure(&initialFailureArena);
+    CHECK(initialFailure.visit(1, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    initialFailure.destroy();
+    CHECK(initialFailureArena.outstanding == 0);
+    CHECK(initialFailureArena.invalidFrees == 0);
+
+    GxArena growthFailureArena;
+    gxArenaInit(&growthFailureArena, 8192);
+    GxAllocator growthFailureAllocator = {};
+    gxArenaMakeAllocator(&growthFailureArena, &growthFailureAllocator);
+    GxPageVisitSet growthFailure;
+    CHECK(growthFailure.init(&growthFailureAllocator, 100, 99) == GxStatus::Ok);
+    for (uint64_t pageId = 1; pageId <= 12; ++pageId) {
+        CHECK(growthFailure.visit(pageId, revisited) == GxStatus::Ok);
+        CHECK(!revisited);
+    }
+    CHECK(growthFailure.capacity() == 16);
+    gxArenaFailAfter(&growthFailureArena, 0);
+    CHECK(growthFailure.visit(13, revisited) == GxStatus::OutOfMemory);
+    CHECK(growthFailure.size() == 12);
+    CHECK(growthFailure.capacity() == 16);
+    CHECK(growthFailureArena.outstanding == 1);
+    CHECK(growthFailure.visit(12, revisited) == GxStatus::Ok);
+    CHECK(revisited);
+    gxArenaDisableFailure(&growthFailureArena);
+    CHECK(growthFailure.visit(13, revisited) == GxStatus::Ok);
+    CHECK(!revisited);
+    CHECK(growthFailure.size() == 13);
+    CHECK(growthFailure.capacity() == 32);
+    growthFailure.destroy();
+    CHECK(growthFailureArena.outstanding == 0);
+    CHECK(growthFailureArena.invalidFrees == 0);
 }
 
 struct PartialBundle {
@@ -433,6 +544,7 @@ void testHostedAdapterAndStatusMappingSurface() {
 int main() {
     testAllocatorContract();
     testAllocationFailure();
+    testPageVisitSet();
     testOwnerPartialCleanup();
     testArrayEdgesAndReferenceModel();
     testStringEdgesAndReferenceModel();

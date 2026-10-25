@@ -24,7 +24,6 @@
 //   * The root page id is owned by the durable catalog index record.
 
 #include <stdint.h>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -36,6 +35,8 @@
 #include "database_types.h"
 
 struct GxArray;
+struct GxAllocator;
+class GxPageVisitSet;
 
 namespace gxos {
 namespace db {
@@ -106,6 +107,8 @@ public:
     // images with its allocator and publish them through checked staging.
     IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
               Transaction* transaction = nullptr);
+    IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
+              Transaction* transaction, const GxAllocator* traversalAllocator);
 
     // Allocates a fresh empty leaf page and returns its id. Used to seed a new
     // index before its catalog record is persisted.
@@ -259,7 +262,8 @@ private:
                            uint64_t& outRootPageId);
 
     // Recursive structural validator used by validate().
-    DbResult validateNode(uint64_t pageId, uint32_t depth, std::set<uint64_t>& visited,
+    DbResult validateNode(uint64_t pageId, uint32_t depth,
+                          ::GxPageVisitSet& visited,
                           uint64_t& entryCount, uint32_t& outHeight,
                           uint32_t& pagesVisited, std::string& error) const;
 
@@ -267,6 +271,7 @@ private:
     DbType _keyType;
     uint32_t _indexId;
     Transaction* _transaction;
+    const GxAllocator* _traversalAllocator;
 };
 
 } // namespace db

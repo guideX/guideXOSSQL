@@ -4,11 +4,11 @@
 #include <cmath>
 #include <cstring>
 #include <new>
-#include <set>
 
 #include "database_endian.h"
 #include "database_transaction.h"
 #include "portable/gx_array.h"
+#include "portable/gx_page_visit_set.h"
 
 namespace gxos {
 namespace db {
@@ -919,7 +919,47 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
 IndexTree::IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
                      Transaction* transaction)
     : _pages(pages), _keyType(keyType), _indexId(indexId),
-      _transaction(transaction) {}
+      _transaction(transaction), _traversalAllocator(nullptr) {}
+
+IndexTree::IndexTree(PageAccess& pages, DbType keyType, uint32_t indexId,
+                     Transaction* transaction,
+                     const GxAllocator* traversalAllocator)
+    : _pages(pages), _keyType(keyType), _indexId(indexId),
+      _transaction(transaction), _traversalAllocator(traversalAllocator) {}
+
+namespace {
+
+DbResult pageVisitTrackerError(GxStatus status) {
+    if (status == GxStatus::CorruptData) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index page visit id out of range");
+    }
+    if (status == GxStatus::OutOfMemory || status == GxStatus::ResourceLimit ||
+        status == GxStatus::Overflow) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index page visit bookkeeping unavailable");
+    }
+    return DbResult::error(DbStatus::Internal,
+                           "index page visit tracker contract failed");
+}
+
+DbResult initializePageVisitTracker(::GxPageVisitSet& tracker,
+                                    const GxAllocator* allocator,
+                                    uint64_t pageCount) {
+    if (pageCount == 0 || pageCount > kMaxPageCount) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index logical page count out of range");
+    }
+    if (allocator == nullptr) {
+        return DbResult::error(DbStatus::NoSpace,
+                               "index page visit allocator unavailable");
+    }
+    const GxStatus status = tracker.init(allocator, pageCount, pageCount - 1);
+    return status == GxStatus::Ok ? DbResult::ok()
+                                  : pageVisitTrackerError(status);
+}
+
+} // namespace
 
 uint32_t IndexTree::capacity() const {
     return DatabasePage::payloadCapacity(_pages.pageSize());
@@ -2189,15 +2229,20 @@ DbResult IndexTree::lookupAll(const std::vector<uint8_t>& logicalKey, uint64_t r
     }
 
     const uint64_t pageCount = _pages.pageCount();
-    std::set<uint64_t> visited;
+    ::GxPageVisitSet visited;
+    result = initializePageVisitTracker(visited, _traversalAllocator,
+                                        pageCount);
+    if (!result.isOk()) return result;
     while (leaf != 0) {
         if (leaf >= pageCount) {
             return DbResult::error(DbStatus::CorruptPage, "index leaf chain out of range");
         }
-        if (!visited.insert(leaf).second) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf chain cycle");
+        bool revisited = false;
+        const GxStatus visitStatus = visited.visit(leaf, revisited);
+        if (visitStatus != GxStatus::Ok) {
+            return pageVisitTrackerError(visitStatus);
         }
-        if (visited.size() > pageCount) {
+        if (revisited) {
             return DbResult::error(DbStatus::CorruptPage, "index leaf chain cycle");
         }
         DatabasePage page;
@@ -2936,15 +2981,21 @@ DbResult IndexTree::rangeScan(const IndexRangeBound& bound, uint64_t rootPageId,
     }
 
     const uint64_t pageCount = _pages.pageCount();
-    std::set<uint64_t> visited;
+    ::GxPageVisitSet visited;
+    DbResult trackerResult = initializePageVisitTracker(visited,
+                                                          _traversalAllocator,
+                                                          pageCount);
+    if (!trackerResult.isOk()) return trackerResult;
     while (leaf != 0) {
         if (leaf >= pageCount) {
             return DbResult::error(DbStatus::CorruptPage, "index leaf chain out of range");
         }
-        if (!visited.insert(leaf).second) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf chain cycle");
+        bool revisited = false;
+        const GxStatus visitStatus = visited.visit(leaf, revisited);
+        if (visitStatus != GxStatus::Ok) {
+            return pageVisitTrackerError(visitStatus);
         }
-        if (visited.size() > pageCount) {
+        if (revisited) {
             return DbResult::error(DbStatus::CorruptPage, "index leaf chain cycle");
         }
         DatabasePage page;
@@ -3000,18 +3051,31 @@ DbResult IndexTree::validate(uint64_t rootPageId, IndexValidation& out) const {
         return DbResult::error(DbStatus::CorruptPage, out.message);
     }
 
-    std::set<uint64_t> visited;
+    ::GxPageVisitSet visited;
+    DbResult result = initializePageVisitTracker(visited,
+                                                  _traversalAllocator,
+                                                  _pages.pageCount());
+    if (!result.isOk()) {
+        out.message = result.message();
+        return result;
+    }
     uint64_t entryCount = 0;
     uint32_t height = 0;
     uint32_t pagesVisited = 0;
     std::string error;
-    DbResult result = validateNode(rootPageId, 0, visited, entryCount, height,
-                                   pagesVisited, error);
+    result = validateNode(rootPageId, 0, visited, entryCount, height,
+                          pagesVisited, error);
     out.pagesVisited = pagesVisited;
     if (!result.isOk()) {
         out.ok = false;
         out.message = error.empty() ? result.message() : error;
+        if (result.status() == DbStatus::NoSpace) return result;
         return DbResult::error(DbStatus::CorruptPage, out.message);
+    }
+    const GxStatus resetStatus = visited.reset();
+    if (resetStatus != GxStatus::Ok) {
+        out.message = "index page visit tracker reset failed";
+        return DbResult::error(DbStatus::Internal, out.message);
     }
     // Walk the leaf chain to verify it is acyclic and ordered.
     uint64_t leaf = 0;
@@ -3043,23 +3107,29 @@ DbResult IndexTree::validate(uint64_t rootPageId, IndexValidation& out) const {
             current = children[0].pageId;
         }
     }
-    std::set<uint64_t> chainVisited;
     while (leaf != 0) {
         if (leaf >= _pages.pageCount()) {
             out.message = "index leaf chain out of range";
             return DbResult::error(DbStatus::CorruptPage, out.message);
         }
-        if (!chainVisited.insert(leaf).second) {
-            out.message = "index leaf chain cycle";
-            return DbResult::error(DbStatus::CorruptPage, out.message);
+        bool revisited = false;
+        const GxStatus visitStatus = visited.visit(leaf, revisited);
+        if (visitStatus != GxStatus::Ok) {
+            const DbResult visitResult = pageVisitTrackerError(visitStatus);
+            out.message = visitResult.message();
+            return visitResult;
         }
-        if (chainVisited.size() > _pages.pageCount()) {
+        if (revisited) {
             out.message = "index leaf chain cycle";
             return DbResult::error(DbStatus::CorruptPage, out.message);
         }
         DatabasePage page;
         DbResult r = _pages.readPage(leaf, page);
         if (!r.isOk()) {
+            if (r.status() == DbStatus::NoSpace) {
+                out.message = r.message();
+                return r;
+            }
             out.message = "index leaf unreadable";
             return DbResult::error(DbStatus::CorruptPage, out.message);
         }
@@ -3082,7 +3152,7 @@ DbResult IndexTree::validate(uint64_t rootPageId, IndexValidation& out) const {
 // private parsing helpers. Returns the minimum physical key of the subtree via
 // `outMinKey` and the subtree height via `outHeight`.
 DbResult IndexTree::validateNode(uint64_t pageId, uint32_t depth,
-                                 std::set<uint64_t>& visited, uint64_t& entryCount,
+                                 ::GxPageVisitSet& visited, uint64_t& entryCount,
                                  uint32_t& outHeight, uint32_t& pagesVisited,
                                  std::string& error) const {
     if (depth > kMaxIndexDepth) {
@@ -3093,7 +3163,14 @@ DbResult IndexTree::validateNode(uint64_t pageId, uint32_t depth,
         error = "index page id out of range";
         return DbResult::error(DbStatus::CorruptPage, error);
     }
-    if (!visited.insert(pageId).second) {
+    bool revisited = false;
+    const GxStatus visitStatus = visited.visit(pageId, revisited);
+    if (visitStatus != GxStatus::Ok) {
+        const DbResult visitResult = pageVisitTrackerError(visitStatus);
+        error = visitResult.message();
+        return visitResult;
+    }
+    if (revisited) {
         error = "index tree cycle";
         return DbResult::error(DbStatus::CorruptPage, error);
     }

@@ -93,6 +93,11 @@ public:
     // one exists, otherwise the committed view.
     PageAccess& pages();
 
+    // Temporary operation storage follows the active page view: transaction
+    // scratch while a writer is active, or the database cache allocator for
+    // committed read operations. The pointer is borrowed for the call scope.
+    const GxAllocator* scratchAllocator() const;
+
     // ---- Relational API --------------------------------------------------
     DbResult createTable(const TableDefinition& def, uint32_t& outTableId);
     DbResult listTables(std::vector<TableInfo>& out) const;
