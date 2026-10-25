@@ -302,5 +302,16 @@ freestanding census all meet the R3Q gates. This verifies the converted
 cycle-membership boundary only; it does not qualify the complete index engine
 or SQL9 native runtime.
 
-Repository and final commit metadata are recorded at closeout after the
-accepted source and report are committed locally.
+### Local commit closeout
+
+- Implementation, tests, and this report were committed locally on `main` as
+  `95c2e0aed737acfaf79fb8a49729a3a0f069c067` (`Add portable index page
+  visit tracking`).
+- Starting HEAD was `4125be5f3699436a243323f33595c1554e9a6060`.
+- Both phase markers remain at SQL9 / NDB1R4P10 with SQL10 / NDB1R4P11 next.
+- The read-only Server reference remains on `NATIVE_DB_STORAGE` at
+  `f29850c93bbac0a0763a31e806d2816310156575`.
+- No push or Git topology change was performed.
+
+This commit identifies the accepted implementation snapshot; a documentation
+closeout commit follows to record its SHA in the report.
