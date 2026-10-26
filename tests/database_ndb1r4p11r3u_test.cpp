@@ -197,6 +197,17 @@ void testOrderingAcrossSignTransitions() {
                                      &comparison) == GxStatus::Ok);
             CHECK(comparison < 0 && values32[i] < values32[j]);
             CHECK(compareEncodedKeys(left, leftLength, right, rightLength) < 0);
+            int32_t decodedLeft = 0;
+            int32_t decodedRight = 0;
+            bool leftIsNull = true;
+            bool rightIsNull = true;
+            CHECK(gxDecodeIndexInt32Key(left, leftLength, &decodedLeft,
+                                        &leftIsNull) == GxStatus::Ok &&
+                  !leftIsNull && decodedLeft == values32[i]);
+            CHECK(gxDecodeIndexInt32Key(right, rightLength, &decodedRight,
+                                        &rightIsNull) == GxStatus::Ok &&
+                  !rightIsNull && decodedRight == values32[j]);
+            CHECK(decodedLeft < decodedRight);
         }
     }
 
@@ -224,6 +235,17 @@ void testOrderingAcrossSignTransitions() {
                                      &comparison) == GxStatus::Ok);
             CHECK(comparison < 0 && values64[i] < values64[j]);
             CHECK(compareEncodedKeys(left, leftLength, right, rightLength) < 0);
+            int64_t decodedLeft = 0;
+            int64_t decodedRight = 0;
+            bool leftIsNull = true;
+            bool rightIsNull = true;
+            CHECK(gxDecodeIndexInt64Key(left, leftLength, &decodedLeft,
+                                        &leftIsNull) == GxStatus::Ok &&
+                  !leftIsNull && decodedLeft == values64[i]);
+            CHECK(gxDecodeIndexInt64Key(right, rightLength, &decodedRight,
+                                        &rightIsNull) == GxStatus::Ok &&
+                  !rightIsNull && decodedRight == values64[j]);
+            CHECK(decodedLeft < decodedRight);
         }
     }
 }
@@ -309,6 +331,9 @@ void testMalformedAndTypeMismatchedPayloads() {
           GxStatus::CorruptData);
     CHECK(gxDecodeIndexInt32Key(int32Good, 6, &value32, &isNull) ==
           GxStatus::CorruptData);
+    CHECK(gxDecodeIndexInt32Key(int32Good,
+                                std::numeric_limits<size_t>::max(),
+                                &value32, &isNull) == GxStatus::CorruptData);
     CHECK(gxDecodeIndexInt32Key(nullExtra, sizeof(nullExtra), &value32,
                                 &isNull) == GxStatus::CorruptData);
     CHECK(gxDecodeIndexInt32Key(unknownTag, sizeof(unknownTag), &value32,
@@ -323,6 +348,9 @@ void testMalformedAndTypeMismatchedPayloads() {
                                 &isNull) == GxStatus::CorruptData);
     CHECK(gxDecodeIndexInt64Key(int64Good, 10, &value64,
                                 &isNull) == GxStatus::CorruptData);
+    CHECK(gxDecodeIndexInt64Key(int64Good,
+                                std::numeric_limits<size_t>::max(),
+                                &value64, &isNull) == GxStatus::CorruptData);
     CHECK(gxDecodeIndexInt32Key(int64Good, sizeof(int64Good), &value32,
                                 &isNull) == GxStatus::CorruptData);
 
