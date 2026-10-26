@@ -1,6 +1,7 @@
 #ifndef GX_PORTABLE_INDEX_KEY_H
 #define GX_PORTABLE_INDEX_KEY_H
 
+#include "gx_index_boolean_key.h"
 #include "gx_index_integer_key.h"
 #include "gx_index_text_key.h"
 

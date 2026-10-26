@@ -806,6 +806,26 @@ bool encodeIndexKey(DbType type, const DbValue& value, std::vector<uint8_t>& out
         return true;
     }
 
+    // Boolean keys use the same hosted-adapter boundary as the integer keys;
+    // keep the byte format in the freestanding production codec.
+    if (type == DbType::Boolean) {
+        if (!value.isNull() && value.type() != DbType::Boolean) {
+            out.push_back(0x01u);
+            return false;
+        }
+        uint8_t encoded[2] = {};
+        size_t encodedLength = 0;
+        const GxStatus status = gxEncodeIndexBooleanKey(
+            value.isNull(), value.booleanValue(), encoded, sizeof(encoded),
+            &encodedLength);
+        if (status != GxStatus::Ok) {
+            out.push_back(value.isNull() ? 0x00u : 0x01u);
+            return false;
+        }
+        out.assign(encoded, encoded + encodedLength);
+        return true;
+    }
+
     if (value.isNull()) {
         out.push_back(0x00);
         return true;
@@ -875,6 +895,16 @@ int compareEncodedKeys(const uint8_t* a, size_t aLength, const uint8_t* b,
 }
 
 bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out) {
+    if (type == DbType::Boolean) {
+        bool value = false;
+        bool isNull = false;
+        if (gxDecodeIndexBooleanKey(key, length, &value, &isNull) !=
+            GxStatus::Ok) {
+            return false;
+        }
+        out = isNull ? DbValue::null() : DbValue::boolean(value);
+        return true;
+    }
     if (type == DbType::Int32) {
         int32_t value = 0;
         bool isNull = false;
@@ -928,12 +958,6 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
         return false;
     }
     switch (type) {
-    case DbType::Boolean:
-        if (length != 2 || key[1] > 1) {
-            return false;
-        }
-        out = DbValue::boolean(key[1] != 0);
-        return true;
     case DbType::Float64: {
         if (length != 9) {
             return false;

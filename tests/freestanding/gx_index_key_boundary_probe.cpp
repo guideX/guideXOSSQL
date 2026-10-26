@@ -71,5 +71,38 @@ extern "C" int gxIndexKeyBoundaryProbe() {
         encodedInt32[4] != 0xFFu) {
         return 8;
     }
+
+    uint8_t encodedBoolean[2] = {};
+    size_t encodedBooleanLength = 0;
+    bool decodedBoolean = true;
+    if (gxEncodeIndexBooleanKey(false, false, encodedBoolean,
+                                sizeof(encodedBoolean),
+                                &encodedBooleanLength) != GxStatus::Ok ||
+        encodedBooleanLength != 2 || encodedBoolean[0] != 0x01u ||
+        encodedBoolean[1] != 0x00u ||
+        gxDecodeIndexBooleanKey(encodedBoolean, encodedBooleanLength,
+                                &decodedBoolean, &isNull) != GxStatus::Ok ||
+        isNull || decodedBoolean) {
+        return 9;
+    }
+    if (gxEncodeIndexBooleanKey(false, true, encodedBoolean,
+                                sizeof(encodedBoolean),
+                                &encodedBooleanLength) != GxStatus::Ok ||
+        encodedBooleanLength != 2 || encodedBoolean[0] != 0x01u ||
+        encodedBoolean[1] != 0x01u ||
+        gxDecodeIndexBooleanKey(encodedBoolean, encodedBooleanLength,
+                                &decodedBoolean, &isNull) != GxStatus::Ok ||
+        isNull || !decodedBoolean) {
+        return 10;
+    }
+    if (gxEncodeIndexBooleanKey(true, false, encodedBoolean,
+                                sizeof(encodedBoolean),
+                                &encodedBooleanLength) != GxStatus::Ok ||
+        encodedBooleanLength != 1 || encodedBoolean[0] != 0x00u ||
+        gxDecodeIndexBooleanKey(encodedBoolean, encodedBooleanLength,
+                                &decodedBoolean, &isNull) != GxStatus::Ok ||
+        !isNull || decodedBoolean) {
+        return 11;
+    }
     return 0;
 }
