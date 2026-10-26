@@ -24,6 +24,7 @@ add_library(gxos_database STATIC
     database/portable/gx_allocator_hosted.cpp
     database/portable/gx_array.cpp
     database/portable/gx_page_visit_set.cpp
+    database/portable/gx_index_integer_key.cpp
     database/portable/gx_index_text_key.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
@@ -147,6 +148,20 @@ else()
     target_compile_options(database_ndb1r4p11r3t_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p11r3t_test COMMAND database_ndb1r4p11r3t_test)
+
+add_executable(database_ndb1r4p11r3u_test
+    tests/database_ndb1r4p11r3u_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3u_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3u_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3u_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3u_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3u_test COMMAND database_ndb1r4p11r3u_test)
 
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)

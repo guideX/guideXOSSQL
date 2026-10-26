@@ -47,6 +47,7 @@ $sources = @(
     "database/portable/gx_allocator_hosted.cpp",
     "database/portable/gx_array.cpp",
     "database/portable/gx_page_visit_set.cpp",
+    "database/portable/gx_index_integer_key.cpp",
     "database/portable/gx_index_text_key.cpp",
     "database/portable/gx_owned_page.cpp",
     "database/portable/gx_heap_page_builder.cpp",
@@ -150,6 +151,7 @@ $probeStem = "gx_index_key_boundary_probe"
 $probePath = Join-Path $repoRoot $probeSource
 $probeObject = Join-Path $outputRoot ($probeStem + ".o")
 $implementationObject = Join-Path $outputRoot "database__portable__gx_index_text_key.o"
+$integerImplementationObject = Join-Path $outputRoot "database__portable__gx_index_integer_key.o"
 $linkedObject = Join-Path $outputRoot ($probeStem + ".linked.o")
 $probeLog = Join-Path $outputRoot ($probeStem + ".compile.log")
 
@@ -176,7 +178,7 @@ $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
     $linkOutput = @(& $ldCommand.Source "-r" "--no-undefined" $probeObject `
-        $implementationObject "-o" $linkedObject 2>&1)
+        $implementationObject $integerImplementationObject "-o" $linkedObject 2>&1)
     $linkExit = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
@@ -208,6 +210,10 @@ if ($probeUndefined.Count -ne 0) {
 $requiredIndexKeySymbols = @(
     "gxEncodeIndexTextKey",
     "gxDecodeIndexTextKey",
+    "gxEncodeIndexInt32Key",
+    "gxDecodeIndexInt32Key",
+    "gxEncodeIndexInt64Key",
+    "gxDecodeIndexInt64Key",
     "gxIndexKeyIsNull",
     "gxCompareIndexKeys"
 )

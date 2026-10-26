@@ -37,13 +37,6 @@ void appendU64Big(std::vector<uint8_t>& out, uint64_t value) {
     }
 }
 
-uint32_t readU32Big(const uint8_t* bytes) {
-    return (static_cast<uint32_t>(bytes[0]) << 24) |
-           (static_cast<uint32_t>(bytes[1]) << 16) |
-           (static_cast<uint32_t>(bytes[2]) << 8) |
-           static_cast<uint32_t>(bytes[3]);
-}
-
 uint64_t readU64Big(const uint8_t* bytes) {
     uint64_t value = 0;
     for (int i = 0; i < 8; ++i) {
@@ -781,6 +774,38 @@ uint64_t floatToOrdered(double value) {
 
 bool encodeIndexKey(DbType type, const DbValue& value, std::vector<uint8_t>& out) {
     out.clear();
+
+    // Keep DbValue as the hosted adapter; fixed-width integer bytes have one
+    // production implementation in the portable scalar codec.
+    if (type == DbType::Int32 || type == DbType::Int64) {
+        uint8_t encoded[9] = {};
+        size_t encodedLength = 0;
+        GxStatus status = GxStatus::InvalidArgument;
+        if (type == DbType::Int32) {
+            if (!value.isNull() && value.type() != DbType::Int32) {
+                out.push_back(0x01u);
+                return false;
+            }
+            status = gxEncodeIndexInt32Key(
+                value.isNull(), value.int32Value(), encoded, sizeof(encoded),
+                &encodedLength);
+        } else {
+            if (!value.isNull() && value.type() != DbType::Int64) {
+                out.push_back(0x01u);
+                return false;
+            }
+            status = gxEncodeIndexInt64Key(
+                value.isNull(), value.int64Value(), encoded, sizeof(encoded),
+                &encodedLength);
+        }
+        if (status != GxStatus::Ok) {
+            out.push_back(value.isNull() ? 0x00u : 0x01u);
+            return false;
+        }
+        out.assign(encoded, encoded + encodedLength);
+        return true;
+    }
+
     if (value.isNull()) {
         out.push_back(0x00);
         return true;
@@ -793,24 +818,6 @@ bool encodeIndexKey(DbType type, const DbValue& value, std::vector<uint8_t>& out
         }
         out.push_back(value.booleanValue() ? 1u : 0u);
         return true;
-    case DbType::Int32: {
-        if (value.type() != DbType::Int32) {
-            return false;
-        }
-        const uint32_t ordered =
-            static_cast<uint32_t>(value.int32Value()) ^ 0x80000000u;
-        appendU32Big(out, ordered);
-        return true;
-    }
-    case DbType::Int64: {
-        if (value.type() != DbType::Int64) {
-            return false;
-        }
-        const uint64_t ordered =
-            static_cast<uint64_t>(value.int64Value()) ^ 0x8000000000000000ull;
-        appendU64Big(out, ordered);
-        return true;
-    }
     case DbType::Float64: {
         if (value.type() != DbType::Float64) {
             return false;
@@ -868,6 +875,27 @@ int compareEncodedKeys(const uint8_t* a, size_t aLength, const uint8_t* b,
 }
 
 bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out) {
+    if (type == DbType::Int32) {
+        int32_t value = 0;
+        bool isNull = false;
+        if (gxDecodeIndexInt32Key(key, length, &value, &isNull) !=
+            GxStatus::Ok) {
+            return false;
+        }
+        out = isNull ? DbValue::null() : DbValue::int32(value);
+        return true;
+    }
+    if (type == DbType::Int64) {
+        int64_t value = 0;
+        bool isNull = false;
+        if (gxDecodeIndexInt64Key(key, length, &value, &isNull) !=
+            GxStatus::Ok) {
+            return false;
+        }
+        out = isNull ? DbValue::null() : DbValue::int64(value);
+        return true;
+    }
+
     if (type == DbType::Text) {
         GxTextByteView text = {nullptr, 0};
         bool isNull = false;
@@ -886,7 +914,7 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
         return true;
     }
 
-    if (length == 0) {
+    if (!key || length == 0) {
         return false;
     }
     if (key[0] == 0x00) {
@@ -905,19 +933,6 @@ bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out
             return false;
         }
         out = DbValue::boolean(key[1] != 0);
-        return true;
-    case DbType::Int32:
-        if (length != 5) {
-            return false;
-        }
-        out = DbValue::int32(static_cast<int32_t>(readU32Big(key + 1) ^ 0x80000000u));
-        return true;
-    case DbType::Int64:
-        if (length != 9) {
-            return false;
-        }
-        out = DbValue::int64(
-            static_cast<int64_t>(readU64Big(key + 1) ^ 0x8000000000000000ull));
         return true;
     case DbType::Float64: {
         if (length != 9) {
