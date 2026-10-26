@@ -8,7 +8,7 @@
 #include "database_endian.h"
 #include "database_transaction.h"
 #include "portable/gx_array.h"
-#include "portable/gx_index_text_key.h"
+#include "portable/gx_index_key.h"
 #include "portable/gx_page_visit_set.h"
 
 namespace gxos {
@@ -856,21 +856,15 @@ bool encodeIndexKey(DbType type, const DbValue& value, std::vector<uint8_t>& out
 }
 
 bool encodedKeyIsNull(const uint8_t* key, size_t length) {
-    return length == 1 && key != nullptr && key[0] == 0x00;
+    bool isNull = false;
+    return gxIndexKeyIsNull(key, length, &isNull) == GxStatus::Ok && isNull;
 }
 
 int compareEncodedKeys(const uint8_t* a, size_t aLength, const uint8_t* b,
                        size_t bLength) {
-    const size_t count = aLength < bLength ? aLength : bLength;
-    for (size_t i = 0; i < count; ++i) {
-        if (a[i] != b[i]) {
-            return a[i] < b[i] ? -1 : 1;
-        }
-    }
-    if (aLength == bLength) {
-        return 0;
-    }
-    return aLength < bLength ? -1 : 1;
+    int comparison = 0;
+    (void)gxCompareIndexKeys(a, aLength, b, bLength, &comparison);
+    return comparison;
 }
 
 bool decodeIndexKey(DbType type, const uint8_t* key, size_t length, DbValue& out) {

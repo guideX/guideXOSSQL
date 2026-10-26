@@ -142,6 +142,87 @@ try {
     Pop-Location
 }
 
+# Keep the production census at its established translation-unit count. This
+# separate probe includes the freestanding public boundary, calls its real
+# declarations, and links against the production implementation object above.
+$probeSource = "tests/freestanding/gx_index_key_boundary_probe.cpp"
+$probeStem = "gx_index_key_boundary_probe"
+$probePath = Join-Path $repoRoot $probeSource
+$probeObject = Join-Path $outputRoot ($probeStem + ".o")
+$implementationObject = Join-Path $outputRoot "database__portable__gx_index_text_key.o"
+$linkedObject = Join-Path $outputRoot ($probeStem + ".linked.o")
+$probeLog = Join-Path $outputRoot ($probeStem + ".compile.log")
+
+Push-Location $repoRoot
+try {
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $probeOutput = @(& $compilerCommand.Source @flags "-c" $probePath "-o" $probeObject 2>&1)
+    $probeCompileExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$probeOutput | Set-Content -LiteralPath $probeLog -Encoding utf8
+if ($probeCompileExit -ne 0) {
+    throw "Freestanding index-key probe failed to compile; see $probeLog"
+}
+} finally {
+    Pop-Location
+}
+
+$ldCommand = Get-Command -Name "ld" -ErrorAction Stop
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $linkOutput = @(& $ldCommand.Source "-r" "--no-undefined" $probeObject `
+        $implementationObject "-o" $linkedObject 2>&1)
+    $linkExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($linkExit -ne 0) {
+    $linkOutput | Set-Content -LiteralPath (Join-Path $outputRoot ($probeStem + ".link.log")) -Encoding utf8
+    throw "Freestanding index-key probe failed to link against the production implementation."
+}
+
+if (-not $nmCommand) {
+    throw "nm is required to verify portable index-key symbols and linkage."
+}
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $probeUndefined = @(& $nmCommand.Source "-u" "-C" $linkedObject 2>&1)
+    $probeUndefinedExit = $LASTEXITCODE
+    $probeSymbols = @(& $nmCommand.Source "-g" "-C" $linkedObject 2>&1)
+    $probeSymbolsExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($probeUndefinedExit -ne 0 -or $probeSymbolsExit -ne 0) {
+    throw "nm failed while inspecting the freestanding index-key probe."
+}
+if ($probeUndefined.Count -ne 0) {
+    throw "Freestanding index-key probe has unresolved symbols: $($probeUndefined -join ' | ')"
+}
+$requiredIndexKeySymbols = @(
+    "gxEncodeIndexTextKey",
+    "gxDecodeIndexTextKey",
+    "gxIndexKeyIsNull",
+    "gxCompareIndexKeys"
+)
+foreach ($symbol in $requiredIndexKeySymbols) {
+    if (-not ($probeSymbols | Where-Object { ([string]$_) -match ("\bT\s+" + [regex]::Escape($symbol) + "(?:$|\()") })) {
+        throw "Freestanding index-key probe is missing production symbol $symbol"
+    }
+}
+$probeSummary = @(
+    "Probe`tCompile`tLink`tUndefinedSymbols`tProductionSymbols",
+    "$probeSource`tPASS`tPASS`tnone`t$($requiredIndexKeySymbols -join ',')"
+)
+$probeSummary | Set-Content -LiteralPath (Join-Path $outputRoot "index-boundary-probe.tsv") -Encoding utf8
+$probeSummary
+
 $summaryPath = Join-Path $outputRoot "qualification.tsv"
 $summary | Set-Content -LiteralPath $summaryPath -Encoding utf8
 Get-Content -LiteralPath $summaryPath

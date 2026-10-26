@@ -1,4 +1,37 @@
-#include "gx_index_text_key.h"
+#include "gx_index_key.h"
+
+GxStatus gxIndexKeyIsNull(const uint8_t* keyBytes, size_t keyLength,
+                          bool* outIsNull) {
+    if (outIsNull) *outIsNull = false;
+    if (!outIsNull) return GxStatus::InvalidArgument;
+    if (!keyBytes && keyLength != 0) return GxStatus::InvalidArgument;
+
+    *outIsNull = keyLength == 1 && keyBytes[0] == 0x00u;
+    return GxStatus::Ok;
+}
+
+GxStatus gxCompareIndexKeys(const uint8_t* leftBytes, size_t leftLength,
+                            const uint8_t* rightBytes, size_t rightLength,
+                            int* outComparison) {
+    if (outComparison) *outComparison = 0;
+    if (!outComparison) return GxStatus::InvalidArgument;
+    if ((!leftBytes && leftLength != 0) ||
+        (!rightBytes && rightLength != 0)) {
+        return GxStatus::InvalidArgument;
+    }
+
+    const size_t count = leftLength < rightLength ? leftLength : rightLength;
+    for (size_t i = 0; i < count; ++i) {
+        if (leftBytes[i] != rightBytes[i]) {
+            *outComparison = leftBytes[i] < rightBytes[i] ? -1 : 1;
+            return GxStatus::Ok;
+        }
+    }
+    if (leftLength != rightLength) {
+        *outComparison = leftLength < rightLength ? -1 : 1;
+    }
+    return GxStatus::Ok;
+}
 
 static void gxMoveIndexTextBytes(uint8_t* destination, const uint8_t* source,
                                  size_t count) {
