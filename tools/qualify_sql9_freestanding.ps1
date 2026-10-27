@@ -233,6 +233,7 @@ $requiredIndexKeySymbols = @(
     "gxCompareIndexPhysicalKeyViews",
     "gxIndexLeafCursorInit",
     "gxIndexLeafCursorReadNext",
+    "gxIndexLeafLookup",
     "gxIndexLeafValidate"
 )
 foreach ($symbol in $requiredIndexKeySymbols) {

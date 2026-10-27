@@ -2335,18 +2335,42 @@ DbResult IndexTree::lookupAll(const std::vector<uint8_t>& logicalKey, uint64_t r
         if (!result.isOk()) {
             return result;
         }
-        std::vector<IndexEntry> entries;
-        result = readLeafEntries(page, info, entries);
-        if (!result.isOk()) {
-            return result;
+        GxIndexLeafLookupResult lowerBound = {};
+        GxIndexLeafError leafError = GxIndexLeafError::None;
+        const GxStatus lookupStatus = gxIndexLeafLookup(
+            page.payload.data(), page.payload.size(), probe.data(),
+            probe.size(), &lowerBound, &leafError);
+        if (lookupStatus != GxStatus::Ok) return leafEntryDataError(leafError);
+        if (lowerBound.continuation.page.entryCount != info.entryCount ||
+            lowerBound.continuation.page.nextLeafPageId != info.nextLeaf ||
+            lowerBound.continuation.page.ownerIndexId != info.ownerIndexId) {
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index leaf metadata changed during lookup");
         }
-        for (size_t i = 0; i < entries.size(); ++i) {
-            const int cmp = compareEncodedKeys(entries[i].key.data(), entries[i].key.size(),
-                                               logicalKey.data(), logicalKey.size());
+
+        GxIndexLeafEntryView entry = lowerBound.entry;
+        bool hasEntry = lowerBound.hasEntry;
+        GxIndexLeafCursor cursor = lowerBound.continuation;
+        while (hasEntry) {
+            const int cmp = compareEncodedKeys(entry.keyBytes,
+                                               entry.keyLength,
+                                               logicalKey.data(),
+                                               logicalKey.size());
             if (cmp == 0) {
-                out.push_back(entries[i]);
+                IndexEntry found;
+                found.key.assign(entry.keyBytes,
+                                 entry.keyBytes + entry.keyLength);
+                found.locator.pageId = entry.locatorPageId;
+                found.locator.slot = entry.locatorSlot;
+                out.push_back(std::move(found));
             } else if (cmp > 0) {
                 return DbResult::ok();
+            }
+
+            const GxStatus cursorStatus = gxIndexLeafCursorReadNext(
+                &cursor, &entry, &hasEntry, &leafError);
+            if (cursorStatus != GxStatus::Ok) {
+                return leafEntryDataError(leafError);
             }
         }
         leaf = info.nextLeaf;

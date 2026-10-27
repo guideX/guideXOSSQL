@@ -211,6 +211,23 @@ else()
 endif()
 add_test(NAME database_ndb1r4p11r3x_test COMMAND database_ndb1r4p11r3x_test)
 
+add_executable(database_ndb1r4p11r3y_test
+    tests/database_ndb1r4p11r3y_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3y_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3y_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+target_compile_definitions(database_ndb1r4p11r3y_test PRIVATE
+    GX_R3Y_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/NDB1R4P11R3X_hosted_leaf_512.hex"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3y_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3y_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3y_test COMMAND database_ndb1r4p11r3y_test)
+
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
 if(MSVC)
@@ -448,6 +465,10 @@ if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
     target_compile_options(database_ndb1r4p11r3x_test PRIVATE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(database_ndb1r4p11r3x_test PRIVATE
+        -fsanitize=address,undefined)
+    target_compile_options(database_ndb1r4p11r3y_test PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(database_ndb1r4p11r3y_test PRIVATE
         -fsanitize=address,undefined)
 endif()
 

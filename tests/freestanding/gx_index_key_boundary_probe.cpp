@@ -190,5 +190,48 @@ extern "C" int gxIndexKeyBoundaryProbe() {
         hasLeafEntry || leafError != GxIndexLeafError::EntryOutOfRange) {
         return 17;
     }
+
+    // The production leaf lookup returns a physical-key match and a
+    // continuation positioned after it, without allocating a combined key.
+    storeProbeLe32(leafBytes + 472, 24);
+    storeProbeLe32(leafBytes + 476, 18);
+    const uint8_t exactPhysicalKey[] = {
+        0x01u, 0x20u, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 4
+    };
+    GxIndexLeafLookupResult lookup = {};
+    if (gxIndexLeafLookup(leafBytes, sizeof(leafBytes), exactPhysicalKey,
+                          sizeof(exactPhysicalKey), &lookup, &leafError) !=
+            GxStatus::Ok ||
+        !lookup.hasEntry || !lookup.exactMatch || lookup.entryPosition != 0 ||
+        lookup.entry.locatorPageId != 7 || lookup.entry.locatorSlot != 4) {
+        return 18;
+    }
+    if (gxIndexLeafCursorReadNext(&lookup.continuation, &leafEntry,
+                                  &hasLeafEntry, &leafError) != GxStatus::Ok ||
+        hasLeafEntry) {
+        return 19;
+    }
+
+    const uint8_t missingPhysicalKey[] = {
+        0x01u, 0x30u, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    if (gxIndexLeafLookup(leafBytes, sizeof(leafBytes), missingPhysicalKey,
+                          sizeof(missingPhysicalKey), &lookup, &leafError) !=
+            GxStatus::Ok ||
+        lookup.hasEntry || lookup.exactMatch || lookup.entryPosition != 1 ||
+        lookup.continuation.position != 1) {
+        return 20;
+    }
+
+    storeProbeLe32(leafBytes + 476, 0xFFFFFFFFu);
+    lookup.entryPosition = 99;
+    lookup.hasEntry = true;
+    if (gxIndexLeafLookup(leafBytes, sizeof(leafBytes), exactPhysicalKey,
+                          sizeof(exactPhysicalKey), &lookup, &leafError) !=
+            GxStatus::CorruptData ||
+        leafError != GxIndexLeafError::EntryOutOfRange || lookup.hasEntry ||
+        lookup.entryPosition != 0 || lookup.continuation.pageBytes != 0) {
+        return 21;
+    }
     return 0;
 }

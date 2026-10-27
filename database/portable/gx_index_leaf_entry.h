@@ -58,6 +58,26 @@ struct GxIndexLeafEntryView {
     uint32_t entryLength;
 };
 
+// Result of a leaf-local physical-key lower-bound lookup. When hasEntry is
+// true, entry is the first physical key >= the requested key and entryPosition
+// is its zero-based slot position. exactMatch compares the complete physical
+// key, including the 12-byte row-locator suffix. continuation is positioned
+// immediately after entry and can be passed to gxIndexLeafCursorReadNext to
+// continue in slot order. When hasEntry is false, entryPosition is the valid
+// end-of-leaf insertion position and continuation is at end-of-leaf.
+//
+// The entry view and continuation borrow the supplied page bytes. Keep the
+// page alive and unchanged until they are discarded. On failure, the result
+// is cleared. The result and optional error output must not overlap either
+// input span or each other.
+struct GxIndexLeafLookupResult {
+    GxIndexLeafCursor continuation;
+    GxIndexLeafEntryView entry;
+    uint32_t entryPosition;
+    bool exactMatch;
+    bool hasEntry;
+};
+
 // Opens the existing little-endian SQL index-leaf payload format. pageLength
 // is the complete page payload length (the outer 32-byte database page header
 // is not included). It must correspond to an existing supported database page
@@ -79,6 +99,22 @@ GxStatus gxIndexLeafCursorReadNext(GxIndexLeafCursor* cursor,
                                    GxIndexLeafEntryView* outEntry,
                                    bool* outHasEntry,
                                    GxIndexLeafError* outError);
+
+// Finds the leaf-local lower-bound candidate for a complete physical key.
+// The page is fully validated first, including entry bounds, non-overlap, and
+// strictly increasing physical order. physicalKeyBytes contains the complete
+// logical-key bytes followed by the existing 12-byte big-endian row locator;
+// it is not null-terminated and its length must include at least those 12
+// locator bytes. A successful non-exact result with hasEntry=true
+// is a valid insertion position, while hasEntry=false is valid end-of-leaf.
+// A lower bound from one leaf is not a tree-wide first match unless the
+// caller's B+ tree descent guarantees that property. No bytes are modified or
+// retained outside the returned borrowed view and continuation cursor.
+GxStatus gxIndexLeafLookup(const uint8_t* pageBytes, size_t pageLength,
+                           const uint8_t* physicalKeyBytes,
+                           size_t physicalKeyLength,
+                           GxIndexLeafLookupResult* outResult,
+                           GxIndexLeafError* outError);
 
 // Validates all entries and the existing physical-key ordering contract
 // without modifying the page or allocating. Unlike simple traversal, this
