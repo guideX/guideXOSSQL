@@ -1,4 +1,5 @@
 #include "gx_index_key.h"
+#include "gx_index_physical_key.h"
 
 // Freestanding compile/link probe for the production portable index-key API.
 // Keeping the encoded bytes on this stack frame makes the lifetime underlying
@@ -103,6 +104,27 @@ extern "C" int gxIndexKeyBoundaryProbe() {
                                 &decodedBoolean, &isNull) != GxStatus::Ok ||
         !isNull || decodedBoolean) {
         return 11;
+    }
+
+    const uint8_t nullKey[] = {0x00u};
+    const uint8_t falseKey[] = {0x01u, 0x00u};
+    if (gxCompareIndexPhysicalKeyViews(
+            nullKey, sizeof(nullKey), true, 4, 2,
+            falseKey, sizeof(falseKey), true, 4, 2,
+            &comparison) != GxStatus::Ok || comparison != -1) {
+        return 12;
+    }
+
+    // The stored full bound and a borrowed key-plus-locator view must compare
+    // equal without a temporary combined-key buffer.
+    const uint8_t storedPhysical[] = {
+        0x01u, 'x', 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 4
+    };
+    if (gxCompareIndexPhysicalKeyViews(
+            storedPhysical, sizeof(storedPhysical), false, 0, 0,
+            storedPhysical, 2, true, 3, 4,
+            &comparison) != GxStatus::Ok || comparison != 0) {
+        return 13;
     }
     return 0;
 }

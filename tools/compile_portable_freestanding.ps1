@@ -11,6 +11,7 @@ New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 $sources = @(
     "database/portable/gx_allocator.cpp",
     "database/portable/gx_array.cpp",
+    "database/portable/gx_index_physical_key.cpp",
     "database/portable/gx_recovered_pages.cpp",
     "database/portable/gx_page_cache.cpp",
     "database/portable/gx_owner.cpp",

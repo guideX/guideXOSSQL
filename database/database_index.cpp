@@ -9,6 +9,7 @@
 #include "database_transaction.h"
 #include "portable/gx_array.h"
 #include "portable/gx_index_key.h"
+#include "portable/gx_index_physical_key.h"
 #include "portable/gx_page_visit_set.h"
 
 namespace gxos {
@@ -45,52 +46,31 @@ uint64_t readU64Big(const uint8_t* bytes) {
     return value;
 }
 
-uint8_t physicalKeyByte(const uint8_t* key, size_t keyLength,
-                        uint64_t locatorPageId, uint32_t locatorSlot,
-                        size_t offset) {
-    if (offset < keyLength) return key[offset];
-    offset -= keyLength;
-    if (offset < 8) {
-        return static_cast<uint8_t>(locatorPageId >> (56 - offset * 8));
-    }
-    offset -= 8;
-    return static_cast<uint8_t>(locatorSlot >> (24 - offset * 8));
-}
-
 int comparePhysicalKeyParts(const uint8_t* leftKey, size_t leftKeyLength,
                             uint64_t leftPageId, uint32_t leftSlot,
                             const uint8_t* rightKey, size_t rightKeyLength,
                             uint64_t rightPageId, uint32_t rightSlot) {
-    const size_t leftLength = leftKeyLength + kIndexPhysicalLocatorBytes;
-    const size_t rightLength = rightKeyLength + kIndexPhysicalLocatorBytes;
-    const size_t compareLength = leftLength < rightLength
-        ? leftLength : rightLength;
-    for (size_t i = 0; i < compareLength; ++i) {
-        const uint8_t a = physicalKeyByte(leftKey, leftKeyLength,
-                                          leftPageId, leftSlot, i);
-        const uint8_t b = physicalKeyByte(rightKey, rightKeyLength,
-                                          rightPageId, rightSlot, i);
-        if (a != b) return a < b ? -1 : 1;
-    }
-    if (leftLength == rightLength) return 0;
-    return leftLength < rightLength ? -1 : 1;
+    int comparison = 0;
+    const GxStatus status = gxCompareIndexPhysicalKeyViews(
+        leftKey, leftKeyLength, true, leftPageId, leftSlot,
+        rightKey, rightKeyLength, true, rightPageId, rightSlot,
+        &comparison);
+    // Page-derived keys are bounded by the page format, and these borrowed
+    // spans are validated before the planner reaches its ordering step.
+    return status == GxStatus::Ok ? comparison : 0;
 }
 
 int compareStoredBoundToInsertKey(const std::vector<uint8_t>& bound,
                                  const std::vector<uint8_t>& logicalKey,
                                  const RowLocator& locator) {
-    const size_t physicalLength = logicalKey.size() +
-        kIndexPhysicalLocatorBytes;
-    const size_t compareLength = bound.size() < physicalLength
-        ? bound.size() : physicalLength;
-    for (size_t i = 0; i < compareLength; ++i) {
-        const uint8_t right = physicalKeyByte(
-            logicalKey.empty() ? nullptr : logicalKey.data(),
-            logicalKey.size(), locator.pageId, locator.slot, i);
-        if (bound[i] != right) return bound[i] < right ? -1 : 1;
-    }
-    if (bound.size() == physicalLength) return 0;
-    return bound.size() < physicalLength ? -1 : 1;
+    int comparison = 0;
+    const GxStatus status = gxCompareIndexPhysicalKeyViews(
+        bound.empty() ? nullptr : bound.data(), bound.size(), false, 0, 0,
+        logicalKey.empty() ? nullptr : logicalKey.data(), logicalKey.size(),
+        true, locator.pageId, locator.slot, &comparison);
+    // Bounds read from validated pages and the caller's logical key are both
+    // within the existing index page-size limit.
+    return status == GxStatus::Ok ? comparison : 0;
 }
 
 DbResult leafPreparationStatus(GxStatus status) {
