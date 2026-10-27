@@ -1,5 +1,22 @@
 #include "gx_index_key.h"
+#include "gx_index_leaf_entry.h"
 #include "gx_index_physical_key.h"
+
+namespace {
+
+void storeProbeLe32(uint8_t* bytes, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) {
+        bytes[i] = static_cast<uint8_t>(value >> (i * 8u));
+    }
+}
+
+void storeProbeLe64(uint8_t* bytes, uint64_t value) {
+    for (size_t i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<uint8_t>(value >> (i * 8u));
+    }
+}
+
+} // namespace
 
 // Freestanding compile/link probe for the production portable index-key API.
 // Keeping the encoded bytes on this stack frame makes the lifetime underlying
@@ -125,6 +142,53 @@ extern "C" int gxIndexKeyBoundaryProbe() {
             storedPhysical, 2, true, 3, 4,
             &comparison) != GxStatus::Ok || comparison != 0) {
         return 13;
+    }
+
+    // Execute the production leaf cursor and validator against a caller-owned
+    // payload with the existing little-endian header, entry and reverse slot.
+    uint8_t leafBytes[480] = {};
+    storeProbeLe32(leafBytes, 0x4C495847u);
+    leafBytes[4] = 1;
+    storeProbeLe32(leafBytes + 16, 1);
+    storeProbeLe32(leafBytes + 20, 5);
+    storeProbeLe32(leafBytes + 24, 2);
+    leafBytes[28] = 0x01u;
+    leafBytes[29] = 0x20u;
+    storeProbeLe64(leafBytes + 30, 7);
+    storeProbeLe32(leafBytes + 38, 4);
+    storeProbeLe32(leafBytes + 472, 24);
+    storeProbeLe32(leafBytes + 476, 18);
+
+    GxIndexLeafCursor leafCursor = {};
+    GxIndexLeafEntryView leafEntry = {};
+    GxIndexLeafError leafError = GxIndexLeafError::None;
+    bool hasLeafEntry = false;
+    if (gxIndexLeafCursorInit(leafBytes, sizeof(leafBytes), &leafCursor,
+                              &leafError) != GxStatus::Ok ||
+        leafCursor.page.entryCount != 1 ||
+        leafCursor.page.ownerIndexId != 5) {
+        return 14;
+    }
+    if (gxIndexLeafCursorReadNext(&leafCursor, &leafEntry, &hasLeafEntry,
+                                  &leafError) != GxStatus::Ok ||
+        !hasLeafEntry || leafEntry.keyLength != 2 ||
+        leafEntry.keyBytes[0] != 0x01u || leafEntry.keyBytes[1] != 0x20u ||
+        leafEntry.locatorPageId != 7 || leafEntry.locatorSlot != 4) {
+        return 15;
+    }
+    if (gxIndexLeafCursorReadNext(&leafCursor, &leafEntry, &hasLeafEntry,
+                                  &leafError) != GxStatus::Ok || hasLeafEntry ||
+        gxIndexLeafValidate(leafBytes, sizeof(leafBytes), &leafError) !=
+            GxStatus::Ok) {
+        return 16;
+    }
+    storeProbeLe32(leafBytes + 476, 0xFFFFFFFFu);
+    if (gxIndexLeafCursorInit(leafBytes, sizeof(leafBytes), &leafCursor,
+                              &leafError) != GxStatus::Ok ||
+        gxIndexLeafCursorReadNext(&leafCursor, &leafEntry, &hasLeafEntry,
+                                  &leafError) != GxStatus::CorruptData ||
+        hasLeafEntry || leafError != GxIndexLeafError::EntryOutOfRange) {
+        return 17;
     }
     return 0;
 }

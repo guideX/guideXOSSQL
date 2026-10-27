@@ -51,6 +51,7 @@ $sources = @(
     "database/portable/gx_index_integer_key.cpp",
     "database/portable/gx_index_text_key.cpp",
     "database/portable/gx_index_physical_key.cpp",
+    "database/portable/gx_index_leaf_entry.cpp",
     "database/portable/gx_owned_page.cpp",
     "database/portable/gx_heap_page_builder.cpp",
     "database/portable/gx_recovered_pages.cpp",
@@ -145,8 +146,8 @@ try {
     Pop-Location
 }
 
-# The production census includes the explicit source set above; R3W adds one
-# production unit (38 to 39). This separate probe includes the freestanding
+# The production census includes the explicit source set above; R3X adds one
+# production unit (39 to 40). This separate probe includes the freestanding
 # public boundary, calls its declarations, and links the production objects.
 $probeSource = "tests/freestanding/gx_index_key_boundary_probe.cpp"
 $runnerSource = "tests/freestanding/gx_index_key_boundary_runner.cpp"
@@ -158,6 +159,7 @@ $implementationObject = Join-Path $outputRoot "database__portable__gx_index_text
 $booleanImplementationObject = Join-Path $outputRoot "database__portable__gx_index_boolean_key.o"
 $integerImplementationObject = Join-Path $outputRoot "database__portable__gx_index_integer_key.o"
 $physicalKeyImplementationObject = Join-Path $outputRoot "database__portable__gx_index_physical_key.o"
+$leafEntryImplementationObject = Join-Path $outputRoot "database__portable__gx_index_leaf_entry.o"
 $linkedObject = Join-Path $outputRoot ($probeStem + ".linked.o")
 $probeExecutable = Join-Path $outputRoot ($probeStem + ".exe")
 $probeLog = Join-Path $outputRoot ($probeStem + ".compile.log")
@@ -187,6 +189,7 @@ try {
     $linkOutput = @(& $ldCommand.Source "-r" "--no-undefined" $probeObject `
         $implementationObject $integerImplementationObject `
         $booleanImplementationObject $physicalKeyImplementationObject `
+        $leafEntryImplementationObject `
         "-o" $linkedObject 2>&1)
     $linkExit = $LASTEXITCODE
 } finally {
@@ -227,7 +230,10 @@ $requiredIndexKeySymbols = @(
     "gxDecodeIndexInt64Key",
     "gxIndexKeyIsNull",
     "gxCompareIndexKeys",
-    "gxCompareIndexPhysicalKeyViews"
+    "gxCompareIndexPhysicalKeyViews",
+    "gxIndexLeafCursorInit",
+    "gxIndexLeafCursorReadNext",
+    "gxIndexLeafValidate"
 )
 foreach ($symbol in $requiredIndexKeySymbols) {
     if (-not ($probeSymbols | Where-Object { ([string]$_) -match ("\bT\s+" + [regex]::Escape($symbol) + "(?:$|\()") })) {
@@ -244,6 +250,7 @@ try {
     $hostLinkOutput = @(& $compilerCommand.Source $runnerPath $probeObject `
         $implementationObject $integerImplementationObject `
         $booleanImplementationObject $physicalKeyImplementationObject `
+        $leafEntryImplementationObject `
         "-o" $probeExecutable 2>&1)
     $hostLinkExit = $LASTEXITCODE
 } finally {

@@ -9,6 +9,7 @@
 #include "database_transaction.h"
 #include "portable/gx_array.h"
 #include "portable/gx_index_key.h"
+#include "portable/gx_index_leaf_entry.h"
 #include "portable/gx_index_physical_key.h"
 #include "portable/gx_page_visit_set.h"
 
@@ -117,6 +118,53 @@ DbResult internalPreparationStatus(GxStatus status) {
     }
     return DbResult::error(DbStatus::Internal,
                            "index internal preparation failed unexpectedly");
+}
+
+DbResult leafEntryDataError(GxIndexLeafError error) {
+    switch (error) {
+    case GxIndexLeafError::HeaderTruncated:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf header truncated");
+    case GxIndexLeafError::SignatureMismatch:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf signature mismatch");
+    case GxIndexLeafError::UnsupportedVersion:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "unsupported index leaf version");
+    case GxIndexLeafError::ImpossibleEntryCount:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "impossible index leaf entry count");
+    case GxIndexLeafError::SlotOutOfRange:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf slot out of range");
+    case GxIndexLeafError::EntryOutOfRange:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf entry out of range");
+    case GxIndexLeafError::EntryTooSmall:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf entry too small");
+    case GxIndexLeafError::KeyLengthInvalid:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf key length invalid");
+    case GxIndexLeafError::PageSizeOutOfRange:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf payload size mismatch");
+    case GxIndexLeafError::EntryRegionsOverlap:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf entry regions overlap");
+    case GxIndexLeafError::PhysicalKeysNotIncreasing:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf entries not strictly ordered");
+    case GxIndexLeafError::PhysicalKeyComparisonFailed:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf physical key comparison failed");
+    case GxIndexLeafError::InvalidArgument:
+    case GxIndexLeafError::InvalidCursor:
+    case GxIndexLeafError::None:
+        break;
+    }
+    return DbResult::error(DbStatus::CorruptPage,
+                           "index leaf entry data is invalid");
 }
 
 struct ScopedIndexPayload {
@@ -1050,25 +1098,16 @@ DbResult IndexTree::readLeaf(uint64_t pageId, DatabasePage& page, LeafInfo& info
     if (page.payload.size() != cap) {
         return DbResult::error(DbStatus::CorruptPage, "index leaf payload size mismatch");
     }
-    if (page.payload.size() < kIndexLeafHeaderSize) {
-        return DbResult::error(DbStatus::CorruptPage, "index leaf header truncated");
-    }
-    const uint8_t* p = page.payload.data();
-    if (loadLe32(p + 0) != kIndexLeafMagic) {
-        return DbResult::error(DbStatus::CorruptPage, "index leaf signature mismatch");
-    }
-    if (loadLe16(p + 4) != kIndexPageVersion) {
-        return DbResult::error(DbStatus::CorruptPage, "unsupported index leaf version");
-    }
-    info.nextLeaf = loadLe64(p + 8);
-    info.entryCount = loadLe32(p + 16);
-    info.ownerIndexId = loadLe32(p + 20);
+    GxIndexLeafCursor cursor = {};
+    GxIndexLeafError leafError = GxIndexLeafError::None;
+    const GxStatus cursorStatus = gxIndexLeafCursorInit(
+        page.payload.data(), page.payload.size(), &cursor, &leafError);
+    if (cursorStatus != GxStatus::Ok) return leafEntryDataError(leafError);
+    info.nextLeaf = cursor.page.nextLeafPageId;
+    info.entryCount = cursor.page.entryCount;
+    info.ownerIndexId = cursor.page.ownerIndexId;
     if (info.ownerIndexId != _indexId) {
         return DbResult::error(DbStatus::CorruptPage, "index leaf belongs to another index");
-    }
-    if (kIndexLeafHeaderSize + kIndexSlotSize * static_cast<uint64_t>(info.entryCount) >
-        cap) {
-        return DbResult::error(DbStatus::CorruptPage, "impossible index leaf entry count");
     }
     return DbResult::ok();
 }
@@ -1077,31 +1116,28 @@ DbResult IndexTree::readLeafEntries(const DatabasePage& page, const LeafInfo& in
                                     std::vector<IndexEntry>& out) const {
     out.clear();
     out.reserve(info.entryCount);
-    const uint32_t cap = capacity();
-    const uint32_t maxKey = maxIndexKeyBytes(_pages.pageSize());
-    for (uint32_t i = 0; i < info.entryCount; ++i) {
-        const uint32_t slotOffset = cap - kIndexSlotSize * (i + 1);
-        if (slotOffset < kIndexLeafHeaderSize) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf slot out of range");
-        }
-        const uint32_t entryOffset = loadLe32(page.payload.data() + slotOffset);
-        const uint32_t entryLength = loadLe32(page.payload.data() + slotOffset + 4);
-        if (entryOffset < kIndexLeafHeaderSize || entryOffset > cap ||
-            entryLength > cap - entryOffset) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf entry out of range");
-        }
-        if (entryLength < kIndexLeafEntryOverhead) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf entry too small");
-        }
-        const uint8_t* entry = page.payload.data() + entryOffset;
-        const uint32_t keyLength = loadLe32(entry);
-        if (keyLength > maxKey || keyLength + kIndexLeafEntryOverhead != entryLength) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf key length invalid");
-        }
+    GxIndexLeafCursor cursor = {};
+    GxIndexLeafError leafError = GxIndexLeafError::None;
+    GxStatus status = gxIndexLeafCursorInit(
+        page.payload.data(), page.payload.size(), &cursor, &leafError);
+    if (status != GxStatus::Ok) return leafEntryDataError(leafError);
+    if (cursor.page.entryCount != info.entryCount ||
+        cursor.page.nextLeafPageId != info.nextLeaf ||
+        cursor.page.ownerIndexId != info.ownerIndexId) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf metadata changed during read");
+    }
+    for (;;) {
+        GxIndexLeafEntryView entry = {};
+        bool hasEntry = false;
+        status = gxIndexLeafCursorReadNext(&cursor, &entry, &hasEntry,
+                                          &leafError);
+        if (status != GxStatus::Ok) return leafEntryDataError(leafError);
+        if (!hasEntry) break;
         IndexEntry result;
-        result.key.assign(entry + 4, entry + 4 + keyLength);
-        result.locator.pageId = loadLe64(entry + 4 + keyLength);
-        result.locator.slot = loadLe32(entry + 4 + keyLength + 8);
+        result.key.assign(entry.keyBytes, entry.keyBytes + entry.keyLength);
+        result.locator.pageId = entry.locatorPageId;
+        result.locator.slot = entry.locatorSlot;
         out.push_back(std::move(result));
     }
     return DbResult::ok();
@@ -1122,39 +1158,38 @@ DbResult IndexTree::readLeafPlan(const DatabasePage& page, const LeafInfo& info,
                                "index leaf plan capacity or count is invalid");
     }
 
-    const uint32_t maxKey = maxIndexKeyBytes(_pages.pageSize());
-    for (uint32_t i = 0; i < info.entryCount; ++i) {
-        const uint64_t slotDistance =
-            static_cast<uint64_t>(kIndexSlotSize) * (i + 1u);
-        if (slotDistance > cap || cap - slotDistance < kIndexLeafHeaderSize) {
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "index leaf plan slot is out of range");
+    GxIndexLeafCursor cursor = {};
+    GxIndexLeafError leafError = GxIndexLeafError::None;
+    GxStatus status = gxIndexLeafCursorInit(
+        page.payload.data(), page.payload.size(), &cursor, &leafError);
+    if (status != GxStatus::Ok || cursor.page.entryCount != info.entryCount ||
+        cursor.page.nextLeafPageId != info.nextLeaf ||
+        cursor.page.ownerIndexId != info.ownerIndexId) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index leaf plan capacity or count is invalid");
+    }
+    for (;;) {
+        GxIndexLeafEntryView leafEntry = {};
+        bool hasEntry = false;
+        status = gxIndexLeafCursorReadNext(&cursor, &leafEntry, &hasEntry,
+                                          &leafError);
+        if (status != GxStatus::Ok) {
+            return leafError == GxIndexLeafError::KeyLengthInvalid
+                ? DbResult::error(DbStatus::CorruptPage,
+                                  "index leaf plan key length is invalid")
+                : DbResult::error(DbStatus::CorruptPage,
+                                  "index leaf plan entry is out of range");
         }
-        const uint32_t slotOffset = cap - static_cast<uint32_t>(slotDistance);
-        const uint32_t entryOffset = loadLe32(page.payload.data() + slotOffset);
-        const uint32_t entryLength =
-            loadLe32(page.payload.data() + slotOffset + 4);
-        if (entryOffset < kIndexLeafHeaderSize || entryOffset > cap ||
-            entryLength > cap - entryOffset ||
-            entryOffset > slotOffset || entryLength > slotOffset - entryOffset ||
-            entryLength < kIndexLeafEntryOverhead + 1u) {
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "index leaf plan entry is out of range");
-        }
-        const uint8_t* encodedEntry = page.payload.data() + entryOffset;
-        const uint32_t keyLength = loadLe32(encodedEntry);
-        if (keyLength == 0 || keyLength > maxKey ||
-            static_cast<uint64_t>(keyLength) + kIndexLeafEntryOverhead !=
-                entryLength) {
+        if (!hasEntry) break;
+        if (leafEntry.keyLength == 0) {
             return DbResult::error(DbStatus::CorruptPage,
                                    "index leaf plan key length is invalid");
         }
-
         PlannedLeafEntry entry = {};
-        entry.key = encodedEntry + 4;
-        entry.locatorPageId = loadLe64(encodedEntry + 4 + keyLength);
-        entry.keyLength = keyLength;
-        entry.locatorSlot = loadLe32(encodedEntry + 4 + keyLength + 8);
+        entry.key = leafEntry.keyBytes;
+        entry.locatorPageId = leafEntry.locatorPageId;
+        entry.keyLength = static_cast<uint32_t>(leafEntry.keyLength);
+        entry.locatorSlot = leafEntry.locatorSlot;
         DbResult appended = appendLeafPlanEntry(out, entry);
         if (!appended.isOk()) return appended;
     }
@@ -2397,51 +2432,49 @@ DbResult IndexTree::insert(const std::vector<uint8_t>& logicalKey,
         static_cast<uint64_t>(leafInfo.entryCount) * kIndexSlotSize;
     bool exactDuplicate = false;
     bool uniqueConflict = false;
-    for (uint32_t i = 0; i < leafInfo.entryCount; ++i) {
-        const uint64_t slotDistance =
-            static_cast<uint64_t>(kIndexSlotSize) * (i + 1u);
-        if (slotDistance > cap || cap - slotDistance < kIndexLeafHeaderSize) {
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "index leaf slot out of range");
+    GxIndexLeafCursor cursor = {};
+    GxIndexLeafError leafError = GxIndexLeafError::None;
+    GxStatus cursorStatus = gxIndexLeafCursorInit(
+        leafPage.payload.data(), leafPage.payload.size(), &cursor, &leafError);
+    if (cursorStatus != GxStatus::Ok ||
+        cursor.page.entryCount != leafInfo.entryCount ||
+        cursor.page.nextLeafPageId != leafInfo.nextLeaf ||
+        cursor.page.ownerIndexId != leafInfo.ownerIndexId) {
+        return cursorStatus == GxStatus::Ok
+            ? DbResult::error(DbStatus::CorruptPage,
+                              "index leaf metadata changed during read")
+            : leafEntryDataError(leafError);
+    }
+    for (;;) {
+        GxIndexLeafEntryView leafEntry = {};
+        bool hasEntry = false;
+        cursorStatus = gxIndexLeafCursorReadNext(&cursor, &leafEntry,
+                                                &hasEntry, &leafError);
+        if (cursorStatus != GxStatus::Ok) {
+            return leafEntryDataError(leafError);
         }
-        const uint32_t slotOffset = cap - static_cast<uint32_t>(slotDistance);
-        const uint32_t entryOffset = loadLe32(leafPage.payload.data() + slotOffset);
-        const uint32_t entryLength =
-            loadLe32(leafPage.payload.data() + slotOffset + 4);
-        if (entryOffset < kIndexLeafHeaderSize || entryOffset > cap ||
-            entryLength > cap - entryOffset || entryOffset > slotOffset ||
-            entryLength > slotOffset - entryOffset ||
-            entryLength < kIndexLeafEntryOverhead) {
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "index leaf entry out of range");
-        }
-        const uint8_t* encodedEntry = leafPage.payload.data() + entryOffset;
-        const uint32_t keyLength = loadLe32(encodedEntry);
-        if (keyLength > maxKey ||
-            static_cast<uint64_t>(keyLength) + kIndexLeafEntryOverhead !=
-                entryLength) {
-            return DbResult::error(DbStatus::CorruptPage,
-                                   "index leaf key length invalid");
-        }
+        if (!hasEntry) break;
         const uint64_t entryBytes =
-            static_cast<uint64_t>(kIndexLeafEntryOverhead) + keyLength;
+            static_cast<uint64_t>(kIndexLeafEntryOverhead) +
+            leafEntry.keyLength;
         if (used > cap || entryBytes > cap - used) {
             return DbResult::error(DbStatus::CorruptPage,
                                    "index leaf entries exceed page capacity");
         }
         used += entryBytes;
-        const uint8_t* key = encodedEntry + 4;
-        const uint64_t rowPageId = loadLe64(key + keyLength);
-        const uint32_t rowSlot = loadLe32(key + keyLength + 8);
-        if (rowPageId == locator.pageId && rowSlot == locator.slot &&
-            compareEncodedKeys(key, keyLength, logicalKey.data(),
+        if (leafEntry.locatorPageId == locator.pageId &&
+            leafEntry.locatorSlot == locator.slot &&
+            compareEncodedKeys(leafEntry.keyBytes, leafEntry.keyLength,
+                               logicalKey.data(),
                                logicalKey.size()) == 0) {
             exactDuplicate = true;
         }
         if (unique && !encodedKeyIsNull(logicalKey.data(), logicalKey.size()) &&
-            compareEncodedKeys(key, keyLength, logicalKey.data(),
+            compareEncodedKeys(leafEntry.keyBytes, leafEntry.keyLength,
+                               logicalKey.data(),
                                logicalKey.size()) == 0 &&
-            (rowPageId != locator.pageId || rowSlot != locator.slot)) {
+            (leafEntry.locatorPageId != locator.pageId ||
+             leafEntry.locatorSlot != locator.slot)) {
             uniqueConflict = true;
         }
     }
@@ -3239,15 +3272,13 @@ DbResult IndexTree::validateNode(uint64_t pageId, uint32_t depth,
             error = result.message();
             return result;
         }
-        for (size_t i = 1; i < entries.size(); ++i) {
-            const std::vector<uint8_t> prev =
-                makePhysicalKey(entries[i - 1].key, entries[i - 1].locator);
-            const std::vector<uint8_t> cur =
-                makePhysicalKey(entries[i].key, entries[i].locator);
-            if (compareEncodedKeys(prev.data(), prev.size(), cur.data(), cur.size()) >= 0) {
-                error = "index leaf entries not strictly ordered";
-                return DbResult::error(DbStatus::CorruptPage, error);
-            }
+        GxIndexLeafError leafError = GxIndexLeafError::None;
+        const GxStatus leafValidation = gxIndexLeafValidate(
+            page.payload.data(), page.payload.size(), &leafError);
+        if (leafValidation != GxStatus::Ok) {
+            const DbResult validationResult = leafEntryDataError(leafError);
+            error = validationResult.message();
+            return validationResult;
         }
         for (size_t i = 0; i < entries.size(); ++i) {
             if (entries[i].locator.pageId >= _pages.pageCount()) {

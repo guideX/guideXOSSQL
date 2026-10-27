@@ -28,6 +28,7 @@ add_library(gxos_database STATIC
     database/portable/gx_index_integer_key.cpp
     database/portable/gx_index_text_key.cpp
     database/portable/gx_index_physical_key.cpp
+    database/portable/gx_index_leaf_entry.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
@@ -192,6 +193,23 @@ else()
     target_compile_options(database_ndb1r4p11r3w_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p11r3w_test COMMAND database_ndb1r4p11r3w_test)
+
+add_executable(database_ndb1r4p11r3x_test
+    tests/database_ndb1r4p11r3x_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3x_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3x_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+target_compile_definitions(database_ndb1r4p11r3x_test PRIVATE
+    GX_R3X_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/NDB1R4P11R3X_hosted_leaf_512.hex"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3x_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3x_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3x_test COMMAND database_ndb1r4p11r3x_test)
 
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
@@ -421,11 +439,15 @@ else()
 endif()
 add_test(NAME database_cache_publication_test COMMAND database_cache_publication_test)
 
-option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for the portable runtime test" OFF)
+option(GX_ENABLE_PORTABLE_SANITIZERS "Enable ASan and UBSan for portable runtime and leaf traversal tests" OFF)
 if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
     target_compile_options(database_portable_runtime_test PRIVATE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(database_portable_runtime_test PRIVATE
+        -fsanitize=address,undefined)
+    target_compile_options(database_ndb1r4p11r3x_test PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(database_ndb1r4p11r3x_test PRIVATE
         -fsanitize=address,undefined)
 endif()
 
