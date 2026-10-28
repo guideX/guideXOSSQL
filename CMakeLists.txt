@@ -32,6 +32,7 @@ add_library(gxos_database STATIC
     database/portable/gx_index_leaf_traversal.cpp
     database/portable/gx_index_internal_node.cpp
     database/portable/gx_index_tree_descent.cpp
+    database/portable/gx_index_lookup.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
@@ -258,6 +259,23 @@ else()
     target_compile_options(database_ndb1r4p11r3aa_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p11r3aa_test COMMAND database_ndb1r4p11r3aa_test)
+
+add_executable(database_ndb1r4p11r3ab_test
+    tests/database_ndb1r4p11r3ab_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3ab_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3ab_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+target_compile_definitions(database_ndb1r4p11r3ab_test PRIVATE
+    GX_R3AB_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/NDB1R4P11R3AA_production_internal_tree.hex"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3ab_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3ab_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3ab_test COMMAND database_ndb1r4p11r3ab_test)
 
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)

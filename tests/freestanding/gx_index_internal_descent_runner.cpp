@@ -10,6 +10,12 @@ extern "C" int gxIndexInternalDescentProbe(
     uint64_t pageCount, uint32_t ownerIndexId, uint64_t rootPageId,
     uint32_t expectedDuplicateCount);
 
+extern "C" int gxIndexCompleteLookupProbe(
+    const uint8_t* const* payloads, const uint64_t* pageIds,
+    const uint16_t* pageTypes, const size_t* lengths, size_t pageTotal,
+    uint64_t pageCount, uint32_t ownerIndexId, uint64_t rootPageId,
+    uint32_t expectedDuplicateCount);
+
 namespace {
 
 int hexDigit(char value) {
@@ -84,5 +90,14 @@ int main(int argc, char** argv) {
         pageTotal, pageCount, ownerIndexId, rootPageId,
         expectedDuplicateCount);
     if (result != 0) std::cerr << "R3AA freestanding probe step " << result << " failed\n";
-    return result;
+    if (result != 0) return result;
+    const int lookupResult = gxIndexCompleteLookupProbe(
+        payloadPointers.data(), pageIds.data(), pageTypes.data(), lengths.data(),
+        pageTotal, pageCount, ownerIndexId, rootPageId,
+        expectedDuplicateCount);
+    if (lookupResult != 0) {
+        std::cerr << "R3AB freestanding complete lookup step "
+                  << lookupResult << " failed\n";
+    }
+    return lookupResult;
 }
