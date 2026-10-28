@@ -12,6 +12,7 @@
 #include "portable/gx_index_leaf_entry.h"
 #include "portable/gx_index_leaf_traversal.h"
 #include "portable/gx_index_physical_key.h"
+#include "portable/gx_index_tree_descent.h"
 #include "portable/gx_page_visit_set.h"
 
 namespace gxos {
@@ -168,24 +169,26 @@ DbResult leafEntryDataError(GxIndexLeafError error) {
                            "index leaf entry data is invalid");
 }
 
-struct IndexLeafProviderContext {
+struct IndexPageProviderContext {
     PageAccess& pages;
-    ::GxPageVisitSet& visited;
+    ::GxPageVisitSet* visited;
+    bool leafOnly;
     DatabasePage page;
     DbResult failure;
     bool hasFailure;
     bool active;
 
-    IndexLeafProviderContext(PageAccess& pageAccess,
-                             ::GxPageVisitSet& pageVisitTracker)
-        : pages(pageAccess), visited(pageVisitTracker), page(), failure(),
-          hasFailure(false), active(false) {}
+    IndexPageProviderContext(PageAccess& pageAccess,
+                             ::GxPageVisitSet* pageVisitTracker,
+                             bool onlyLeafPages)
+        : pages(pageAccess), visited(pageVisitTracker), leafOnly(onlyLeafPages),
+          page(), failure(), hasFailure(false), active(false) {}
 };
 
-GxIndexPageProviderStatus acquireIndexLeafPage(
+GxIndexPageProviderStatus acquireIndexPage(
     void* opaque, uint64_t pageId, GxIndexPageView* outView) {
-    IndexLeafProviderContext* context =
-        static_cast<IndexLeafProviderContext*>(opaque);
+    IndexPageProviderContext* context =
+        static_cast<IndexPageProviderContext*>(opaque);
     if (context == nullptr || outView == nullptr || context->active) {
         if (context != nullptr) {
             context->failure = DbResult::error(
@@ -196,24 +199,29 @@ GxIndexPageProviderStatus acquireIndexLeafPage(
     }
     outView->bytes = nullptr;
     outView->length = 0;
+    outView->pageId = 0;
+    outView->pageType = 0;
     outView->token = nullptr;
 
-    bool revisited = false;
-    const GxStatus visitStatus = context->visited.visit(pageId, revisited);
-    if (visitStatus != GxStatus::Ok) {
-        context->failure = visitStatus == GxStatus::CorruptData
-            ? DbResult::error(DbStatus::CorruptPage,
-                              "index page visit id out of range")
-            : DbResult::error(DbStatus::NoSpace,
-                              "index page visit bookkeeping unavailable");
-        context->hasFailure = true;
-        return GxIndexPageProviderStatus::Error;
-    }
-    if (revisited) {
-        context->failure = DbResult::error(DbStatus::CorruptPage,
-                                           "index leaf chain cycle");
-        context->hasFailure = true;
-        return GxIndexPageProviderStatus::Error;
+    if (context->visited != nullptr) {
+        bool revisited = false;
+        const GxStatus visitStatus = context->visited->visit(pageId, revisited);
+        if (visitStatus != GxStatus::Ok) {
+            context->failure = visitStatus == GxStatus::CorruptData
+                ? DbResult::error(DbStatus::CorruptPage,
+                                  "index page visit id out of range")
+                : DbResult::error(DbStatus::NoSpace,
+                                  "index page visit bookkeeping unavailable");
+            context->hasFailure = true;
+            return GxIndexPageProviderStatus::Error;
+        }
+        if (revisited) {
+            context->failure = DbResult::error(
+                DbStatus::CorruptPage, context->leafOnly
+                    ? "index leaf chain cycle" : "index tree cycle");
+            context->hasFailure = true;
+            return GxIndexPageProviderStatus::Error;
+        }
     }
 
     DbResult readResult = context->pages.readPage(pageId, context->page);
@@ -230,7 +238,14 @@ GxIndexPageProviderStatus acquireIndexLeafPage(
         context->hasFailure = true;
         return GxIndexPageProviderStatus::Error;
     }
-    if (context->page.type != PageType::IndexLeaf) {
+    if (context->page.type != PageType::IndexLeaf &&
+        context->page.type != PageType::IndexInternal) {
+        context->failure = DbResult::error(
+            DbStatus::CorruptPage, "index page has an invalid type");
+        context->hasFailure = true;
+        return GxIndexPageProviderStatus::Error;
+    }
+    if (context->leafOnly && context->page.type != PageType::IndexLeaf) {
         context->failure = DbResult::error(
             DbStatus::CorruptPage, "index page is not a leaf");
         context->hasFailure = true;
@@ -239,28 +254,32 @@ GxIndexPageProviderStatus acquireIndexLeafPage(
     if (context->page.payload.size() !=
         DatabasePage::payloadCapacity(context->pages.pageSize())) {
         context->failure = DbResult::error(
-            DbStatus::CorruptPage, "index leaf payload size mismatch");
+            DbStatus::CorruptPage, "index page payload size mismatch");
         context->hasFailure = true;
         return GxIndexPageProviderStatus::Error;
     }
 
     outView->bytes = context->page.payload.data();
     outView->length = context->page.payload.size();
+    outView->pageId = context->page.pageId;
+    outView->pageType = static_cast<uint16_t>(context->page.type);
     outView->token = &context->page;
     context->active = true;
     return GxIndexPageProviderStatus::Ok;
 }
 
-void releaseIndexLeafPage(void* opaque, uint64_t,
-                           const GxIndexPageView* view) {
-    IndexLeafProviderContext* context =
-        static_cast<IndexLeafProviderContext*>(opaque);
+void releaseIndexPage(void* opaque, uint64_t,
+                      const GxIndexPageView* view) {
+    IndexPageProviderContext* context =
+        static_cast<IndexPageProviderContext*>(opaque);
     if (context == nullptr) return;
     if (!context->active || view == nullptr || view->token != &context->page ||
         view->bytes != context->page.payload.data() ||
-        view->length != context->page.payload.size()) {
+        view->length != context->page.payload.size() ||
+        view->pageId != context->page.pageId ||
+        view->pageType != static_cast<uint16_t>(context->page.type)) {
         context->failure = DbResult::error(
-            DbStatus::Internal, "index leaf provider released an invalid borrow");
+            DbStatus::Internal, "index page provider released an invalid borrow");
         context->hasFailure = true;
     }
     context->active = false;
@@ -2422,21 +2441,63 @@ DbResult IndexTree::lookupAll(const std::vector<uint8_t>& logicalKey, uint64_t r
     RowLocator minLocator(0, 0);
     appendLocator(probe, minLocator);
 
-    uint64_t leaf = 0;
-    std::vector<uint64_t> path;
-    DbResult result = findLeaf(rootPageId, probe, leaf, path);
-    if (!result.isOk()) {
-        return result;
-    }
-
     const uint64_t pageCount = _pages.pageCount();
+    IndexPageProviderContext descentContext(_pages, nullptr, false);
+    const GxIndexPageProvider descentProvider = {
+        &descentContext, acquireIndexPage, releaseIndexPage
+    };
+    uint64_t visitedPath[kMaxIndexDepth + 1] = {};
+    GxIndexTreeDescentResult descent = {};
+    const GxIndexTreeDescentStatus descentStatus =
+        gxIndexTreeDescendToLeaf(
+            &descentProvider, rootPageId, pageCount, _indexId,
+            probe.data(), probe.size(), kMaxIndexDepth, visitedPath,
+            sizeof(visitedPath) / sizeof(visitedPath[0]), &descent);
+    if (descentContext.hasFailure) return descentContext.failure;
+    if (descentContext.active) {
+        return DbResult::error(DbStatus::Internal,
+                               "index descent retained a borrowed page");
+    }
+    if (descentStatus != GxIndexTreeDescentStatus::Success) {
+        switch (descentStatus) {
+        case GxIndexTreeDescentStatus::Success:
+            break;
+        case GxIndexTreeDescentStatus::InvalidArgument:
+            return DbResult::error(DbStatus::InvalidArgument,
+                                   "index descent arguments are invalid");
+        case GxIndexTreeDescentStatus::InvalidPageId:
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index descent page id is out of range");
+        case GxIndexTreeDescentStatus::MissingPage:
+            return DbResult::error(DbStatus::OutOfBounds,
+                                   "index descent page is missing");
+        case GxIndexTreeDescentStatus::ProviderFailure:
+            return DbResult::error(DbStatus::IoError,
+                                   "index descent page provider failed");
+        case GxIndexTreeDescentStatus::CorruptPage:
+            if (descent.leafError != GxIndexLeafError::None) {
+                return leafEntryDataError(descent.leafError);
+            }
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index internal node or page is invalid");
+        case GxIndexTreeDescentStatus::Cycle:
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index tree cycle");
+        case GxIndexTreeDescentStatus::TraversalLimit:
+            return DbResult::error(DbStatus::CorruptPage,
+                                   "index tree exceeds maximum depth");
+        }
+    }
+    const uint64_t leaf = descent.leafPageId;
+
     ::GxPageVisitSet visited;
-    result = initializePageVisitTracker(visited, _traversalAllocator, pageCount);
+    DbResult result = initializePageVisitTracker(visited, _traversalAllocator,
+                                                  pageCount);
     if (!result.isOk()) return result;
 
-    IndexLeafProviderContext providerContext(_pages, visited);
+    IndexPageProviderContext providerContext(_pages, &visited, true);
     const GxIndexPageProvider provider = {
-        &providerContext, acquireIndexLeafPage, releaseIndexLeafPage
+        &providerContext, acquireIndexPage, releaseIndexPage
     };
     std::vector<uint8_t> previousPhysicalKey(capacity());
     IndexLookupVisitorContext visitorContext(out);

@@ -53,6 +53,8 @@ $sources = @(
     "database/portable/gx_index_physical_key.cpp",
     "database/portable/gx_index_leaf_entry.cpp",
     "database/portable/gx_index_leaf_traversal.cpp",
+    "database/portable/gx_index_internal_node.cpp",
+    "database/portable/gx_index_tree_descent.cpp",
     "database/portable/gx_owned_page.cpp",
     "database/portable/gx_heap_page_builder.cpp",
     "database/portable/gx_recovered_pages.cpp",
@@ -286,6 +288,128 @@ $probeSummary = @(
 )
 $probeSummary | Set-Content -LiteralPath (Join-Path $outputRoot "index-boundary-probe.tsv") -Encoding utf8
 $probeSummary
+
+# R3AA compiles and executes the production internal-node reader and bounded
+# root-to-leaf descent against a tree serialized by the hosted IndexTree
+# writer. The existing key/leaf proof above remains an independent R3Z check.
+$descentProbeSource = "tests/freestanding/gx_index_internal_descent_probe.cpp"
+$descentRunnerSource = "tests/freestanding/gx_index_internal_descent_runner.cpp"
+$descentFixture = Join-Path $repoRoot `
+    "tests/fixtures/NDB1R4P11R3AA_production_internal_tree.hex"
+if (-not (Test-Path -LiteralPath $descentFixture)) {
+    throw "The R3AA production-writer internal-tree fixture is missing: $descentFixture"
+}
+$descentProbePath = Join-Path $repoRoot $descentProbeSource
+$descentRunnerPath = Join-Path $repoRoot $descentRunnerSource
+$descentProbeObject = Join-Path $outputRoot "gx_index_internal_descent_probe.o"
+$descentLinkedObject = Join-Path $outputRoot "gx_index_internal_descent_probe.linked.o"
+$descentExecutable = Join-Path $outputRoot "gx_index_internal_descent_probe.exe"
+$descentProbeLog = Join-Path $outputRoot "gx_index_internal_descent_probe.compile.log"
+$physicalKeyObject = Join-Path $outputRoot "database__portable__gx_index_physical_key.o"
+$leafEntryObject = Join-Path $outputRoot "database__portable__gx_index_leaf_entry.o"
+$leafTraversalObject = Join-Path $outputRoot "database__portable__gx_index_leaf_traversal.o"
+$internalNodeObject = Join-Path $outputRoot "database__portable__gx_index_internal_node.o"
+$treeDescentObject = Join-Path $outputRoot "database__portable__gx_index_tree_descent.o"
+
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $descentCompileOutput = @(& $compilerCommand.Source @flags "-c" `
+        $descentProbePath "-o" $descentProbeObject 2>&1)
+    $descentCompileExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$descentCompileOutput | Set-Content -LiteralPath $descentProbeLog -Encoding utf8
+if ($descentCompileExit -ne 0) {
+    throw "Freestanding internal-node descent probe failed to compile; see $descentProbeLog"
+}
+
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $descentLinkOutput = @(& $ldCommand.Source "-r" "--no-undefined" `
+        $descentProbeObject $physicalKeyObject $leafEntryObject `
+        $leafTraversalObject $internalNodeObject $treeDescentObject `
+        "-o" $descentLinkedObject 2>&1)
+    $descentLinkExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($descentLinkExit -ne 0) {
+    $descentLinkOutput | Set-Content -LiteralPath `
+        (Join-Path $outputRoot "gx_index_internal_descent_probe.link.log") -Encoding utf8
+    throw "Freestanding internal-node descent probe failed its no-undefined link."
+}
+
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $descentUndefined = @(& $nmCommand.Source "-u" "-C" `
+        $descentLinkedObject 2>&1)
+    $descentUndefinedExit = $LASTEXITCODE
+    $descentSymbols = @(& $nmCommand.Source "-g" "-C" `
+        $descentLinkedObject 2>&1)
+    $descentSymbolsExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($descentUndefinedExit -ne 0 -or $descentSymbolsExit -ne 0 -or
+    $descentUndefined.Count -ne 0) {
+    throw "Freestanding internal-node descent probe has unresolved symbols or nm failed."
+}
+$requiredDescentSymbols = @(
+    "gxIndexInternalNodeCursorInit",
+    "gxIndexInternalNodeCursorReadNext",
+    "gxIndexInternalNodeSelectChild",
+    "gxIndexTreeDescendToLeaf",
+    "gxIndexLeafValidate",
+    "gxIndexLeafLookupChain"
+)
+foreach ($symbol in $requiredDescentSymbols) {
+    if (-not ($descentSymbols | Where-Object {
+        ([string]$_) -match ("\bT\s+" + [regex]::Escape($symbol) + "(?:$|\()")
+    })) {
+        throw "Freestanding descent proof is missing production symbol $symbol"
+    }
+}
+
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $descentHostLinkOutput = @(& $compilerCommand.Source $descentRunnerPath `
+        $descentProbeObject $physicalKeyObject $leafEntryObject `
+        $leafTraversalObject $internalNodeObject $treeDescentObject `
+        "-o" $descentExecutable 2>&1)
+    $descentHostLinkExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+if ($descentHostLinkExit -ne 0) {
+    $descentHostLinkOutput | Set-Content -LiteralPath `
+        (Join-Path $outputRoot "gx_index_internal_descent_probe.host-link.log") -Encoding utf8
+    throw "Could not build the hosted runner for the freestanding descent proof."
+}
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $descentRunOutput = @(& $descentExecutable $descentFixture 2>&1)
+    $descentRunExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
+$descentRunOutput | Set-Content -LiteralPath `
+    (Join-Path $outputRoot "gx_index_internal_descent_probe.run.log") -Encoding utf8
+if ($descentRunExit -ne 0) {
+    throw "Freestanding production internal-node descent probe returned $descentRunExit."
+}
+$descentProbeSummary = @(
+    "Probe`tCompile`tRelocatableLink`tHostedExecution`tUndefinedSymbols`tProductionSymbols",
+    "$descentProbeSource`tPASS`tPASS`tPASS`tnone`t$($requiredDescentSymbols -join ',')"
+)
+$descentProbeSummary | Set-Content -LiteralPath `
+    (Join-Path $outputRoot "index-internal-descent-probe.tsv") -Encoding utf8
+$descentProbeSummary
 
 $summaryPath = Join-Path $outputRoot "qualification.tsv"
 $summary | Set-Content -LiteralPath $summaryPath -Encoding utf8

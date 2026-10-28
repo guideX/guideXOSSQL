@@ -21,6 +21,13 @@ enum class GxIndexPageProviderStatus {
 struct GxIndexPageView {
     const uint8_t* bytes;
     size_t length;
+    // Outer database-page identity and type supplied by the provider. Leaf
+    // chain traversal only consumes the payload fields; root descent also
+    // checks these values before interpreting the payload. Descent requires
+    // the requested page id and actual persisted type (IndexLeaf=3 or
+    // IndexInternal=4).
+    uint64_t pageId;
+    uint16_t pageType;
     void* token;
 };
 
