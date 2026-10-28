@@ -52,6 +52,7 @@ $sources = @(
     "database/portable/gx_index_text_key.cpp",
     "database/portable/gx_index_physical_key.cpp",
     "database/portable/gx_index_leaf_entry.cpp",
+    "database/portable/gx_index_leaf_traversal.cpp",
     "database/portable/gx_owned_page.cpp",
     "database/portable/gx_heap_page_builder.cpp",
     "database/portable/gx_recovered_pages.cpp",
@@ -146,11 +147,15 @@ try {
     Pop-Location
 }
 
-# The production census includes the explicit source set above; R3X adds one
-# production unit (39 to 40). This separate probe includes the freestanding
+# The production census includes the explicit source set above; R3Z adds one
+# production unit (40 to 41). This separate probe includes the freestanding
 # public boundary, calls its declarations, and links the production objects.
 $probeSource = "tests/freestanding/gx_index_key_boundary_probe.cpp"
 $runnerSource = "tests/freestanding/gx_index_key_boundary_runner.cpp"
+$probeFixture = Join-Path $repoRoot "tests/fixtures/NDB1R4P11R3Z_production_leaf_chain.hex"
+if (-not (Test-Path -LiteralPath $probeFixture)) {
+    throw "The R3Z production-writer leaf-chain fixture is missing: $probeFixture"
+}
 $probeStem = "gx_index_key_boundary_probe"
 $probePath = Join-Path $repoRoot $probeSource
 $runnerPath = Join-Path $repoRoot $runnerSource
@@ -160,6 +165,7 @@ $booleanImplementationObject = Join-Path $outputRoot "database__portable__gx_ind
 $integerImplementationObject = Join-Path $outputRoot "database__portable__gx_index_integer_key.o"
 $physicalKeyImplementationObject = Join-Path $outputRoot "database__portable__gx_index_physical_key.o"
 $leafEntryImplementationObject = Join-Path $outputRoot "database__portable__gx_index_leaf_entry.o"
+$leafTraversalImplementationObject = Join-Path $outputRoot "database__portable__gx_index_leaf_traversal.o"
 $linkedObject = Join-Path $outputRoot ($probeStem + ".linked.o")
 $probeExecutable = Join-Path $outputRoot ($probeStem + ".exe")
 $probeLog = Join-Path $outputRoot ($probeStem + ".compile.log")
@@ -189,7 +195,7 @@ try {
     $linkOutput = @(& $ldCommand.Source "-r" "--no-undefined" $probeObject `
         $implementationObject $integerImplementationObject `
         $booleanImplementationObject $physicalKeyImplementationObject `
-        $leafEntryImplementationObject `
+        $leafEntryImplementationObject $leafTraversalImplementationObject `
         "-o" $linkedObject 2>&1)
     $linkExit = $LASTEXITCODE
 } finally {
@@ -234,7 +240,8 @@ $requiredIndexKeySymbols = @(
     "gxIndexLeafCursorInit",
     "gxIndexLeafCursorReadNext",
     "gxIndexLeafLookup",
-    "gxIndexLeafValidate"
+    "gxIndexLeafValidate",
+    "gxIndexLeafLookupChain"
 )
 foreach ($symbol in $requiredIndexKeySymbols) {
     if (-not ($probeSymbols | Where-Object { ([string]$_) -match ("\bT\s+" + [regex]::Escape($symbol) + "(?:$|\()") })) {
@@ -251,7 +258,7 @@ try {
     $hostLinkOutput = @(& $compilerCommand.Source $runnerPath $probeObject `
         $implementationObject $integerImplementationObject `
         $booleanImplementationObject $physicalKeyImplementationObject `
-        $leafEntryImplementationObject `
+        $leafEntryImplementationObject $leafTraversalImplementationObject `
         "-o" $probeExecutable 2>&1)
     $hostLinkExit = $LASTEXITCODE
 } finally {
@@ -264,11 +271,12 @@ if ($hostLinkExit -ne 0) {
 $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-    $null = & $probeExecutable 2>&1
+    $probeRunOutput = @(& $probeExecutable $probeFixture 2>&1)
     $probeRunExit = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedErrorActionPreference
 }
+$probeRunOutput | Set-Content -LiteralPath (Join-Path $outputRoot ($probeStem + ".run.log")) -Encoding utf8
 if ($probeRunExit -ne 0) {
     throw "Freestanding-compiled production index operation probe returned $probeRunExit."
 }

@@ -1,5 +1,6 @@
 #include "gx_index_key.h"
 #include "gx_index_leaf_entry.h"
+#include "gx_index_leaf_traversal.h"
 #include "gx_index_physical_key.h"
 
 namespace {
@@ -16,12 +17,119 @@ void storeProbeLe64(uint8_t* bytes, uint64_t value) {
     }
 }
 
+struct ProbePageProvider {
+    const uint8_t* const* payloads;
+    const uint64_t* pageIds;
+    const size_t* lengths;
+    size_t pageTotal;
+    uint64_t acquireCount;
+    uint64_t releaseCount;
+    uint64_t failOnAcquire;
+    uint64_t overridePageId;
+    const uint8_t* overrideBytes;
+    size_t overrideLength;
+    bool hasOverride;
+    bool active;
+    uint8_t buffer[480];
+};
+
+GxIndexPageProviderStatus probeAcquirePage(
+    void* opaque, uint64_t pageId, GxIndexPageView* outView) {
+    ProbePageProvider* provider = static_cast<ProbePageProvider*>(opaque);
+    if (provider == nullptr || outView == nullptr || provider->active) {
+        return GxIndexPageProviderStatus::Error;
+    }
+    ++provider->acquireCount;
+    outView->bytes = nullptr;
+    outView->length = 0;
+    outView->token = nullptr;
+    if (provider->failOnAcquire != 0 &&
+        provider->acquireCount == provider->failOnAcquire) {
+        return GxIndexPageProviderStatus::Error;
+    }
+
+    const uint8_t* bytes = nullptr;
+    size_t length = 0;
+    if (provider->hasOverride && pageId == provider->overridePageId) {
+        bytes = provider->overrideBytes;
+        length = provider->overrideLength;
+    } else {
+        for (size_t i = 0; i < provider->pageTotal; ++i) {
+            if (provider->pageIds[i] == pageId) {
+                bytes = provider->payloads[i];
+                length = provider->lengths[i];
+                break;
+            }
+        }
+    }
+    if (bytes == nullptr) return GxIndexPageProviderStatus::MissingPage;
+    if (length > sizeof(provider->buffer)) {
+        return GxIndexPageProviderStatus::Error;
+    }
+    for (size_t i = 0; i < length; ++i) provider->buffer[i] = bytes[i];
+    provider->active = true;
+    outView->bytes = provider->buffer;
+    outView->length = length;
+    outView->token = provider;
+    return GxIndexPageProviderStatus::Ok;
+}
+
+void probeReleasePage(void* opaque, uint64_t,
+                      const GxIndexPageView* view) {
+    ProbePageProvider* provider = static_cast<ProbePageProvider*>(opaque);
+    if (provider == nullptr) return;
+    if (!provider->active || view == nullptr || view->token != provider ||
+        view->bytes != provider->buffer) {
+        provider->active = false;
+        return;
+    }
+    provider->active = false;
+    ++provider->releaseCount;
+    for (size_t i = 0; i < sizeof(provider->buffer); ++i) {
+        provider->buffer[i] = 0xDDu;
+    }
+}
+
+struct ProbeMatchState {
+    uint64_t count;
+    uint64_t firstPageId;
+    bool sawAnotherPage;
+    bool invalid;
+};
+
+GxIndexLeafVisitControl probeVisitMatch(
+    void* opaque, uint64_t pageId, const GxIndexLeafEntryView* entry) {
+    ProbeMatchState* state = static_cast<ProbeMatchState*>(opaque);
+    const uint8_t expectedKey[] = {0x01u, 'm', 0, 'n'};
+    if (state == nullptr || entry == nullptr || entry->keyLength != 4 ||
+        entry->keyBytes[0] != expectedKey[0] ||
+        entry->keyBytes[1] != expectedKey[1] ||
+        entry->keyBytes[2] != expectedKey[2] ||
+        entry->keyBytes[3] != expectedKey[3] ||
+        entry->locatorPageId != 1 ||
+        entry->locatorSlot != 100u + state->count) {
+        if (state != nullptr) state->invalid = true;
+        return GxIndexLeafVisitControl::Error;
+    }
+    if (state->count == 0) state->firstPageId = pageId;
+    else if (pageId != state->firstPageId) state->sawAnotherPage = true;
+    ++state->count;
+    return GxIndexLeafVisitControl::Continue;
+}
+
 } // namespace
 
 // Freestanding compile/link probe for the production portable index-key API.
 // Keeping the encoded bytes on this stack frame makes the lifetime underlying
 // the borrowed decode view explicit for the entire use of that view.
-extern "C" int gxIndexKeyBoundaryProbe() {
+extern "C" int gxIndexKeyBoundaryProbe(
+    const uint8_t* const* leafPayloads,
+    const uint64_t* leafPageIds,
+    const size_t* leafLengths,
+    size_t leafCount,
+    uint64_t firstPageId,
+    uint64_t pageCount,
+    uint32_t ownerIndexId) {
     const uint8_t textBytes[] = {'a', 0x00u, 'b'};
     uint8_t encodedBytes[sizeof(textBytes) + 1] = {};
     size_t encodedLength = 0;
@@ -232,6 +340,109 @@ extern "C" int gxIndexKeyBoundaryProbe() {
         leafError != GxIndexLeafError::EntryOutOfRange || lookup.hasEntry ||
         lookup.entryPosition != 0 || lookup.continuation.pageBytes != 0) {
         return 21;
+    }
+
+    if (leafPayloads == nullptr || leafPageIds == nullptr ||
+        leafLengths == nullptr || leafCount < 3 || pageCount <= leafCount ||
+        firstPageId == 0 || ownerIndexId == 0) {
+        return 22;
+    }
+    ProbePageProvider pageProvider = {};
+    pageProvider.payloads = leafPayloads;
+    pageProvider.pageIds = leafPageIds;
+    pageProvider.lengths = leafLengths;
+    pageProvider.pageTotal = leafCount;
+    GxIndexPageProvider provider = {
+        &pageProvider, probeAcquirePage, probeReleasePage
+    };
+    uint8_t probePhysical[16] = {
+        0x01u, 'm', 0, 'n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    uint8_t previousPhysicalKey[480] = {};
+    ProbeMatchState matches = {};
+    GxIndexLeafTraversalResult traversal = {};
+    const GxIndexLeafTraversalStatus traversalStatus =
+        gxIndexLeafLookupChain(
+            &provider, firstPageId, pageCount, ownerIndexId,
+            pageCount - 1, probePhysical, sizeof(probePhysical),
+            previousPhysicalKey, sizeof(previousPhysicalKey),
+            probeVisitMatch, &matches, &traversal);
+    if ((traversalStatus != GxIndexLeafTraversalStatus::EndOfChain &&
+         traversalStatus != GxIndexLeafTraversalStatus::KeyBoundary) ||
+        matches.invalid || matches.count != 64 || !matches.sawAnotherPage ||
+        traversal.matchesVisited != 64 || traversal.pagesVisited < 3 ||
+        pageProvider.releaseCount != traversal.pagesVisited ||
+        pageProvider.active) {
+        return 23;
+    }
+
+    // A key beyond the serialized chain must visit each supplied leaf and
+    // stop only at the existing zero end marker.
+    pageProvider.acquireCount = 0;
+    pageProvider.releaseCount = 0;
+    const uint8_t beyondAllKeys[13] = {
+        0xFFu, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    matches = ProbeMatchState();
+    const GxIndexLeafTraversalStatus endStatus = gxIndexLeafLookupChain(
+        &provider, firstPageId, pageCount, ownerIndexId,
+        pageCount - 1, beyondAllKeys, sizeof(beyondAllKeys),
+        previousPhysicalKey, sizeof(previousPhysicalKey),
+        probeVisitMatch, &matches, &traversal);
+    if (endStatus != GxIndexLeafTraversalStatus::EndOfChain ||
+        matches.count != 0 || traversal.pagesVisited != leafCount ||
+        pageProvider.releaseCount != traversal.pagesVisited ||
+        pageProvider.active) {
+        return 24;
+    }
+
+    // A provider error after a successful borrow still releases that borrow.
+    pageProvider.acquireCount = 0;
+    pageProvider.releaseCount = 0;
+    pageProvider.failOnAcquire = 2;
+    matches = ProbeMatchState();
+    const GxIndexLeafTraversalStatus providerFailure =
+        gxIndexLeafLookupChain(
+            &provider, firstPageId, pageCount, ownerIndexId,
+            pageCount - 1, probePhysical, sizeof(probePhysical),
+            previousPhysicalKey, sizeof(previousPhysicalKey),
+            probeVisitMatch, &matches, &traversal);
+    if (providerFailure != GxIndexLeafTraversalStatus::ProviderFailure ||
+        pageProvider.releaseCount != 1 || pageProvider.active) {
+        return 25;
+    }
+
+    // Corrupt only the existing next-leaf field in a production-writer page
+    // payload. The portable traversal rejects it and releases the borrow.
+    pageProvider.acquireCount = 0;
+    pageProvider.releaseCount = 0;
+    pageProvider.failOnAcquire = 0;
+    uint8_t badFirstLeaf[480] = {};
+    size_t firstIndex = leafCount;
+    for (size_t i = 0; i < leafCount; ++i) {
+        if (leafPageIds[i] == firstPageId) firstIndex = i;
+    }
+    if (firstIndex == leafCount || leafLengths[firstIndex] != sizeof(badFirstLeaf)) {
+        return 26;
+    }
+    for (size_t i = 0; i < sizeof(badFirstLeaf); ++i) {
+        badFirstLeaf[i] = leafPayloads[firstIndex][i];
+    }
+    storeProbeLe64(badFirstLeaf + 8, pageCount);
+    pageProvider.overridePageId = firstPageId;
+    pageProvider.overrideBytes = badFirstLeaf;
+    pageProvider.overrideLength = sizeof(badFirstLeaf);
+    pageProvider.hasOverride = true;
+    matches = ProbeMatchState();
+    const GxIndexLeafTraversalStatus badLinkStatus =
+        gxIndexLeafLookupChain(
+            &provider, firstPageId, pageCount, ownerIndexId,
+            pageCount - 1, probePhysical, sizeof(probePhysical),
+            previousPhysicalKey, sizeof(previousPhysicalKey),
+            probeVisitMatch, &matches, &traversal);
+    if (badLinkStatus != GxIndexLeafTraversalStatus::InvalidPageId ||
+        pageProvider.releaseCount != 1 || pageProvider.active) {
+        return 27;
     }
     return 0;
 }

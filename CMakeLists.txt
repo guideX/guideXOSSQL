@@ -29,6 +29,7 @@ add_library(gxos_database STATIC
     database/portable/gx_index_text_key.cpp
     database/portable/gx_index_physical_key.cpp
     database/portable/gx_index_leaf_entry.cpp
+    database/portable/gx_index_leaf_traversal.cpp
     database/portable/gx_owned_page.cpp
     database/portable/gx_heap_page_builder.cpp
     database/portable/gx_recovered_pages.cpp
@@ -227,6 +228,20 @@ else()
     target_compile_options(database_ndb1r4p11r3y_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p11r3y_test COMMAND database_ndb1r4p11r3y_test)
+
+add_executable(database_ndb1r4p11r3z_test
+    tests/database_ndb1r4p11r3z_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3z_test PRIVATE gxos_database)
+target_include_directories(database_ndb1r4p11r3z_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3z_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3z_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3z_test COMMAND database_ndb1r4p11r3z_test)
 
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
@@ -469,6 +484,10 @@ if(GX_ENABLE_PORTABLE_SANITIZERS AND NOT MSVC)
     target_compile_options(database_ndb1r4p11r3y_test PRIVATE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(database_ndb1r4p11r3y_test PRIVATE
+        -fsanitize=address,undefined)
+    target_compile_options(database_ndb1r4p11r3z_test PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(database_ndb1r4p11r3z_test PRIVATE
         -fsanitize=address,undefined)
 endif()
 
