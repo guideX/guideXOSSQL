@@ -5,9 +5,12 @@
 **Outcome A — PORTABLE_INDEX_CROSS_PAGE_TRAVERSAL_VERIFIED**
 
 Starting HEAD: `0d2efa3fcf1d7b51e76f482b88c8b0994a3b6520` on `main`.
-At qualification start, local `main` was two commits ahead of `origin/main` and
-zero behind it. Ending HEAD is recorded after the local commit in the completion
-message. The SQL9/SQL10 and NDB1R4P10/NDB1R4P11 phase markers were unchanged.
+Qualification ending HEAD (R3Z implementation commit):
+`8f4d355fc559ac8557ce600952201d661b758fe7`. At qualification start, local
+`main` was two commits ahead of `origin/main` and zero behind it. The
+SQL9/SQL10 and NDB1R4P10/NDB1R4P11 phase markers were unchanged. A report-only
+follow-up commit records this ending hash; no implementation source changed
+after the qualification run.
 
 The production `IndexTree::lookupAll` path now uses the portable leaf-chain
 lookup operation after its existing hosted root-to-leaf descent. The existing
