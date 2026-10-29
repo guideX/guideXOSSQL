@@ -51,7 +51,7 @@ GxIndexLeafTraversalStatus publish(
 
 } // namespace
 
-GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
+static GxIndexLeafTraversalStatus scanRangeChainInternal(
     const GxIndexPageProvider* provider,
     uint64_t firstPageId,
     uint64_t pageCount,
@@ -59,11 +59,20 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
     uint64_t maxPagesToVisit,
     const uint8_t* physicalLowerBound,
     size_t physicalLowerBoundLength,
+    bool hasLower,
+    const uint8_t* lowerKeyBytes,
+    size_t lowerKeyLength,
+    bool lowerInclusive,
+    bool hasUpper,
+    const uint8_t* upperKeyBytes,
+    size_t upperKeyLength,
+    bool upperInclusive,
     uint8_t* previousPhysicalKey,
     size_t previousPhysicalKeyCapacity,
     GxIndexLeafMatchVisitorFn visitor,
     void* visitorContext,
-    GxIndexLeafTraversalResult* outResult) {
+    GxIndexLeafTraversalResult* outResult,
+    bool verifyUpperBoundary) {
     GxIndexLeafTraversalResult result = {};
     result.providerStatus = GxIndexPageProviderStatus::Ok;
     result.leafError = GxIndexLeafError::None;
@@ -73,6 +82,10 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
         outResult == nullptr || physicalLowerBound == nullptr ||
         previousPhysicalKey == nullptr ||
         physicalLowerBoundLength < kPhysicalLocatorBytes ||
+        (hasLower && lowerKeyBytes == nullptr) ||
+        (!hasLower && (lowerKeyBytes != nullptr || lowerKeyLength != 0)) ||
+        (hasUpper && upperKeyBytes == nullptr) ||
+        (!hasUpper && (upperKeyBytes != nullptr || upperKeyLength != 0)) ||
         previousPhysicalKeyCapacity == 0 || pageCount <= 1 ||
         maxPagesToVisit == 0) {
         return GxIndexLeafTraversalStatus::InvalidArgument;
@@ -84,18 +97,41 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
                       sizeof(*provider)) ||
         rangesOverlap(outResult, sizeof(*outResult), physicalLowerBound,
                       physicalLowerBoundLength) ||
+        rangesOverlap(outResult, sizeof(*outResult), lowerKeyBytes,
+                      lowerKeyLength) ||
+        rangesOverlap(outResult, sizeof(*outResult), upperKeyBytes,
+                      upperKeyLength) ||
         rangesOverlap(outResult, sizeof(*outResult), previousPhysicalKey,
                       previousPhysicalKeyCapacity) ||
         rangesOverlap(previousPhysicalKey, previousPhysicalKeyCapacity,
-                      physicalLowerBound, physicalLowerBoundLength)) {
+                      physicalLowerBound, physicalLowerBoundLength) ||
+        rangesOverlap(previousPhysicalKey, previousPhysicalKeyCapacity,
+                      lowerKeyBytes, lowerKeyLength) ||
+        rangesOverlap(previousPhysicalKey, previousPhysicalKeyCapacity,
+                      upperKeyBytes, upperKeyLength) ||
+        ((lowerKeyBytes != upperKeyBytes ||
+          lowerKeyLength != upperKeyLength) &&
+         rangesOverlap(lowerKeyBytes, lowerKeyLength, upperKeyBytes,
+                       upperKeyLength))) {
         return GxIndexLeafTraversalStatus::InvalidArgument;
     }
 
-    const size_t logicalKeyLength =
+    const size_t probeLogicalKeyLength =
         physicalLowerBoundLength - kPhysicalLocatorBytes;
-    for (size_t i = logicalKeyLength; i < physicalLowerBoundLength; ++i) {
+    for (size_t i = probeLogicalKeyLength; i < physicalLowerBoundLength; ++i) {
         if (physicalLowerBound[i] != 0) {
             return GxIndexLeafTraversalStatus::InvalidArgument;
+        }
+    }
+    if ((hasLower && lowerKeyLength != probeLogicalKeyLength) ||
+        (!hasLower && probeLogicalKeyLength != 0)) {
+        return GxIndexLeafTraversalStatus::InvalidArgument;
+    }
+    if (hasLower) {
+        for (size_t i = 0; i < lowerKeyLength; ++i) {
+            if (physicalLowerBound[i] != lowerKeyBytes[i]) {
+                return GxIndexLeafTraversalStatus::InvalidArgument;
+            }
         }
     }
 
@@ -105,6 +141,7 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
     uint64_t currentPageId = firstPageId;
     size_t previousPhysicalKeyLength = 0;
     bool hasPreviousPhysicalKey = false;
+    bool upperBoundExceeded = false;
 
     while (currentPageId != 0) {
         if (result.pagesVisited >= pageLimit) {
@@ -137,6 +174,10 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
         if (view.bytes == nullptr || view.length == 0 ||
             rangesOverlap(view.bytes, view.length, physicalLowerBound,
                           physicalLowerBoundLength) ||
+            rangesOverlap(view.bytes, view.length, lowerKeyBytes,
+                          lowerKeyLength) ||
+            rangesOverlap(view.bytes, view.length, upperKeyBytes,
+                          upperKeyLength) ||
             rangesOverlap(view.bytes, view.length, previousPhysicalKey,
                           previousPhysicalKeyCapacity) ||
             rangesOverlap(view.bytes, view.length, outResult,
@@ -233,26 +274,57 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
                 }
 
                 if (lookupStatus == GxStatus::Ok &&
+                    pageStatus == GxIndexLeafTraversalStatus::EndOfChain &&
+                    upperBoundExceeded && hasPageEntry) {
+                    // The previous leaf crossed the logical upper endpoint.
+                    // Validate this successor's first physical key against
+                    // the previous leaf before treating the range as done.
+                    pageStatus = GxIndexLeafTraversalStatus::KeyBoundary;
+                } else if (lookupStatus == GxStatus::Ok &&
                     pageStatus == GxIndexLeafTraversalStatus::EndOfChain) {
                     GxIndexLeafEntryView entry = lowerBound.entry;
                     bool hasCandidate = lowerBound.hasEntry;
                     GxIndexLeafCursor cursor = lowerBound.continuation;
                     while (hasCandidate) {
-                        comparison = 0;
-                        const GxStatus compareStatus =
-                            gxCompareIndexPhysicalKeyViews(
-                                entry.keyBytes, entry.keyLength, false, 0, 0,
-                                physicalLowerBound, logicalKeyLength, false,
-                                0, 0, &comparison);
-                        if (compareStatus != GxStatus::Ok) {
-                            pageStatus = GxIndexLeafTraversalStatus::CorruptPage;
-                            break;
+                        bool eligible = true;
+                        if (hasLower) {
+                            comparison = 0;
+                            const GxStatus compareStatus =
+                                gxCompareIndexPhysicalKeyViews(
+                                    entry.keyBytes, entry.keyLength, false, 0, 0,
+                                    lowerKeyBytes, lowerKeyLength, false, 0, 0,
+                                    &comparison);
+                            if (compareStatus != GxStatus::Ok) {
+                                pageStatus = GxIndexLeafTraversalStatus::CorruptPage;
+                                break;
+                            }
+                            if (comparison < 0 ||
+                                (comparison == 0 && !lowerInclusive)) {
+                                eligible = false;
+                            }
                         }
-                        if (comparison > 0) {
-                            pageStatus = GxIndexLeafTraversalStatus::KeyBoundary;
-                            break;
+                        if (eligible && hasUpper) {
+                            comparison = 0;
+                            const GxStatus compareStatus =
+                                gxCompareIndexPhysicalKeyViews(
+                                    entry.keyBytes, entry.keyLength, false, 0, 0,
+                                    upperKeyBytes, upperKeyLength, false, 0, 0,
+                                    &comparison);
+                            if (compareStatus != GxStatus::Ok) {
+                                pageStatus = GxIndexLeafTraversalStatus::CorruptPage;
+                                break;
+                            }
+                            if (comparison > 0 ||
+                                (comparison == 0 && !upperInclusive)) {
+                                if (verifyUpperBoundary) {
+                                    upperBoundExceeded = true;
+                                } else {
+                                    pageStatus = GxIndexLeafTraversalStatus::KeyBoundary;
+                                }
+                                break;
+                            }
                         }
-                        if (comparison == 0) {
+                        if (eligible) {
                             if (result.matchesVisited ==
                                 static_cast<uint64_t>(-1)) {
                                 pageStatus = GxIndexLeafTraversalStatus::CorruptPage;
@@ -290,11 +362,76 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
             return publish(pageStatus, outResult, result);
         }
         if (nextPageId == 0) {
-            return publish(GxIndexLeafTraversalStatus::EndOfChain,
+            return publish(upperBoundExceeded
+                               ? GxIndexLeafTraversalStatus::KeyBoundary
+                               : GxIndexLeafTraversalStatus::EndOfChain,
                            outResult, result);
         }
         currentPageId = nextPageId;
     }
 
     return publish(GxIndexLeafTraversalStatus::EndOfChain, outResult, result);
+}
+
+GxIndexLeafTraversalStatus gxIndexLeafScanRangeChain(
+    const GxIndexPageProvider* provider,
+    uint64_t firstPageId,
+    uint64_t pageCount,
+    uint32_t expectedOwnerIndexId,
+    uint64_t maxPagesToVisit,
+    const uint8_t* physicalLowerBound,
+    size_t physicalLowerBoundLength,
+    bool hasLower,
+    const uint8_t* lowerKeyBytes,
+    size_t lowerKeyLength,
+    bool lowerInclusive,
+    bool hasUpper,
+    const uint8_t* upperKeyBytes,
+    size_t upperKeyLength,
+    bool upperInclusive,
+    uint8_t* previousPhysicalKey,
+    size_t previousPhysicalKeyCapacity,
+    GxIndexLeafMatchVisitorFn visitor,
+    void* visitorContext,
+    GxIndexLeafTraversalResult* outResult) {
+    return scanRangeChainInternal(
+        provider, firstPageId, pageCount, expectedOwnerIndexId,
+        maxPagesToVisit, physicalLowerBound, physicalLowerBoundLength,
+        hasLower, lowerKeyBytes, lowerKeyLength, lowerInclusive,
+        hasUpper, upperKeyBytes, upperKeyLength, upperInclusive,
+        previousPhysicalKey, previousPhysicalKeyCapacity, visitor,
+        visitorContext, outResult, true);
+}
+
+GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
+    const GxIndexPageProvider* provider,
+    uint64_t firstPageId,
+    uint64_t pageCount,
+    uint32_t expectedOwnerIndexId,
+    uint64_t maxPagesToVisit,
+    const uint8_t* physicalLowerBound,
+    size_t physicalLowerBoundLength,
+    uint8_t* previousPhysicalKey,
+    size_t previousPhysicalKeyCapacity,
+    GxIndexLeafMatchVisitorFn visitor,
+    void* visitorContext,
+    GxIndexLeafTraversalResult* outResult) {
+    if (physicalLowerBound == nullptr ||
+        physicalLowerBoundLength < kPhysicalLocatorBytes) {
+        return scanRangeChainInternal(
+            provider, firstPageId, pageCount, expectedOwnerIndexId,
+            maxPagesToVisit, physicalLowerBound, physicalLowerBoundLength,
+            true, nullptr, 0, true, true, nullptr, 0, true,
+            previousPhysicalKey, previousPhysicalKeyCapacity, visitor,
+            visitorContext, outResult, false);
+    }
+    const size_t logicalKeyLength =
+        physicalLowerBoundLength - kPhysicalLocatorBytes;
+    return scanRangeChainInternal(
+        provider, firstPageId, pageCount, expectedOwnerIndexId,
+        maxPagesToVisit, physicalLowerBound, physicalLowerBoundLength,
+        true, physicalLowerBound, logicalKeyLength, true,
+        true, physicalLowerBound, logicalKeyLength, true,
+        previousPhysicalKey, previousPhysicalKeyCapacity, visitor,
+        visitorContext, outResult, false);
 }

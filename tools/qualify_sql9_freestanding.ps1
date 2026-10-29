@@ -297,9 +297,9 @@ $descentProbeSource = "tests/freestanding/gx_index_internal_descent_probe.cpp"
 $completeLookupProbeSource = "tests/freestanding/gx_index_complete_lookup_probe.cpp"
 $descentRunnerSource = "tests/freestanding/gx_index_internal_descent_runner.cpp"
 $descentFixture = Join-Path $repoRoot `
-    "tests/fixtures/NDB1R4P11R3AA_production_internal_tree.hex"
+    "tests/fixtures/NDB1R4P11R3AC_production_range_tree.hex"
 if (-not (Test-Path -LiteralPath $descentFixture)) {
-    throw "The R3AA production-writer internal-tree fixture is missing: $descentFixture"
+    throw "The R3AC production-writer range-tree fixture is missing: $descentFixture"
 }
 $descentProbePath = Join-Path $repoRoot $descentProbeSource
 $completeLookupProbePath = Join-Path $repoRoot $completeLookupProbeSource
@@ -386,8 +386,10 @@ $requiredDescentSymbols = @(
     "gxIndexInternalNodeSelectChild",
     "gxIndexTreeDescendToLeaf",
     "gxIndexLookupAll",
+    "gxIndexRangeScan",
     "gxIndexLeafValidate",
-    "gxIndexLeafLookupChain"
+    "gxIndexLeafLookupChain",
+    "gxIndexLeafScanRangeChain"
 )
 foreach ($symbol in $requiredDescentSymbols) {
     if (-not ($descentSymbols | Where-Object {

@@ -40,6 +40,20 @@ enum class GxIndexLookupVisitControl {
 typedef GxIndexLookupVisitControl (*GxIndexLookupMatchVisitorFn)(
     void* context, uint64_t locatorPageId, uint32_t locatorSlot);
 
+enum class GxIndexRangeScanVisitControl {
+    Continue = 0,
+    Stop,
+    Error
+};
+
+// The logical key bytes are borrowed from the active leaf page and are valid
+// only until this callback returns. Locator fields are passed by value. The
+// visitor may copy the key, but must not retain the pointer, release the page,
+// or re-enter the scan.
+typedef GxIndexRangeScanVisitControl (*GxIndexRangeScanVisitorFn)(
+    void* context, const uint8_t* logicalKeyBytes, size_t logicalKeyLength,
+    uint64_t locatorPageId, uint32_t locatorSlot);
+
 struct GxIndexLookupResult {
     uint64_t leafPageId;
     uint64_t descentPagesVisited;
@@ -96,6 +110,46 @@ GxIndexLookupStatus gxIndexLookupAll(
     uint8_t* previousPhysicalKey,
     size_t previousPhysicalKeyCapacity,
     GxIndexLookupMatchVisitorFn visitor,
+    void* visitorContext,
+    GxIndexLookupResult* outResult);
+
+// Performs a bounded read-only logical-key range scan using the same provider
+// and descent contracts as gxIndexLookupAll. Encoded bounds are compared as
+// complete logical byte sequences; physical row-locator suffixes participate
+// only in page descent and entry ordering. An omitted lower endpoint starts
+// from the minimum physical probe (twelve zero bytes). The physicalLowerBound
+// scratch must hold the selected lower probe plus its 12-byte locator suffix.
+// Range endpoint spans use the existing tagged index encoding convention:
+// NULL is the one-byte 0x00 key and non-NULL keys begin with 0x01. Type-specific
+// encoding remains the hosted adapter's responsibility.
+//
+// If both valid endpoints describe an empty interval, the operation completes
+// with no visitor calls after validating the root id and argument spans. On
+// non-complete failures after callbacks, the returned status is authoritative
+// and the caller must discard partial results. Visitor stop is reported as
+// VisitorStopped and releases the active page before returning.
+GxIndexLookupStatus gxIndexRangeScan(
+    const GxIndexPageProvider* provider,
+    uint64_t rootPageId,
+    uint64_t pageCount,
+    uint32_t expectedOwnerIndexId,
+    bool hasLower,
+    const uint8_t* lowerKeyBytes,
+    size_t lowerKeyLength,
+    bool lowerInclusive,
+    bool hasUpper,
+    const uint8_t* upperKeyBytes,
+    size_t upperKeyLength,
+    bool upperInclusive,
+    uint32_t maxDepth,
+    uint64_t* visitedPathPageIds,
+    size_t visitedPathPageIdCapacity,
+    uint64_t maxLeafPagesToVisit,
+    uint8_t* physicalLowerBound,
+    size_t physicalLowerBoundCapacity,
+    uint8_t* previousPhysicalKey,
+    size_t previousPhysicalKeyCapacity,
+    GxIndexRangeScanVisitorFn visitor,
     void* visitorContext,
     GxIndexLookupResult* outResult);
 

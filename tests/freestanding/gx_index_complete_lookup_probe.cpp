@@ -29,6 +29,12 @@ struct MatchState {
     bool invalid;
 };
 
+struct RangeMatchState {
+    uint64_t count;
+    uint32_t stopAfter;
+    bool invalid;
+};
+
 GxIndexPageProviderStatus acquirePage(
     void* opaque, uint64_t pageId, GxIndexPageView* outView) {
     ProbePageProvider* provider = static_cast<ProbePageProvider*>(opaque);
@@ -105,6 +111,29 @@ GxIndexLookupVisitControl visitMatch(
     return GxIndexLookupVisitControl::Continue;
 }
 
+GxIndexRangeScanVisitControl visitRangeMatch(
+    void* opaque, const uint8_t* keyBytes, size_t keyLength,
+    uint64_t locatorPageId, uint32_t locatorSlot) {
+    RangeMatchState* state = static_cast<RangeMatchState*>(opaque);
+    static const uint8_t duplicateKey[] = {0x01u, 'm', '-', 'd', 'u', 'p'};
+    if (state == nullptr || keyBytes == nullptr ||
+        keyLength != sizeof(duplicateKey) || locatorPageId != 1 ||
+        locatorSlot != 1000u + state->count) {
+        if (state != nullptr) state->invalid = true;
+        return GxIndexRangeScanVisitControl::Error;
+    }
+    for (size_t i = 0; i < sizeof(duplicateKey); ++i) {
+        if (keyBytes[i] != duplicateKey[i]) {
+            state->invalid = true;
+            return GxIndexRangeScanVisitControl::Error;
+        }
+    }
+    ++state->count;
+    return state->stopAfter != 0 && state->count == state->stopAfter
+        ? GxIndexRangeScanVisitControl::Stop
+        : GxIndexRangeScanVisitControl::Continue;
+}
+
 void resetProvider(ProbePageProvider& provider) {
     provider.acquireCount = 0;
     provider.successfulAcquireCount = 0;
@@ -133,6 +162,29 @@ GxIndexLookupStatus lookup(
         sizeof(visitedPath) / sizeof(visitedPath[0]), pageCount - 1,
         lowerBound, sizeof(lowerBound), previousPhysicalKey,
         sizeof(previousPhysicalKey), visitMatch, &matches, &result);
+}
+
+GxIndexLookupStatus scanRange(
+    ProbePageProvider& state, uint64_t rootPageId, uint64_t pageCount,
+    uint32_t ownerIndexId, bool hasLower, bool lowerInclusive,
+    bool hasUpper, bool upperInclusive, RangeMatchState& matches,
+    GxIndexLookupResult& result) {
+    GxIndexPageProvider provider = {&state, acquirePage, releasePage};
+    state.rootPageId = rootPageId;
+    const uint8_t duplicateKey[] = {0x01u, 'm', '-', 'd', 'u', 'p'};
+    uint8_t lowerBound[sizeof(duplicateKey) + 12] = {};
+    uint8_t previousPhysicalKey[480] = {};
+    uint64_t visitedPath[gxos::db::kMaxIndexDepth + 1] = {};
+    return gxIndexRangeScan(
+        &provider, rootPageId, pageCount, ownerIndexId, hasLower,
+        hasLower ? duplicateKey : nullptr,
+        hasLower ? sizeof(duplicateKey) : 0, lowerInclusive,
+        hasUpper, hasUpper ? duplicateKey : nullptr,
+        hasUpper ? sizeof(duplicateKey) : 0, upperInclusive,
+        gxos::db::kMaxIndexDepth, visitedPath,
+        sizeof(visitedPath) / sizeof(visitedPath[0]), pageCount - 1,
+        lowerBound, sizeof(lowerBound), previousPhysicalKey,
+        sizeof(previousPhysicalKey), visitRangeMatch, &matches, &result);
 }
 
 } // namespace
@@ -214,6 +266,57 @@ extern "C" int gxIndexCompleteLookupProbe(
                corruptMatches, corrupt) != GxIndexLookupStatus::CorruptPage ||
         provider.active || provider.releaseCount != 1) {
         return 6;
+    }
+
+    resetProvider(provider);
+    RangeMatchState ranged = {};
+    GxIndexLookupResult rangeResult = {};
+    if (scanRange(provider, rootPageId, pageCount, ownerIndexId,
+                  true, true, true, true, ranged, rangeResult) !=
+            GxIndexLookupStatus::Complete ||
+        ranged.invalid || ranged.count != expectedDuplicateCount ||
+        rangeResult.matchesVisited != expectedDuplicateCount ||
+        rangeResult.depth < 2 || rangeResult.leafPagesVisited < 2 ||
+        provider.active ||
+        provider.releaseCount != provider.successfulAcquireCount) {
+        return 7;
+    }
+
+    resetProvider(provider);
+    RangeMatchState rangeStopped = {};
+    rangeStopped.stopAfter = 3;
+    GxIndexLookupResult rangeStoppedResult = {};
+    if (scanRange(provider, rootPageId, pageCount, ownerIndexId,
+                  true, true, false, true, rangeStopped,
+                  rangeStoppedResult) != GxIndexLookupStatus::VisitorStopped ||
+        rangeStopped.invalid || rangeStopped.count != 3 ||
+        rangeStoppedResult.matchesVisited != 3 || provider.active ||
+        provider.releaseCount != provider.successfulAcquireCount) {
+        return 8;
+    }
+
+    resetProvider(provider);
+    RangeMatchState emptyRange = {};
+    GxIndexLookupResult emptyRangeResult = {};
+    if (scanRange(provider, rootPageId, pageCount, ownerIndexId,
+                  true, false, true, true, emptyRange,
+                  emptyRangeResult) != GxIndexLookupStatus::Complete ||
+        emptyRange.count != 0 || provider.acquireCount != 0) {
+        return 9;
+    }
+
+    resetProvider(provider);
+    RangeMatchState partialRange = {};
+    provider.visitorCount = &partialRange.count;
+    provider.failAfterVisitor = true;
+    GxIndexLookupResult partialRangeResult = {};
+    if (scanRange(provider, rootPageId, pageCount, ownerIndexId,
+                  true, true, false, true, partialRange,
+                  partialRangeResult) != GxIndexLookupStatus::ProviderFailure ||
+        partialRange.invalid || partialRange.count == 0 ||
+        partialRangeResult.matchesVisited == 0 || provider.active ||
+        provider.releaseCount != provider.successfulAcquireCount) {
+        return 10;
     }
 
     return 0;

@@ -1,6 +1,7 @@
 #include "gx_index_lookup.h"
 
 #include "database_format.h"
+#include "gx_index_physical_key.h"
 
 namespace {
 
@@ -8,7 +9,8 @@ const size_t kPhysicalLocatorBytes = 12;
 
 enum class ProviderPhase {
     Descent,
-    LeafChain
+    LeafChain,
+    RangeChain
 };
 
 struct ProviderBridge {
@@ -17,6 +19,10 @@ struct ProviderBridge {
     uint64_t borrowedPageId;
     const uint8_t* logicalKeyBytes;
     size_t logicalKeyLength;
+    const uint8_t* rangeLowerKeyBytes;
+    size_t rangeLowerKeyLength;
+    const uint8_t* rangeUpperKeyBytes;
+    size_t rangeUpperKeyLength;
     const uint8_t* physicalLowerBound;
     size_t physicalLowerBoundLength;
     const uint8_t* previousPhysicalKey;
@@ -85,6 +91,12 @@ GxIndexPageProviderStatus acquirePage(
         rangesOverlap(sourceView.bytes, sourceView.length,
                       bridge->logicalKeyBytes, bridge->logicalKeyLength) ||
         rangesOverlap(sourceView.bytes, sourceView.length,
+                      bridge->rangeLowerKeyBytes,
+                      bridge->rangeLowerKeyLength) ||
+        rangesOverlap(sourceView.bytes, sourceView.length,
+                      bridge->rangeUpperKeyBytes,
+                      bridge->rangeUpperKeyLength) ||
+        rangesOverlap(sourceView.bytes, sourceView.length,
                       bridge->physicalLowerBound,
                       bridge->physicalLowerBoundLength) ||
         rangesOverlap(sourceView.bytes, sourceView.length,
@@ -95,7 +107,7 @@ GxIndexPageProviderStatus acquirePage(
                       bridge->visitedPathPageIdCapacity * sizeof(uint64_t)) ||
         rangesOverlap(sourceView.bytes, sourceView.length,
                       bridge->outResult, sizeof(*bridge->outResult));
-    const bool invalidLeafView = bridge->phase == ProviderPhase::LeafChain &&
+    const bool invalidLeafView = bridge->phase != ProviderPhase::Descent &&
         (sourceView.pageId != pageId || sourceView.pageType !=
          static_cast<uint16_t>(gxos::db::PageType::IndexLeaf));
     if (aliasesCallerStorage || invalidLeafView) {
@@ -136,6 +148,11 @@ struct VisitorBridge {
     void* context;
 };
 
+struct RangeVisitorBridge {
+    GxIndexRangeScanVisitorFn visitor;
+    void* context;
+};
+
 GxIndexLeafVisitControl visitMatch(
     void* opaque, uint64_t, const GxIndexLeafEntryView* entry) {
     VisitorBridge* bridge = static_cast<VisitorBridge*>(opaque);
@@ -151,6 +168,30 @@ GxIndexLeafVisitControl visitMatch(
         return GxIndexLeafVisitControl::Stop;
     }
     return GxIndexLeafVisitControl::Error;
+}
+
+GxIndexLeafVisitControl visitRangeMatch(
+    void* opaque, uint64_t, const GxIndexLeafEntryView* entry) {
+    RangeVisitorBridge* bridge = static_cast<RangeVisitorBridge*>(opaque);
+    if (bridge == nullptr || bridge->visitor == nullptr || entry == nullptr) {
+        return GxIndexLeafVisitControl::Error;
+    }
+    const GxIndexRangeScanVisitControl control = bridge->visitor(
+        bridge->context, entry->keyBytes, entry->keyLength,
+        entry->locatorPageId, entry->locatorSlot);
+    if (control == GxIndexRangeScanVisitControl::Continue) {
+        return GxIndexLeafVisitControl::Continue;
+    }
+    if (control == GxIndexRangeScanVisitControl::Stop) {
+        return GxIndexLeafVisitControl::Stop;
+    }
+    return GxIndexLeafVisitControl::Error;
+}
+
+bool validEncodedLogicalKey(const uint8_t* bytes, size_t length) {
+    if (bytes == nullptr || length == 0) return false;
+    if (bytes[0] == 0) return length == 1;
+    return bytes[0] == 1;
 }
 
 GxIndexLookupStatus mapDescentStatus(
@@ -352,6 +393,227 @@ GxIndexLookupStatus gxIndexLookupAll(
         expectedOwnerIndexId, maxLeafPagesToVisit, physicalLowerBound,
         physicalLowerBoundLength, previousPhysicalKey,
         previousPhysicalKeyCapacity, visitMatch, &visitorBridge, &traversal);
+    if (providerBridge.active) releaseOutstanding(providerBridge);
+    result.leafPagesVisited = traversal.pagesVisited;
+    result.matchesVisited = traversal.matchesVisited;
+    result.providerStatus = traversal.providerStatus;
+    result.leafError = traversal.leafError;
+
+    if (providerBridge.releaseMismatch) {
+        result.error = GxIndexLookupError::ProviderView;
+        *outResult = result;
+        return GxIndexLookupStatus::CorruptPage;
+    }
+    result.error = providerBridge.invalidView
+        ? GxIndexLookupError::ProviderView : GxIndexLookupError::LeafTraversal;
+    const GxIndexLookupStatus status = mapLeafStatus(
+        result.leafTraversalStatus, providerBridge.invalidView);
+    if (status == GxIndexLookupStatus::Complete ||
+        status == GxIndexLookupStatus::VisitorStopped) {
+        result.error = GxIndexLookupError::None;
+    }
+    *outResult = result;
+    return status;
+}
+
+GxIndexLookupStatus gxIndexRangeScan(
+    const GxIndexPageProvider* provider,
+    uint64_t rootPageId,
+    uint64_t pageCount,
+    uint32_t expectedOwnerIndexId,
+    bool hasLower,
+    const uint8_t* lowerKeyBytes,
+    size_t lowerKeyLength,
+    bool lowerInclusive,
+    bool hasUpper,
+    const uint8_t* upperKeyBytes,
+    size_t upperKeyLength,
+    bool upperInclusive,
+    uint32_t maxDepth,
+    uint64_t* visitedPathPageIds,
+    size_t visitedPathPageIdCapacity,
+    uint64_t maxLeafPagesToVisit,
+    uint8_t* physicalLowerBound,
+    size_t physicalLowerBoundCapacity,
+    uint8_t* previousPhysicalKey,
+    size_t previousPhysicalKeyCapacity,
+    GxIndexRangeScanVisitorFn visitor,
+    void* visitorContext,
+    GxIndexLookupResult* outResult) {
+    if (provider == nullptr || provider->acquire == nullptr ||
+        provider->release == nullptr || outResult == nullptr ||
+        (hasLower && !validEncodedLogicalKey(lowerKeyBytes, lowerKeyLength)) ||
+        (!hasLower && (lowerKeyBytes != nullptr || lowerKeyLength != 0)) ||
+        (hasUpper && !validEncodedLogicalKey(upperKeyBytes, upperKeyLength)) ||
+        (!hasUpper && (upperKeyBytes != nullptr || upperKeyLength != 0)) ||
+        (hasLower && lowerKeyLength >
+            static_cast<size_t>(-1) - kPhysicalLocatorBytes) ||
+        pageCount < 2 || maxDepth > gxos::db::kMaxIndexDepth ||
+        visitedPathPageIds == nullptr ||
+        visitedPathPageIdCapacity < static_cast<size_t>(maxDepth) + 1u ||
+        visitedPathPageIdCapacity >
+            static_cast<size_t>(-1) / sizeof(uint64_t) ||
+        maxLeafPagesToVisit == 0 || physicalLowerBound == nullptr ||
+        previousPhysicalKey == nullptr || previousPhysicalKeyCapacity == 0 ||
+        visitor == nullptr) {
+        return GxIndexLookupStatus::InvalidArgument;
+    }
+
+    const size_t physicalLowerBoundLength = hasLower
+        ? lowerKeyLength + kPhysicalLocatorBytes : kPhysicalLocatorBytes;
+    if (physicalLowerBoundCapacity < physicalLowerBoundLength) {
+        return GxIndexLookupStatus::InvalidArgument;
+    }
+    const size_t visitedPathBytes =
+        visitedPathPageIdCapacity * sizeof(uint64_t);
+    if (rangesOverlap(outResult, sizeof(*outResult), provider,
+                      sizeof(*provider)) ||
+        spansOverlap(lowerKeyBytes, lowerKeyLength, outResult,
+                     sizeof(*outResult)) ||
+        spansOverlap(upperKeyBytes, upperKeyLength, outResult,
+                     sizeof(*outResult)) ||
+        spansOverlap(lowerKeyBytes, lowerKeyLength, visitedPathPageIds,
+                     visitedPathBytes) ||
+        spansOverlap(upperKeyBytes, upperKeyLength, visitedPathPageIds,
+                     visitedPathBytes) ||
+        spansOverlap(lowerKeyBytes, lowerKeyLength, physicalLowerBound,
+                     physicalLowerBoundLength) ||
+        spansOverlap(upperKeyBytes, upperKeyLength, physicalLowerBound,
+                     physicalLowerBoundLength) ||
+        spansOverlap(lowerKeyBytes, lowerKeyLength, previousPhysicalKey,
+                     previousPhysicalKeyCapacity) ||
+        spansOverlap(upperKeyBytes, upperKeyLength, previousPhysicalKey,
+                     previousPhysicalKeyCapacity) ||
+        spansOverlap(physicalLowerBound, physicalLowerBoundLength,
+                     previousPhysicalKey, previousPhysicalKeyCapacity) ||
+        spansOverlap(physicalLowerBound, physicalLowerBoundLength,
+                     visitedPathPageIds, visitedPathBytes) ||
+        spansOverlap(physicalLowerBound, physicalLowerBoundLength,
+                     outResult, sizeof(*outResult)) ||
+        spansOverlap(previousPhysicalKey, previousPhysicalKeyCapacity,
+                     visitedPathPageIds, visitedPathBytes) ||
+        spansOverlap(previousPhysicalKey, previousPhysicalKeyCapacity,
+                     outResult, sizeof(*outResult)) ||
+        spansOverlap(visitedPathPageIds, visitedPathBytes,
+                     outResult, sizeof(*outResult)) ||
+        rangesOverlap(provider, sizeof(*provider), lowerKeyBytes,
+                      lowerKeyLength) ||
+        rangesOverlap(provider, sizeof(*provider), upperKeyBytes,
+                      upperKeyLength) ||
+        rangesOverlap(provider, sizeof(*provider), physicalLowerBound,
+                      physicalLowerBoundLength) ||
+        rangesOverlap(provider, sizeof(*provider), previousPhysicalKey,
+                      previousPhysicalKeyCapacity) ||
+        rangesOverlap(provider, sizeof(*provider), visitedPathPageIds,
+                      visitedPathBytes)) {
+        return GxIndexLookupStatus::InvalidArgument;
+    }
+
+    GxIndexLookupResult result = {};
+    result.providerStatus = GxIndexPageProviderStatus::Ok;
+    result.descentStatus = GxIndexTreeDescentStatus::InvalidArgument;
+    result.descentError = GxIndexTreeDescentError::None;
+    result.internalNodeError = GxIndexInternalNodeError::None;
+    result.leafTraversalStatus = GxIndexLeafTraversalStatus::InvalidArgument;
+    result.leafError = GxIndexLeafError::None;
+    result.error = GxIndexLookupError::None;
+    if (rootPageId == 0 || rootPageId >= pageCount) {
+        result.descentStatus = GxIndexTreeDescentStatus::InvalidPageId;
+        result.error = GxIndexLookupError::Descent;
+        *outResult = result;
+        return GxIndexLookupStatus::InvalidPageId;
+    }
+
+    bool emptyInterval = false;
+    if (hasLower && hasUpper) {
+        int comparison = 0;
+        if (gxCompareIndexPhysicalKeyViews(
+                lowerKeyBytes, lowerKeyLength, false, 0, 0,
+                upperKeyBytes, upperKeyLength, false, 0, 0,
+                &comparison) != GxStatus::Ok) {
+            return GxIndexLookupStatus::InvalidArgument;
+        }
+        emptyInterval = comparison > 0 ||
+            (comparison == 0 && (!lowerInclusive || !upperInclusive));
+    }
+    if (emptyInterval) {
+        result.descentStatus = GxIndexTreeDescentStatus::Success;
+        result.leafTraversalStatus = GxIndexLeafTraversalStatus::EndOfChain;
+        *outResult = result;
+        return GxIndexLookupStatus::Complete;
+    }
+
+    if (hasLower) {
+        copyBytes(physicalLowerBound, lowerKeyBytes, lowerKeyLength);
+    }
+    for (size_t i = hasLower ? lowerKeyLength : 0;
+         i < physicalLowerBoundLength; ++i) {
+        physicalLowerBound[i] = 0;
+    }
+
+    ProviderBridge providerBridge = {};
+    providerBridge.source = provider;
+    providerBridge.borrowedView = GxIndexPageView();
+    providerBridge.borrowedPageId = 0;
+    providerBridge.logicalKeyBytes = hasLower ? lowerKeyBytes : nullptr;
+    providerBridge.logicalKeyLength = hasLower ? lowerKeyLength : 0;
+    providerBridge.rangeLowerKeyBytes = hasLower ? lowerKeyBytes : nullptr;
+    providerBridge.rangeLowerKeyLength = hasLower ? lowerKeyLength : 0;
+    providerBridge.rangeUpperKeyBytes = hasUpper ? upperKeyBytes : nullptr;
+    providerBridge.rangeUpperKeyLength = hasUpper ? upperKeyLength : 0;
+    providerBridge.physicalLowerBound = physicalLowerBound;
+    providerBridge.physicalLowerBoundLength = physicalLowerBoundLength;
+    providerBridge.previousPhysicalKey = previousPhysicalKey;
+    providerBridge.previousPhysicalKeyCapacity = previousPhysicalKeyCapacity;
+    providerBridge.visitedPathPageIds = visitedPathPageIds;
+    providerBridge.visitedPathPageIdCapacity = visitedPathPageIdCapacity;
+    providerBridge.outResult = outResult;
+    providerBridge.active = false;
+    providerBridge.invalidView = false;
+    providerBridge.releaseMismatch = false;
+    providerBridge.phase = ProviderPhase::Descent;
+    const GxIndexPageProvider bridgedProvider = {
+        &providerBridge, acquirePage, releasePage
+    };
+
+    GxIndexTreeDescentResult descent = {};
+    result.descentStatus = gxIndexTreeDescendToLeaf(
+        &bridgedProvider, rootPageId, pageCount, expectedOwnerIndexId,
+        physicalLowerBound, physicalLowerBoundLength, maxDepth,
+        visitedPathPageIds, visitedPathPageIdCapacity, &descent);
+    result.descentPagesVisited = descent.pagesVisited;
+    result.leafPageId = descent.leafPageId;
+    result.depth = descent.depth;
+    result.descentError = descent.error;
+    result.internalNodeError = descent.internalNodeError;
+    result.providerStatus = descent.providerStatus;
+    result.leafError = descent.leafError;
+
+    if (providerBridge.active) releaseOutstanding(providerBridge);
+    if (providerBridge.releaseMismatch) {
+        result.error = GxIndexLookupError::ProviderView;
+        *outResult = result;
+        return GxIndexLookupStatus::CorruptPage;
+    }
+    if (result.descentStatus != GxIndexTreeDescentStatus::Success) {
+        result.error = providerBridge.invalidView
+            ? GxIndexLookupError::ProviderView : GxIndexLookupError::Descent;
+        const GxIndexLookupStatus status = mapDescentStatus(
+            result.descentStatus, providerBridge.invalidView);
+        *outResult = result;
+        return status;
+    }
+
+    providerBridge.phase = ProviderPhase::RangeChain;
+    RangeVisitorBridge visitorBridge = {visitor, visitorContext};
+    GxIndexLeafTraversalResult traversal = {};
+    result.leafTraversalStatus = gxIndexLeafScanRangeChain(
+        &bridgedProvider, result.leafPageId, pageCount,
+        expectedOwnerIndexId, maxLeafPagesToVisit, physicalLowerBound,
+        physicalLowerBoundLength, hasLower, lowerKeyBytes, lowerKeyLength,
+        lowerInclusive, hasUpper, upperKeyBytes, upperKeyLength,
+        upperInclusive, previousPhysicalKey, previousPhysicalKeyCapacity,
+        visitRangeMatch, &visitorBridge, &traversal);
     if (providerBridge.active) releaseOutstanding(providerBridge);
     result.leafPagesVisited = traversal.pagesVisited;
     result.matchesVisited = traversal.matchesVisited;

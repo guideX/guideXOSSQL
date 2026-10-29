@@ -330,6 +330,29 @@ GxIndexLookupVisitControl collectIndexLookupMatch(
     return GxIndexLookupVisitControl::Continue;
 }
 
+struct IndexRangeScanVisitorContext {
+    std::vector<IndexEntry>& output;
+};
+
+GxIndexRangeScanVisitControl collectIndexRangeScanMatch(
+    void* opaque, const uint8_t* logicalKeyBytes, size_t logicalKeyLength,
+    uint64_t locatorPageId, uint32_t locatorSlot) {
+    IndexRangeScanVisitorContext* context =
+        static_cast<IndexRangeScanVisitorContext*>(opaque);
+    if (context == nullptr ||
+        (logicalKeyBytes == nullptr && logicalKeyLength != 0)) {
+        return GxIndexRangeScanVisitControl::Error;
+    }
+    IndexEntry entry;
+    if (logicalKeyLength != 0) {
+        entry.key.assign(logicalKeyBytes,
+                         logicalKeyBytes + logicalKeyLength);
+    }
+    entry.locator = RowLocator(locatorPageId, locatorSlot);
+    context->output.push_back(entry);
+    return GxIndexRangeScanVisitControl::Continue;
+}
+
 struct ScopedIndexPayload {
     GxArray bytes;
 
@@ -3199,119 +3222,90 @@ DbResult IndexTree::rangeScan(const IndexRangeBound& bound, uint64_t rootPageId,
             return DbResult::error(DbStatus::InvalidArgument, "invalid upper bound value");
         }
     }
-
-    uint64_t leaf = 0;
-    if (bound.hasLower) {
-        std::vector<uint8_t> probe = lowerEncoded;
-        appendLocator(probe, RowLocator(0, 0));
-        std::vector<uint64_t> path;
-        DbResult result = findLeaf(rootPageId, probe, leaf, path);
-        if (!result.isOk()) {
-            return result;
-        }
-    } else {
-        // Leftmost leaf: follow child 0 from the root.
-        uint64_t current = rootPageId;
-        const uint64_t pageCount = _pages.pageCount();
-        for (uint32_t depth = 0; depth <= kMaxIndexDepth; ++depth) {
-            if (current == 0 || current >= pageCount) {
-                return DbResult::error(DbStatus::CorruptPage, "index root page out of range");
-            }
-            DatabasePage page;
-            DbResult result = _pages.readPage(current, page);
-            if (!result.isOk()) {
-                return result;
-            }
-            if (page.type == PageType::IndexLeaf) {
-                leaf = current;
-                break;
-            }
-            if (page.type != PageType::IndexInternal) {
-                return DbResult::error(DbStatus::CorruptPage, "index page has unknown type");
-            }
-            InternalInfo info;
-            result = readInternal(current, page, info);
-            if (!result.isOk()) {
-                return result;
-            }
-            if (info.childCount == 0) {
-                return DbResult::error(DbStatus::CorruptPage,
-                                       "index internal node has no children");
-            }
-            std::vector<Child> children;
-            result = readInternalChildren(page, info, children);
-            if (!result.isOk()) {
-                return result;
-            }
-            current = children[0].pageId;
-        }
-        if (leaf == 0) {
-            return DbResult::error(DbStatus::CorruptPage, "index tree exceeds maximum depth");
-        }
-    }
-
     const uint64_t pageCount = _pages.pageCount();
-    ::GxPageVisitSet visited;
-    DbResult trackerResult = initializePageVisitTracker(visited,
-                                                          _traversalAllocator,
-                                                          pageCount);
+    ::GxPageVisitSet visitedLeaves;
+    DbResult trackerResult = initializePageVisitTracker(
+        visitedLeaves, _traversalAllocator, pageCount);
     if (!trackerResult.isOk()) return trackerResult;
-    while (leaf != 0) {
-        if (leaf >= pageCount) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf chain out of range");
-        }
-        bool revisited = false;
-        const GxStatus visitStatus = visited.visit(leaf, revisited);
-        if (visitStatus != GxStatus::Ok) {
-            return pageVisitTrackerError(visitStatus);
-        }
-        if (revisited) {
-            return DbResult::error(DbStatus::CorruptPage, "index leaf chain cycle");
-        }
-        DatabasePage page;
-        DbResult result = _pages.readPage(leaf, page);
-        if (!result.isOk()) {
-            return result;
-        }
-        LeafInfo info;
-        result = readLeaf(leaf, page, info);
-        if (!result.isOk()) {
-            return result;
-        }
-        std::vector<IndexEntry> entries;
-        result = readLeafEntries(page, info, entries);
-        if (!result.isOk()) {
-            return result;
-        }
-        for (size_t i = 0; i < entries.size(); ++i) {
-            const std::vector<uint8_t>& logical = entries[i].key;
-            if (bound.hasLower) {
-                std::vector<uint8_t> probe = lowerEncoded;
-                appendLocator(probe, RowLocator(0, 0));
-                const std::vector<uint8_t> physical =
-                    makePhysicalKey(logical, entries[i].locator);
-                if (compareEncodedKeys(physical.data(), physical.size(), probe.data(),
-                                       probe.size()) < 0) {
-                    continue;
-                }
-                if (!bound.lowerInclusive &&
-                    compareEncodedKeys(logical.data(), logical.size(),
-                                       lowerEncoded.data(), lowerEncoded.size()) == 0) {
-                    continue;
-                }
-            }
-            if (bound.hasUpper) {
-                const int cmp = compareEncodedKeys(logical.data(), logical.size(),
-                                                   upperEncoded.data(), upperEncoded.size());
-                if (bound.upperInclusive ? cmp > 0 : cmp >= 0) {
-                    return DbResult::ok();
-                }
-            }
-            out.push_back(entries[i]);
-        }
-        leaf = info.nextLeaf;
+
+    if (bound.hasLower && lowerEncoded.size() >
+        static_cast<size_t>(-1) - kIndexPhysicalLocatorBytes) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "index lower bound is too large");
     }
-    return DbResult::ok();
+    const size_t probeLength = bound.hasLower
+        ? lowerEncoded.size() + kIndexPhysicalLocatorBytes
+        : kIndexPhysicalLocatorBytes;
+    std::vector<uint8_t> physicalLowerBound(probeLength, 0);
+    if (bound.hasLower && !lowerEncoded.empty()) {
+        std::copy(lowerEncoded.begin(), lowerEncoded.end(),
+                  physicalLowerBound.begin());
+    }
+    std::vector<uint8_t> previousPhysicalKey(capacity());
+    std::vector<IndexEntry> staged;
+    IndexRangeScanVisitorContext visitorContext = {staged};
+    IndexPageProviderContext providerContext(_pages, &visitedLeaves, false,
+                                              true);
+    const GxIndexPageProvider provider = {
+        &providerContext, acquireIndexPage, releaseIndexPage
+    };
+    uint64_t visitedPath[kMaxIndexDepth + 1] = {};
+    GxIndexLookupResult scan = {};
+    const GxIndexLookupStatus scanStatus = gxIndexRangeScan(
+        &provider, rootPageId, pageCount, _indexId,
+        bound.hasLower, bound.hasLower ? lowerEncoded.data() : nullptr,
+        lowerEncoded.size(), bound.lowerInclusive,
+        bound.hasUpper, bound.hasUpper ? upperEncoded.data() : nullptr,
+        upperEncoded.size(), bound.upperInclusive, kMaxIndexDepth,
+        visitedPath, sizeof(visitedPath) / sizeof(visitedPath[0]),
+        pageCount > 1 ? pageCount - 1 : 0,
+        physicalLowerBound.data(), physicalLowerBound.size(),
+        previousPhysicalKey.data(), previousPhysicalKey.size(),
+        collectIndexRangeScanMatch, &visitorContext, &scan);
+
+    if (providerContext.hasFailure) return providerContext.failure;
+    if (providerContext.active) {
+        return DbResult::error(DbStatus::Internal,
+                               "index range scan retained a borrowed page");
+    }
+    switch (scanStatus) {
+    case GxIndexLookupStatus::Complete:
+    case GxIndexLookupStatus::VisitorStopped:
+        out.swap(staged);
+        return DbResult::ok();
+    case GxIndexLookupStatus::InvalidArgument:
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "index range scan arguments are invalid");
+    case GxIndexLookupStatus::InvalidPageId:
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index range scan page id is out of range");
+    case GxIndexLookupStatus::MissingPage:
+        return DbResult::error(DbStatus::OutOfBounds,
+                               "index range scan page is missing");
+    case GxIndexLookupStatus::ProviderFailure:
+        return DbResult::error(DbStatus::IoError,
+                               "index range scan page provider failed");
+    case GxIndexLookupStatus::CorruptPage:
+        if (scan.leafError != GxIndexLeafError::None) {
+            return leafEntryDataError(scan.leafError);
+        }
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index range scan page or provider view is invalid");
+    case GxIndexLookupStatus::Cycle:
+        return DbResult::error(DbStatus::CorruptPage,
+            scan.error == GxIndexLookupError::Descent
+                ? "index tree cycle" : "index leaf chain cycle");
+    case GxIndexLookupStatus::TraversalLimit:
+        return DbResult::error(DbStatus::CorruptPage,
+            scan.error == GxIndexLookupError::Descent
+                ? "index tree exceeds maximum depth"
+                : "index leaf traversal exceeded its page bound");
+    case GxIndexLookupStatus::VisitorFailure:
+        return DbResult::error(DbStatus::Internal,
+                               "index range scan visitor failed");
+    }
+    return DbResult::error(DbStatus::Internal,
+                           "index range scan returned an unknown status");
 }
 
 DbResult IndexTree::validate(uint64_t rootPageId, IndexValidation& out) const {

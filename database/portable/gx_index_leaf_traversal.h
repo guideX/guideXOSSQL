@@ -114,4 +114,36 @@ GxIndexLeafTraversalStatus gxIndexLeafLookupChain(
     void* visitorContext,
     GxIndexLeafTraversalResult* outResult);
 
+// Scans an ordered leaf chain starting at the leaf selected by
+// physicalLowerBound. The logical lower and upper bounds compare complete
+// encoded logical keys (the row-locator suffix is excluded). The seek probe
+// must be lowerKeyBytes || 12 zero locator bytes when hasLower is true, or
+// twelve zero bytes when no lower bound is present. A range can therefore
+// begin at every duplicate for its lower key before the visitor applies an
+// exclusive lower endpoint. A missing upper bound scans to the chain end.
+// KeyBoundary means an upper endpoint stopped the scan; EndOfChain means the
+// valid zero successor marker ended it. Both are normal completion statuses
+// for this operation. Entry views are borrowed only for the visitor call.
+GxIndexLeafTraversalStatus gxIndexLeafScanRangeChain(
+    const GxIndexPageProvider* provider,
+    uint64_t firstPageId,
+    uint64_t pageCount,
+    uint32_t expectedOwnerIndexId,
+    uint64_t maxPagesToVisit,
+    const uint8_t* physicalLowerBound,
+    size_t physicalLowerBoundLength,
+    bool hasLower,
+    const uint8_t* lowerKeyBytes,
+    size_t lowerKeyLength,
+    bool lowerInclusive,
+    bool hasUpper,
+    const uint8_t* upperKeyBytes,
+    size_t upperKeyLength,
+    bool upperInclusive,
+    uint8_t* previousPhysicalKey,
+    size_t previousPhysicalKeyCapacity,
+    GxIndexLeafMatchVisitorFn visitor,
+    void* visitorContext,
+    GxIndexLeafTraversalResult* outResult);
+
 #endif

@@ -42,7 +42,7 @@ bool parsePayload(const std::string& encoded, std::vector<uint8_t>& output) {
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::cerr << "expected the R3AA production internal-tree fixture path\n";
+        std::cerr << "expected the R3AC production range-tree fixture path\n";
         return 2;
     }
     std::ifstream input(argv[1], std::ios::in | std::ios::binary);
@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
                     rootPageId >> expectedDuplicateCount >> pageTotal) ||
         pageSize != 512 || pageCount <= pageTotal || pageTotal < 3 ||
         pageTotal > 4096 || rootPageId == 0 || expectedDuplicateCount < 2) {
-        std::cerr << "invalid R3AA fixture header\n";
+        std::cerr << "invalid R3AC fixture header\n";
         return 3;
     }
 
@@ -69,13 +69,13 @@ int main(int argc, char** argv) {
             pageIds[i] == 0 || pageIds[i] >= pageCount ||
             !parsePayload(encoded, payloads[i]) ||
             payloads[i].size() != pageSize - 32) {
-            std::cerr << "invalid R3AA fixture page record " << i << "\n";
+            std::cerr << "invalid R3AC fixture page record " << i << "\n";
             return 4;
         }
     }
     std::string extra;
     if (input >> extra) {
-        std::cerr << "unexpected trailing R3AA fixture data\n";
+        std::cerr << "unexpected trailing R3AC fixture data\n";
         return 5;
     }
 
@@ -89,14 +89,14 @@ int main(int argc, char** argv) {
         payloadPointers.data(), pageIds.data(), pageTypes.data(), lengths.data(),
         pageTotal, pageCount, ownerIndexId, rootPageId,
         expectedDuplicateCount);
-    if (result != 0) std::cerr << "R3AA freestanding probe step " << result << " failed\n";
+    if (result != 0) std::cerr << "R3AC freestanding descent probe step " << result << " failed\n";
     if (result != 0) return result;
     const int lookupResult = gxIndexCompleteLookupProbe(
         payloadPointers.data(), pageIds.data(), pageTypes.data(), lengths.data(),
         pageTotal, pageCount, ownerIndexId, rootPageId,
         expectedDuplicateCount);
     if (lookupResult != 0) {
-        std::cerr << "R3AB freestanding complete lookup step "
+        std::cerr << "R3AC freestanding complete lookup/range step "
                   << lookupResult << " failed\n";
     }
     return lookupResult;
