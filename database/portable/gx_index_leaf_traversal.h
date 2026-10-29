@@ -42,6 +42,14 @@ struct GxIndexPageProvider {
     GxIndexPageReleaseFn release;
 };
 
+// Snapshot contract for complete index operations: the caller must keep the
+// provider context alive for the entire operation, and rootPageId, pageCount,
+// and every successful acquire must describe one logically consistent,
+// read-only storage view. A snapshot token or matching page generation alone
+// does not establish that guarantee; the underlying storage/provider must
+// keep the view stable across all page acquisitions. A successful borrow is
+// immutable and remains valid through release().
+
 enum class GxIndexLeafVisitControl {
     Continue = 0,
     Stop,
