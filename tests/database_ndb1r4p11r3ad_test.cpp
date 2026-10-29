@@ -172,6 +172,20 @@ public:
         return pageId < _pages.size() && _present[static_cast<size_t>(pageId)]
             ? &_pages[static_cast<size_t>(pageId)] : nullptr;
     }
+    bool samePageBytes(const SnapshotPageAccess& other) const {
+        if (_pageSize != other._pageSize || _pages.size() != other._pages.size() ||
+            _present != other._present) return false;
+        for (size_t i = 0; i < _pages.size(); ++i) {
+            if (!_present[i]) continue;
+            const DatabasePage& left = _pages[i];
+            const DatabasePage& right = other._pages[i];
+            if (left.pageId != right.pageId || left.type != right.type ||
+                left.flags != right.flags || left.payloadSize != right.payloadSize ||
+                left.generation != right.generation ||
+                left.payload != right.payload) return false;
+        }
+        return true;
+    }
 
 private:
     uint32_t _pageSize;
@@ -241,6 +255,7 @@ void testStableSnapshots(GxAllocator& allocator) {
 
     SnapshotPageAccess snapshotA = source;
     snapshotA.setReadOnly(true);
+    const SnapshotPageAccess initialA = snapshotA;
     SnapshotPageAccess writableB = source;
     writableB.setReadOnly(false);
     IndexTree writerB(writableB, DbType::Text, owner, nullptr, &allocator);
@@ -254,6 +269,7 @@ void testStableSnapshots(GxAllocator& allocator) {
     CHECK(writerB.validate(rootB, validationB).isOk() && validationB.ok);
     SnapshotPageAccess snapshotB = writableB;
     snapshotB.setReadOnly(true);
+    const SnapshotPageAccess initialB = snapshotB;
 
     IndexTree treeA(snapshotA, DbType::Text, owner, nullptr, &allocator);
     IndexTree treeB(snapshotB, DbType::Text, owner, nullptr, &allocator);
@@ -303,6 +319,8 @@ void testStableSnapshots(GxAllocator& allocator) {
     CHECK(sameEntries(rows, stableA));
     DatabasePage rejectedWrite;
     CHECK(snapshotA.writePage(rejectedWrite).status() == DbStatus::ReadOnly);
+    CHECK(snapshotA.samePageBytes(initialA));
+    CHECK(snapshotB.samePageBytes(initialB));
 }
 
 void testSnapshotFailures(GxAllocator& allocator) {
