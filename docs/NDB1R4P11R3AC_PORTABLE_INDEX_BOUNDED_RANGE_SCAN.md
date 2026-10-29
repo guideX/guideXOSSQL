@@ -68,4 +68,4 @@ The production range and complete-lookup probes compile with those flags, link t
 
 Recommended next milestone: qualify a read-only guideXOS Server adapter mapping its transaction-consistent index pages to `GxIndexPageProvider`, then exercise point and range reads with duplicate runs, snapshot consistency, corruption, and provider failures. Keep writes, Float64 migration, SQL syntax, and planner work out of that milestone.
 
-Documentation commit and final HEAD: pending.
+Ending qualified source HEAD: `eacbffd837109a586d76e1fcf99bfec635e1360b`. This is the production revision under the final CTest aggregate. The report is a documentation-only follow-up and does not alter that tested source revision.
