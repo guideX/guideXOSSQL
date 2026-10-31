@@ -33,10 +33,11 @@ definitions in the hosted contract target. Live/concurrent access is rejected.
   `D:\dev\guideXOSServer_NATIVE_DB_STORAGE`, branch `NATIVE_DB`, starting
   HEAD `f29850c93bbac0a0763a31e806d2816310156575`; it was clean and its
   `.native-db.phase` remains NDB1R3 → NDB1R4.
-- Ending implementation commit: recorded after the implementation commit;
-  the following report-finalization commit updates this evidence file only.
-- No phase marker, Server file, persisted database/index/WAL format, recovery
-  order, or Git history was changed. No push, QEMU, or QAC run was performed.
+- Implementation commit: `2a461fa64d01932f9dab36bb9bbf2066792e9804`.
+  This evidence file is finalized in a subsequent documentation-only commit.
+- No phase marker, Server file, persisted database/index/WAL format, or
+  recovery order was changed. Git history was extended only by local commits;
+  no rewrite occurred. No push, QEMU, or QAC run was performed.
 
 The prior SQL qualifications read were
 `docs/NDB1R4P11R3AE_SQL_PAGE_PUBLICATION_READ_VIEW.md` and
@@ -302,7 +303,7 @@ the last page borrow.
 ## Commits and limits
 
 - Starting HEAD: `fb06228c7aad284328c5dee6c0c34e5c0d4a7a1f`.
-- Ending implementation commit: recorded after the implementation commit;
-  the final report update is a separate documentation-only local commit.
+- Implementation commit: `2a461fa64d01932f9dab36bb9bbf2066792e9804`; this
+  final evidence update is a separate documentation-only local commit.
 - No Server changes, push, history rewrite, QEMU/QAC run, native guest
   execution, live-writer enablement, or database-format change.
