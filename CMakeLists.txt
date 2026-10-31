@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(guideXOSSqlDatabase LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -53,6 +55,7 @@ add_library(gxos_database STATIC
     database/database_sql.cpp
 )
 target_include_directories(gxos_database PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/database")
+target_link_libraries(gxos_database PUBLIC Threads::Threads)
 
 if(MSVC)
     target_compile_options(gxos_database PRIVATE /W4)
@@ -310,6 +313,18 @@ else()
     target_compile_options(database_ndb1r4p11r3ad_test PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME database_ndb1r4p11r3ad_test COMMAND database_ndb1r4p11r3ad_test)
+
+add_executable(database_ndb1r4p11r3ae_test
+    tests/database_ndb1r4p11r3ae_test.cpp
+)
+target_link_libraries(database_ndb1r4p11r3ae_test PRIVATE
+    gxos_database Threads::Threads)
+if(MSVC)
+    target_compile_options(database_ndb1r4p11r3ae_test PRIVATE /W4)
+else()
+    target_compile_options(database_ndb1r4p11r3ae_test PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME database_ndb1r4p11r3ae_test COMMAND database_ndb1r4p11r3ae_test)
 
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)

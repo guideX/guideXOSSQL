@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -34,10 +35,46 @@
 namespace gxos {
 namespace db {
 
+class Database;
 class Table;
 class Transaction;
+class DatabaseReadView;
+class DatabaseCoordinatorTestAccess;
 struct IndexRangeBound;
 struct IndexValidation;
+
+// Holds the database-instance publication coordinator for a bounded hosted
+// read operation. The captured page metadata and page view remain valid until
+// this object is released. This is an operation view, not a transaction-start
+// snapshot. The Database must outlive the view, and the view must be released
+// on its acquiring thread.
+class DatabaseReadView {
+public:
+    DatabaseReadView();
+    ~DatabaseReadView();
+    DatabaseReadView(const DatabaseReadView&) = delete;
+    DatabaseReadView& operator=(const DatabaseReadView&) = delete;
+    DatabaseReadView(DatabaseReadView&&) = delete;
+    DatabaseReadView& operator=(DatabaseReadView&&) = delete;
+
+    bool isActive() const { return _database != nullptr; }
+    uint32_t pageSize() const { return _pageSize; }
+    uint64_t pageCount() const { return _pageCount; }
+    DbResult readPage(uint64_t pageId, DatabasePage& out);
+    DbResult indexRoot(uint32_t indexId, uint64_t& outRootPageId,
+                       DbType& outKeyType) const;
+    void release();
+
+private:
+    friend class Database;
+    Database* _database;
+    PageAccess* _pages;
+    Transaction* _transaction;
+    const GxAllocator* _scratchAllocator;
+    uint32_t _pageSize;
+    uint64_t _pageCount;
+    std::unique_lock<std::recursive_mutex> _guard;
+};
 
 class Database : public PageAccess {
 public:
@@ -88,6 +125,14 @@ public:
     Transaction* activeTransaction() { return _activeTx; }
     const Transaction* activeTransaction() const { return _activeTx; }
     void finishTransaction(Transaction* tx, bool committed);
+
+    // Acquires a hosted, database-instance read view. Keep it alive across the
+    // complete point lookup or range scan. All facade publication operations
+    // on this Database instance use the same coordinator. The guard must be
+    // released on the thread that acquired it. Raw catalog/cache/file access,
+    // other Database handles, other processes, and external file writers are
+    // outside this coordination contract.
+    DbResult acquireReadView(DatabaseReadView& out);
 
     // The page view the relational layer must use: the active transaction when
     // one exists, otherwise the committed view.
@@ -184,6 +229,8 @@ public:
 private:
     friend class Transaction;
     friend class Table;
+    friend class DatabaseReadView;
+    friend class DatabaseCoordinatorTestAccess;
 
     Database();
     DbResult openImpl(const std::string& path, const DatabaseOpenOptions& options,
@@ -196,8 +243,14 @@ private:
                                        size_t imageSize);
     DbResult applyRecovery(const std::vector<WalTransaction>& transactions);
     DbResult validateRecoveryCoverage(const std::vector<WalTransaction>& transactions);
+    DbResult ensureWriteAllowed() const;
     void refreshDiagnostics();
 
+    // Recursive because public relational operations compose transaction,
+    // table, and index helpers synchronously on the same calling thread.
+    // The portable B+ tree layer does not depend on this hosted coordinator.
+    mutable std::recursive_mutex _operationMutex;
+    uint32_t _activeReadViews;
     std::unique_ptr<DatabaseFile> _file;
     std::unique_ptr<BufferManager> _buffer;
     std::unique_ptr<WriteAheadLog> _wal;

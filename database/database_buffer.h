@@ -18,7 +18,9 @@
 //     (header-last ordering + OS durability barrier).
 //   * Pages read through DatabaseFile::readPage, so CRC/structure validation
 //     still applies to every page that enters the cache.
-//   * No threads and no background flushing.
+//   * No background flushing. BufferManager has no independent locking;
+//     Database's hosted facade coordinates its supported SQL read/publication
+//     operations. Direct BufferManager use remains caller-serialized.
 
 #include <stddef.h>
 #include <stdint.h>

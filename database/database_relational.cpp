@@ -23,6 +23,40 @@ const uint32_t kDefaultBufferCapacity = 32;
 static_assert(std::is_nothrow_move_assignable<DatabasePage>::value,
               "published page views must be installable without allocation");
 
+class ReadViewPageAccess : public PageAccess {
+public:
+    ReadViewPageAccess(PageAccess& source, uint32_t pageSize,
+                       uint64_t pageCount)
+        : _source(source), _pageSize(pageSize), _pageCount(pageCount) {}
+
+    uint32_t pageSize() const override { return _pageSize; }
+    uint64_t pageCount() const override { return _pageCount; }
+    bool isReadOnly() const override { return true; }
+
+    DbResult readPage(uint64_t pageId, DatabasePage& out) override {
+        if (pageId == kHeaderPageId || pageId >= _pageCount) {
+            return DbResult::error(DbStatus::OutOfBounds,
+                                   "page id is outside the captured read view");
+        }
+        return _source.readPage(pageId, out);
+    }
+
+    DbResult writePage(const DatabasePage&) override {
+        return DbResult::error(DbStatus::ReadOnly,
+                               "database read view is read-only");
+    }
+
+    DbResult allocatePage(PageType, uint64_t&) override {
+        return DbResult::error(DbStatus::ReadOnly,
+                               "database read view is read-only");
+    }
+
+private:
+    PageAccess& _source;
+    uint32_t _pageSize;
+    uint64_t _pageCount;
+};
+
 // Human-readable rendering of a column DEFAULT value for diagnostics.
 std::string describeDbValue(const DbValue& value) {
     if (value.isNull()) {
@@ -60,8 +94,68 @@ std::string describeDbValue(const DbValue& value) {
 
 } // namespace
 
+DatabaseReadView::DatabaseReadView()
+    : _database(nullptr), _pages(nullptr), _transaction(nullptr),
+      _scratchAllocator(nullptr), _pageSize(0), _pageCount(0), _guard() {}
+
+DatabaseReadView::~DatabaseReadView() { release(); }
+
+DbResult DatabaseReadView::readPage(uint64_t pageId, DatabasePage& out) {
+    if (_database == nullptr || _pages == nullptr || !_guard.owns_lock()) {
+        return DbResult::error(DbStatus::NoActiveTransaction,
+                               "database read view is no longer active");
+    }
+    if (pageId == kHeaderPageId || pageId >= _pageCount) {
+        return DbResult::error(DbStatus::OutOfBounds,
+                               "page id is outside the captured read view");
+    }
+    return _pages->readPage(pageId, out);
+}
+
+DbResult DatabaseReadView::indexRoot(uint32_t indexId,
+                                     uint64_t& outRootPageId,
+                                     DbType& outKeyType) const {
+    if (_database == nullptr || !_guard.owns_lock()) {
+        return DbResult::error(DbStatus::NoActiveTransaction,
+                               "database read view is no longer active");
+    }
+    const Catalog::IndexRecord* record =
+        _database->_catalog.findIndex(indexId);
+    if (record == nullptr) {
+        return DbResult::error(DbStatus::InvalidArgument, "no such index");
+    }
+    const Catalog::TableRecord* table =
+        _database->_catalog.findTable(record->tableId);
+    if (table == nullptr) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index table is not present in the captured catalog");
+    }
+    if (record->columnOrdinal >= table->columns.size()) {
+        return DbResult::error(DbStatus::CorruptPage,
+                               "index column ordinal is outside its table");
+    }
+    outRootPageId = record->rootPageId;
+    outKeyType = table->columns[record->columnOrdinal].type;
+    return DbResult::ok();
+}
+
+void DatabaseReadView::release() {
+    if (_database != nullptr && _guard.owns_lock() &&
+        _database->_activeReadViews != 0) {
+        --_database->_activeReadViews;
+    }
+    _database = nullptr;
+    _pages = nullptr;
+    _transaction = nullptr;
+    _scratchAllocator = nullptr;
+    _pageSize = 0;
+    _pageCount = 0;
+    if (_guard.owns_lock()) _guard.unlock();
+}
+
 Database::Database()
-    : _file(), _buffer(), _wal(), _catalog(), _diagnostics(), _open(false),
+    : _operationMutex(), _activeReadViews(0), _file(), _buffer(), _wal(),
+      _catalog(), _diagnostics(), _open(false),
       _readOnly(false), _catalogDirty(false), _walRecordAllocator(),
       _hasWalRecordAllocator(false), _transactionPageAllocator(),
       _hasTransactionPageAllocator(false), _activeTx(nullptr), _nextTxId(1),
@@ -75,6 +169,8 @@ Database::~Database() {
 }
 
 void Database::markCatalogDirty() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    if (_activeReadViews != 0) return;
     _catalogDirty = true;
     if (_activeTx != nullptr) {
         _activeTx->markCatalogChanged();
@@ -102,14 +198,17 @@ uint32_t Database::bufferCapacity() const {
 }
 
 uint32_t Database::pageSize() const {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     return _file ? _file->pageSize() : 0;
 }
 
 uint64_t Database::pageCount() const {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     return _file ? _file->pageCount() : 0;
 }
 
 PageAccess& Database::pages() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     if (_activeTx != nullptr) {
         return *static_cast<PageAccess*>(_activeTx);
     }
@@ -122,6 +221,7 @@ const GxAllocator* Database::scratchAllocator() const {
 }
 
 DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -168,6 +268,7 @@ DbResult Database::readPage(uint64_t pageId, DatabasePage& out) {
 }
 
 DbResult Database::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -179,6 +280,9 @@ DbResult Database::readOwnedPage(uint64_t pageId, GxOwnedPage& out) {
 }
 
 DbResult Database::writePage(const DatabasePage& page) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -191,6 +295,9 @@ DbResult Database::writePage(const DatabasePage& page) {
 DbResult Database::installCommittedPageImage(uint64_t pageId,
                                              const uint8_t* image,
                                              size_t imageSize) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_buffer) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -203,6 +310,49 @@ DbResult Database::installCommittedPageImage(uint64_t pageId,
 DbResult Database::allocatePage(PageType, uint64_t&) {
     return DbResult::error(DbStatus::Internal,
                            "the committed page view cannot allocate pages");
+}
+
+DbResult Database::acquireReadView(DatabaseReadView& out) {
+    if (out.isActive()) {
+        return DbResult::error(DbStatus::InvalidArgument,
+                               "read view is already active");
+    }
+    std::unique_lock<std::recursive_mutex> guard(_operationMutex);
+    if (!_open || !_buffer || !_file) {
+        return DbResult::error(DbStatus::NotOpen,
+                               "database is not open");
+    }
+    if (_diagnostics.recoveryRequired) {
+        return DbResult::error(DbStatus::RecoveryRequired,
+                               "committed page publication requires WAL recovery");
+    }
+    PageAccess* pageView = &pages();
+    const uint32_t capturedPageSize = pageView->pageSize();
+    const uint64_t capturedPageCount = pageView->pageCount();
+    const GxAllocator* capturedAllocator = scratchAllocator();
+    if (capturedPageSize == 0 || capturedPageCount == 0 ||
+        capturedAllocator == nullptr) {
+        return DbResult::error(DbStatus::Internal,
+                               "database read view metadata is unavailable");
+    }
+    out._database = this;
+    out._pages = pageView;
+    out._transaction = _activeTx;
+    out._scratchAllocator = capturedAllocator;
+    out._pageSize = capturedPageSize;
+    out._pageCount = capturedPageCount;
+    ++_activeReadViews;
+    out._guard = std::move(guard);
+    return DbResult::ok();
+}
+
+DbResult Database::ensureWriteAllowed() const {
+    if (_activeReadViews != 0) {
+        return DbResult::error(
+            DbStatus::Internal,
+            "database publication cannot reenter an active read view");
+    }
+    return DbResult::ok();
 }
 
 DbResult Database::openAndRecoverWal(IDatabaseFileSystem& fileSystem,
@@ -664,6 +814,9 @@ DbResult Database::open(const std::string& path, const DatabaseOpenOptions& opti
 }
 
 DbResult Database::close() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::ok();
     }
@@ -695,6 +848,9 @@ DbResult Database::close() {
 }
 
 DbResult Database::flush() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -730,7 +886,10 @@ DbResult Database::flush() {
 }
 
 DbResult Database::beginTransaction(std::unique_ptr<Transaction>& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     out.reset();
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -786,6 +945,8 @@ DbResult Database::beginTransaction(std::unique_ptr<Transaction>& out) {
 }
 
 void Database::finishTransaction(Transaction* tx, bool committed) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    if (_activeReadViews != 0) return;
     if (_activeTx == tx) {
         _activeTx = nullptr;
     }
@@ -796,6 +957,9 @@ void Database::finishTransaction(Transaction* tx, bool committed) {
 }
 
 DbResult Database::createTable(const TableDefinition& def, uint32_t& outTableId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -820,6 +984,9 @@ DbResult Database::createTable(const TableDefinition& def, uint32_t& outTableId)
 }
 
 DbResult Database::createIndex(const IndexDefinition& def, uint32_t& outIndexId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -844,6 +1011,9 @@ DbResult Database::createIndex(const IndexDefinition& def, uint32_t& outIndexId)
 }
 
 DbResult Database::dropIndex(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -879,6 +1049,9 @@ DbResult Database::dropIndex(const std::string& name) {
 }
 
 DbResult Database::dropTable(const std::string& name) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -914,6 +1087,9 @@ DbResult Database::dropTable(const std::string& name) {
 }
 
 DbResult Database::alterTableAddColumn(const std::string& name, const ColumnDefinition& col) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_open) {
         return DbResult::error(DbStatus::NotOpen, "database is not open");
     }
@@ -987,6 +1163,7 @@ DbResult Database::listForeignKeys(std::vector<ForeignKeyInfo>& out) const {
 }
 
 DbResult Database::validateIntegrity(std::string& message) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     message.clear();
     if (!_open) {
         message = "database is not open";
@@ -1112,6 +1289,9 @@ DbResult Database::validateIntegrity(std::string& message) {
 }
 
 DbResult Database::buildIndex(uint32_t indexId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
+    DbResult allowed = ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
     if (rec == nullptr) {
         return DbResult::error(DbStatus::Internal, "index record not found");
@@ -1249,60 +1429,67 @@ const Catalog::IndexRecord* Database::findIndexForColumn(uint32_t tableId,
 DbResult Database::indexLookup(uint32_t indexId, const std::vector<uint8_t>& logicalKey,
                                std::vector<RowLocator>& out) {
     out.clear();
-    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
-    if (rec == nullptr) {
-        return DbResult::error(DbStatus::InvalidArgument, "no such index");
-    }
-    if (rec->rootPageId == 0) {
+    DatabaseReadView view;
+    DbResult result = acquireReadView(view);
+    if (!result.isOk()) return result;
+    uint64_t rootPageId = 0;
+    DbType keyType = DbType::Unknown;
+    result = view.indexRoot(indexId, rootPageId, keyType);
+    if (!result.isOk()) return result;
+    if (rootPageId == 0) {
         return DbResult::ok();
     }
-    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
-    if (table == nullptr) {
-        return DbResult::error(DbStatus::Internal, "index table not found");
-    }
-    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId,
-                   activeTransaction(), scratchAllocator());
+    ReadViewPageAccess readPages(*view._pages, view._pageSize, view._pageCount);
+    IndexTree tree(readPages, keyType, indexId, view._transaction,
+                   view._scratchAllocator);
     std::vector<IndexEntry> entries;
-    DbResult result = tree.lookupAll(logicalKey, rec->rootPageId, entries);
+    result = tree.lookupAll(logicalKey, rootPageId, entries);
     if (!result.isOk()) {
         return result;
     }
-    out.reserve(entries.size());
+    std::vector<RowLocator> staged;
+    staged.reserve(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
-        out.push_back(entries[i].locator);
+        staged.push_back(entries[i].locator);
     }
+    view.release();
+    out.swap(staged);
     return DbResult::ok();
 }
 
 DbResult Database::indexRange(uint32_t indexId, const IndexRangeBound& bound,
                               std::vector<RowLocator>& out) {
     out.clear();
-    const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
-    if (rec == nullptr) {
-        return DbResult::error(DbStatus::InvalidArgument, "no such index");
-    }
-    if (rec->rootPageId == 0) {
+    DatabaseReadView view;
+    DbResult result = acquireReadView(view);
+    if (!result.isOk()) return result;
+    uint64_t rootPageId = 0;
+    DbType keyType = DbType::Unknown;
+    result = view.indexRoot(indexId, rootPageId, keyType);
+    if (!result.isOk()) return result;
+    if (rootPageId == 0) {
         return DbResult::ok();
     }
-    const Catalog::TableRecord* table = _catalog.findTable(rec->tableId);
-    if (table == nullptr) {
-        return DbResult::error(DbStatus::Internal, "index table not found");
-    }
-    IndexTree tree(pages(), table->columns[rec->columnOrdinal].type, indexId,
-                   activeTransaction(), scratchAllocator());
+    ReadViewPageAccess readPages(*view._pages, view._pageSize, view._pageCount);
+    IndexTree tree(readPages, keyType, indexId, view._transaction,
+                   view._scratchAllocator);
     std::vector<IndexEntry> entries;
-    DbResult result = tree.rangeScan(bound, rec->rootPageId, entries);
+    result = tree.rangeScan(bound, rootPageId, entries);
     if (!result.isOk()) {
         return result;
     }
-    out.reserve(entries.size());
+    std::vector<RowLocator> staged;
+    staged.reserve(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
-        out.push_back(entries[i].locator);
+        staged.push_back(entries[i].locator);
     }
+    view.release();
+    out.swap(staged);
     return DbResult::ok();
 }
 
 DbResult Database::validateIndex(uint32_t indexId, IndexValidation& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_operationMutex);
     out = IndexValidation();
     const Catalog::IndexRecord* rec = _catalog.findIndex(indexId);
     if (rec == nullptr) {

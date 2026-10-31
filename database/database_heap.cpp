@@ -1001,6 +1001,9 @@ DbResult Table::ensureLastHeapPage() {
 }
 
 DbResult Table::insert(const std::vector<DbValue>& values) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (_db.isReadOnly()) {
         return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
     }
@@ -1236,6 +1239,9 @@ DbResult Table::appendEncodedRowToTail(const std::vector<uint8_t>& rowBytes,
 }
 
 DbResult Table::applyMutations(const std::vector<RowMutation>& mutations) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (_db.isReadOnly()) {
         return DbResult::error(DbStatus::ReadOnly, "database opened read-only");
     }
@@ -1533,6 +1539,9 @@ DbResult Table::applyMutationsInTransaction(const std::vector<RowMutation>& muta
 }
 
 DbResult Table::alterAddColumn(const ColumnDefinition& newCol) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     // Must be called with an active transaction so the statement savepoint can
     // restore the old schema and rows on any failure.
     const Catalog::TableRecord* rec = _db.catalog().findTable(_tableId);

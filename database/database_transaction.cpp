@@ -79,6 +79,7 @@ uint32_t Transaction::pageSize() const { return _db.pageSize(); }
 uint64_t Transaction::pageCount() const { return _nextPageId; }
 
 DbResult Transaction::readPage(uint64_t pageId, DatabasePage& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -128,6 +129,9 @@ DbResult Transaction::stagePagePayload(uint64_t pageId, PageType type,
                                        uint16_t flags, uint32_t generation,
                                        const uint8_t* payload,
                                        size_t payloadSize) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -154,6 +158,7 @@ DbResult Transaction::writePagePayload(uint64_t pageId, PageType type,
                                        uint16_t flags, uint32_t generation,
                                        const uint8_t* payload,
                                        size_t payloadSize) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
     return stagePagePayload(pageId, type, flags, generation, payload,
                             payloadSize);
 }
@@ -163,6 +168,9 @@ DbResult Transaction::allocatePagePayload(PageType type, uint16_t flags,
                                           const uint8_t* payload,
                                           size_t payloadSize,
                                           uint64_t& outPageId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction,
                                "transaction is not active");
@@ -186,6 +194,9 @@ DbResult Transaction::allocatePagePayload(PageType type, uint16_t flags,
 }
 
 DbResult Transaction::allocatePage(PageType type, uint64_t& outPageId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -211,6 +222,9 @@ DbResult Transaction::allocatePage(PageType type, uint64_t& outPageId) {
 }
 
 DbResult Transaction::createTable(const TableDefinition& def, uint32_t& outTableId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -224,6 +238,9 @@ DbResult Transaction::createTable(const TableDefinition& def, uint32_t& outTable
 }
 
 DbResult Transaction::createIndex(const IndexDefinition& def, uint32_t& outIndexId) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -250,6 +267,9 @@ DbResult Transaction::openTable(const std::string& name, std::unique_ptr<Table>&
 }
 
 DbResult Transaction::commit() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
@@ -348,6 +368,9 @@ DbResult Transaction::commit() {
 }
 
 DbResult Transaction::beginStatement(TransactionSavepoint& out) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     gxTransactionPageOverlayDestroy(&out.pageOverlay);
     const GxStatus cloneStatus = gxTransactionPageOverlayClone(
         &out.pageOverlay, &_pageOverlay);
@@ -373,6 +396,9 @@ DbResult Transaction::beginStatement(TransactionSavepoint& out) {
 }
 
 DbResult Transaction::rollbackStatement(TransactionSavepoint& savepoint) {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     // The snapshot has already paid every allocation cost. Move restores the
     // page overlay without allocation; reject an unusable snapshot instead of
     // silently reporting an ordinary statement rollback.
@@ -404,6 +430,9 @@ DbResult Transaction::rollbackStatement(TransactionSavepoint& savepoint) {
 void Transaction::releaseStatement(const TransactionSavepoint&) {}
 
 DbResult Transaction::rollback() {
+    std::lock_guard<std::recursive_mutex> operationGuard(_db._operationMutex);
+    DbResult allowed = _db.ensureWriteAllowed();
+    if (!allowed.isOk()) return allowed;
     if (!_active) {
         return DbResult::error(DbStatus::NoActiveTransaction, "transaction is not active");
     }
