@@ -326,6 +326,61 @@ else()
 endif()
 add_test(NAME database_ndb1r4p11r3ae_test COMMAND database_ndb1r4p11r3ae_test)
 
+# The native page-provider seam is compiled only when a checked guideXOS
+# Server source tree is supplied. It includes the real Server C declarations
+# and, for its hosted contract test, the real native file-bridge implementation.
+set(GX_GUIDEXOS_SERVER_SOURCE_DIR "" CACHE PATH
+    "guideXOS Server source root used to qualify the native SQL page-provider boundary")
+if(GX_GUIDEXOS_SERVER_SOURCE_DIR AND
+   EXISTS "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include/kernel/native_database_file.h" AND
+   EXISTS "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/native_database_file.cpp")
+    add_library(gxos_native_sql_index_page_provider STATIC
+        database/native/gx_native_sql_index_page_provider.cpp
+    )
+    target_include_directories(gxos_native_sql_index_page_provider PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/database/native"
+        "${CMAKE_CURRENT_SOURCE_DIR}/database"
+        "${CMAKE_CURRENT_SOURCE_DIR}/database/portable"
+    )
+    target_link_libraries(gxos_native_sql_index_page_provider PUBLIC gxos_database)
+    if(MSVC)
+        target_compile_options(gxos_native_sql_index_page_provider PRIVATE /W4)
+    else()
+        target_compile_options(gxos_native_sql_index_page_provider PRIVATE -Wall -Wextra)
+        target_compile_options(gxos_native_sql_index_page_provider PRIVATE
+            -iquote "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+    endif()
+    if(MSVC)
+        target_compile_options(gxos_native_sql_index_page_provider PRIVATE
+            "/external:I${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+    endif()
+
+    add_executable(database_ndb1r4p11r3af_test
+        tests/database_ndb1r4p11r3af_test.cpp
+        "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/native_database_file.cpp"
+    )
+    target_include_directories(database_ndb1r4p11r3af_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/database/native"
+    )
+    target_link_libraries(database_ndb1r4p11r3af_test PRIVATE
+        gxos_native_sql_index_page_provider gxos_database)
+    if(MSVC)
+        target_compile_options(database_ndb1r4p11r3af_test PRIVATE /W4)
+    else()
+        target_compile_options(database_ndb1r4p11r3af_test PRIVATE -Wall -Wextra)
+        target_compile_options(database_ndb1r4p11r3af_test PRIVATE
+            -iquote "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+    endif()
+    if(MSVC)
+        target_compile_options(database_ndb1r4p11r3af_test PRIVATE
+            "/external:I${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+    endif()
+    add_test(NAME database_ndb1r4p11r3af_test COMMAND database_ndb1r4p11r3af_test)
+elseif(GX_GUIDEXOS_SERVER_SOURCE_DIR)
+    message(FATAL_ERROR
+        "GX_GUIDEXOS_SERVER_SOURCE_DIR does not contain the checked native database bridge declarations and implementation")
+endif()
+
 add_executable(database_sql7_test tests/database_sql7_test.cpp)
 target_link_libraries(database_sql7_test PRIVATE gxos_database)
 if(MSVC)
