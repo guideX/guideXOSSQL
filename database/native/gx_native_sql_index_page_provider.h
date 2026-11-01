@@ -64,6 +64,7 @@ struct GxNativeSqlIndexPageProviderContext {
     uint64_t indexRootPageId;
     uint32_t ownerIndexId;
     GxDbFileStatus nativeFileStatus;
+    GxDbFileStatus cleanupFileStatus;
     GxNativeSqlImageError error;
 };
 

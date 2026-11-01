@@ -376,6 +376,40 @@ if(GX_GUIDEXOS_SERVER_SOURCE_DIR AND
             "/external:I${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
     endif()
     add_test(NAME database_ndb1r4p11r3af_test COMMAND database_ndb1r4p11r3af_test)
+
+    # R3AG repeats the source-backed immutable-image boundary with stronger
+    # root-owner and SHA-256 preservation checks. The same fixture and bridge
+    # helpers are compiled from R3AF's test source to avoid a second harness.
+    if(WIN32)
+        add_executable(database_ndb1r4p11r3ag_test
+            tests/database_ndb1r4p11r3af_test.cpp
+            tests/gx_sha256_windows.cpp
+            "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/native_database_file.cpp"
+        )
+        target_compile_definitions(database_ndb1r4p11r3ag_test PRIVATE
+            GX_R3AG_QUALIFICATION=1
+        )
+        target_include_directories(database_ndb1r4p11r3ag_test PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/database/native"
+        )
+        target_link_libraries(database_ndb1r4p11r3ag_test PRIVATE
+            gxos_native_sql_index_page_provider gxos_database bcrypt)
+        if(MSVC)
+            target_compile_options(database_ndb1r4p11r3ag_test PRIVATE /W4)
+            target_compile_options(database_ndb1r4p11r3ag_test PRIVATE
+                "/external:I${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+        else()
+            target_compile_options(database_ndb1r4p11r3ag_test PRIVATE -Wall -Wextra)
+            target_compile_options(database_ndb1r4p11r3ag_test PRIVATE
+                -iquote "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
+        endif()
+        add_test(NAME database_ndb1r4p11r3ag_test COMMAND database_ndb1r4p11r3ag_test)
+        add_test(NAME database_ndb1r4p11r3ag_native_link
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/qualify_ndb1r4p11r3ag_native_link.ps1"
+                -ServerSourceDir "${GX_GUIDEXOS_SERVER_SOURCE_DIR}"
+                -OutputRoot "${CMAKE_CURRENT_BINARY_DIR}/r3ag-native-link-runs")
+    endif()
 elseif(GX_GUIDEXOS_SERVER_SOURCE_DIR)
     message(FATAL_ERROR
         "GX_GUIDEXOS_SERVER_SOURCE_DIR does not contain the checked native database bridge declarations and implementation")

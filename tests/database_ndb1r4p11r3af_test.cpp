@@ -35,6 +35,7 @@ const int kHostSeekEnd = SEEK_END;
 #include "database_catalog.h"
 #include "database_endian.h"
 #include "database_heap.h"
+#include "database_header.h"
 #include "database_index.h"
 #include "database_relational.h"
 #include "database_schema.h"
@@ -46,6 +47,18 @@ const int kHostSeekEnd = SEEK_END;
 using namespace gxos::db;
 
 namespace {
+
+#if defined(GX_R3AG_QUALIFICATION)
+const char* const kQualificationName = "R3AG";
+const char* const kLogicalDatabasePath = "/R3AG/IMAGE.gxdb";
+const char* const kBridgeDatabasePath = "/R3AG/IMAGE.GDB";
+const char* const kTestDirectoryName = "gxos_r3ag_native_provider";
+#else
+const char* const kQualificationName = "R3AF";
+const char* const kLogicalDatabasePath = "/R3AF/IMAGE.gxdb";
+const char* const kBridgeDatabasePath = "/R3AF/IMAGE.GDB";
+const char* const kTestDirectoryName = "gxos_r3af_native_provider";
+#endif
 
 struct HostFileHandle {
     FILE* file;
@@ -60,6 +73,7 @@ uint32_t g_failures = 0;
 uint32_t g_readCount = 0;
 uint32_t g_shortReadAt = 0;
 uint32_t g_readOnlyOpenCount = 0;
+bool g_failSize = false;
 bool g_scheduleShortReadAfterPointCallback = false;
 
 void check(bool value, const char* name) {
@@ -134,6 +148,7 @@ int64_t hostTell(uint8_t handle) {
 }
 
 int64_t hostSize(uint8_t handle) {
+    if (g_failSize) return -1;
     if (handle >= 32 || !g_handles[handle].file) return -1;
     const long original = std::ftell(g_handles[handle].file);
     if (original < 0 || std::fseek(g_handles[handle].file, 0, kHostSeekEnd) != 0) return -1;
@@ -171,7 +186,7 @@ std::string testDirectory() {
     const char* base = std::getenv("TEMP");
     if (!base) base = std::getenv("TMP");
     if (!base) base = ".";
-    const std::string path = std::string(base) + "\\gxos_r3af_native_provider";
+    const std::string path = std::string(base) + "\\" + kTestDirectoryName;
 #if defined(_WIN32)
     _mkdir(path.c_str());
 #else
@@ -272,6 +287,16 @@ std::vector<uint8_t> readBytes(const std::string& path) {
                                 std::istreambuf_iterator<char>());
 }
 
+#if defined(GX_R3AG_QUALIFICATION)
+extern "C" int gxR3agSha256File(const char* path, char* outHex65);
+
+std::string sha256File(const std::string& path) {
+    char digest[65] = {};
+    if (!gxR3agSha256File(path.c_str(), digest)) return std::string();
+    return std::string(digest);
+}
+#endif
+
 bool writeBytes(const std::string& path, const std::vector<uint8_t>& bytes) {
     std::ofstream output(path.c_str(), std::ios::binary | std::ios::trunc);
     if (!output) return false;
@@ -302,6 +327,47 @@ bool mutatePage(const std::string& path, uint32_t pageSize, uint64_t pageId,
             payload.data(), payloadLength) != GxStatus::Ok) return false;
     return writeBytes(path, image);
 }
+
+#if defined(GX_R3AG_QUALIFICATION)
+bool mutatePageType(const std::string& path, uint32_t pageSize, uint64_t pageId,
+                    uint16_t newPageType) {
+    std::vector<uint8_t> image = readBytes(path);
+    if (pageSize == 0 || pageId > UINT64_MAX / pageSize) return false;
+    const uint64_t offset64 = pageId * pageSize;
+    if (offset64 > image.size() || pageSize > image.size() - offset64) return false;
+    const size_t offset = static_cast<size_t>(offset64);
+    GxDatabasePageInfo info;
+    if (gxDatabasePageInspect(image.data() + offset, pageSize, pageSize,
+                              pageId, &info) != GxStatus::Ok) return false;
+    const size_t payloadLength = pageSize - kPageHeaderSize;
+    std::vector<uint8_t> payload(
+        image.begin() + offset + kPageHeaderSize,
+        image.begin() + offset + pageSize);
+    if (gxDatabasePageEncode(image.data() + offset, pageSize, pageId,
+            newPageType, info.flags, info.generation,
+            payload.data(), payloadLength) != GxStatus::Ok) return false;
+    return writeBytes(path, image);
+}
+
+bool mutateHeaderFormatMajor(const std::string& path, uint16_t formatMajor) {
+    std::vector<uint8_t> image = readBytes(path);
+    if (image.size() < kHeaderSize) return false;
+    const uint8_t* bytes = image.data();
+    DatabaseHeader header;
+    header.formatMajor = formatMajor;
+    header.formatMinor = loadLe16(bytes + header_offset::FormatMinor);
+    header.pageSize = loadLe32(bytes + header_offset::PageSize);
+    std::memcpy(header.databaseId, bytes + header_offset::DatabaseId,
+                sizeof(header.databaseId));
+    header.creationTimeUnixNanos = loadLe64(bytes + header_offset::CreationTime);
+    header.pageCount = loadLe64(bytes + header_offset::PageCount);
+    header.rootPageId = loadLe64(bytes + header_offset::RootPageId);
+    header.flags = loadLe32(bytes + header_offset::Flags);
+    header.headerSize = loadLe32(bytes + header_offset::HeaderSize);
+    storeLe32(image.data() + header_offset::HeaderCrc32, header.computeCrc());
+    return writeBytes(path, image);
+}
+#endif
 
 void corruptInternalSignature(uint8_t* payload, size_t length, uint64_t) {
     if (length) payload[0] = 0;
@@ -484,7 +550,7 @@ bool openProvider(const Fixture& fixture, size_t index,
                   std::vector<uint8_t>& buffer,
                   GxNativeSqlIndexPageProviderContext& context) {
     g_imagePath = fixture.path;
-    g_bridgePath = "/R3AF/IMAGE.GDB";
+    g_bridgePath = kBridgeDatabasePath;
     gxNativeSqlIndexPageProviderInit(&context);
     buffer.resize(fixture.pageSize);
     GxNativeSqlIndexImageIdentity identity = {};
@@ -494,7 +560,7 @@ bool openProvider(const Fixture& fixture, size_t index,
     identity.indexRootPageId = fixture.roots[index];
     identity.ownerIndexId = fixture.indexIds[index];
     identity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
-    return gxNativeSqlIndexPageProviderOpen(&context, "/R3AF/IMAGE.gxdb",
+    return gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
         &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_OK;
 }
 
@@ -519,23 +585,143 @@ void testIdentityAndModes(const Fixture& fixture) {
     identity.ownerIndexId = fixture.indexIds[0];
     identity.consistency = GX_NATIVE_SQL_CONSISTENCY_LIVE_SINGLE_INSTANCE;
     g_imagePath = fixture.path;
-    g_bridgePath = "/R3AF/IMAGE.GDB";
-    CHECK(gxNativeSqlIndexPageProviderOpen(&context, "/R3AF/IMAGE.gxdb",
+    g_bridgePath = kBridgeDatabasePath;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
         &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_UNSUPPORTED_MODE);
     identity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
     identity.indexRootPageId = fixture.pageCount;
-    CHECK(gxNativeSqlIndexPageProviderOpen(&context, "/R3AF/IMAGE.gxdb",
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
         &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_INVALID_ROOT);
     identity.indexRootPageId = fixture.roots[0];
     identity.catalogRootPageId++;
-    CHECK(gxNativeSqlIndexPageProviderOpen(&context, "/R3AF/IMAGE.gxdb",
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
         &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_METADATA_MISMATCH);
     CHECK(!context.active);
 }
 
+#if defined(GX_R3AG_QUALIFICATION)
+void testRootOwnerAssociation(const Fixture& fixture) {
+    std::vector<uint8_t> buffer;
+    GxNativeSqlIndexPageProviderContext context;
+    CHECK(openProvider(fixture, 0, buffer, context));
+
+    // The root and owner must come from the same catalog record. The adapter
+    // checks the supplied root against the captured image extent; the
+    // production portable decoder rejects a root owned by another index.
+    context.ownerIndexId = fixture.indexIds[1];
+    std::vector<uint8_t> key;
+    CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(7), key));
+    LocatorCollector results;
+    CHECK(runLookup(fixture, context, key, results) ==
+          GxIndexLookupStatus::CorruptPage);
+    CHECK(results.locators.empty());
+    CHECK(!context.borrowed);
+    CHECK(gxNativeSqlIndexPageProviderClose(&context) ==
+          GX_NATIVE_SQL_IMAGE_OK);
+}
+
+GxIndexLookupStatus runLookupStaged(
+    const Fixture& fixture, GxNativeSqlIndexPageProviderContext& context,
+    const std::vector<uint8_t>& key, std::vector<RowLocator>& published) {
+    LocatorCollector staging;
+    const GxIndexLookupStatus status = runLookup(fixture, context, key, staging);
+    if (status == GxIndexLookupStatus::Complete) {
+        published.swap(staging.locators);
+    } else {
+        published.clear();
+    }
+    return status;
+}
+
+struct VisitorCounter { uint32_t calls; };
+
+GxIndexLookupVisitControl stopPointVisitor(void* opaque, uint64_t, uint32_t) {
+    ++static_cast<VisitorCounter*>(opaque)->calls;
+    return GxIndexLookupVisitControl::Stop;
+}
+
+GxIndexLookupVisitControl failPointVisitor(void* opaque, uint64_t, uint32_t) {
+    ++static_cast<VisitorCounter*>(opaque)->calls;
+    return GxIndexLookupVisitControl::Error;
+}
+
+GxIndexRangeScanVisitControl stopRangeVisitor(void* opaque, const uint8_t*,
+                                              size_t, uint64_t, uint32_t) {
+    ++static_cast<VisitorCounter*>(opaque)->calls;
+    return GxIndexRangeScanVisitControl::Stop;
+}
+
+GxIndexRangeScanVisitControl failRangeVisitor(void* opaque, const uint8_t*,
+                                              size_t, uint64_t, uint32_t) {
+    ++static_cast<VisitorCounter*>(opaque)->calls;
+    return GxIndexRangeScanVisitControl::Error;
+}
+
+void testVisitorExitReleasesBorrow(const Fixture& fixture) {
+    std::vector<uint8_t> key;
+    CHECK(encodeIndexKey(DbType::Int64, DbValue::int64(7), key));
+    for (uint32_t failure = 0; failure < 2; ++failure) {
+        std::vector<uint8_t> buffer;
+        GxNativeSqlIndexPageProviderContext context;
+        CHECK(openProvider(fixture, 0, buffer, context));
+        GxIndexPageProvider provider = gxNativeSqlIndexPageProviderBind(&context);
+        uint64_t visited[kMaxIndexDepth + 1] = {};
+        std::vector<uint8_t> lower(key.size() + 12, 0);
+        std::copy(key.begin(), key.end(), lower.begin());
+        std::vector<uint8_t> previous(fixture.pageSize - kPageHeaderSize);
+        GxIndexLookupResult result = {};
+        VisitorCounter counter = {};
+        const GxIndexLookupStatus status = gxIndexLookupAll(
+            &provider, context.indexRootPageId, context.pageCount,
+            context.ownerIndexId, key.data(), key.size(), kMaxIndexDepth,
+            visited, kMaxIndexDepth + 1, context.pageCount - 1,
+            lower.data(), lower.size(), previous.data(), previous.size(),
+            failure == 0 ? stopPointVisitor : failPointVisitor,
+            &counter, &result);
+        CHECK(status == (failure == 0 ? GxIndexLookupStatus::VisitorStopped
+                                     : GxIndexLookupStatus::VisitorFailure));
+        CHECK(counter.calls == 1);
+        CHECK(!context.borrowed);
+        CHECK(gxNativeSqlIndexPageProviderClose(&context) ==
+              GX_NATIVE_SQL_IMAGE_OK);
+    }
+
+    for (uint32_t failure = 0; failure < 2; ++failure) {
+        std::vector<uint8_t> buffer;
+        GxNativeSqlIndexPageProviderContext context;
+        CHECK(openProvider(fixture, 1, buffer, context));
+        GxIndexPageProvider provider = gxNativeSqlIndexPageProviderBind(&context);
+        uint64_t visited[kMaxIndexDepth + 1] = {};
+        uint8_t physicalLowerBound[12] = {};
+        std::vector<uint8_t> previous(fixture.pageSize - kPageHeaderSize);
+        GxIndexLookupResult result = {};
+        VisitorCounter counter = {};
+        const GxIndexLookupStatus status = gxIndexRangeScan(
+            &provider, context.indexRootPageId, context.pageCount,
+            context.ownerIndexId, false, nullptr, 0, true, false, nullptr, 0,
+            true, kMaxIndexDepth, visited, kMaxIndexDepth + 1,
+            context.pageCount - 1, physicalLowerBound,
+            sizeof(physicalLowerBound), previous.data(), previous.size(),
+            failure == 0 ? stopRangeVisitor : failRangeVisitor,
+            &counter, &result);
+        CHECK(status == (failure == 0 ? GxIndexLookupStatus::VisitorStopped
+                                     : GxIndexLookupStatus::VisitorFailure));
+        CHECK(counter.calls == 1);
+        CHECK(!context.borrowed);
+        CHECK(gxNativeSqlIndexPageProviderClose(&context) ==
+              GX_NATIVE_SQL_IMAGE_OK);
+    }
+}
+#endif
+
 void testFixture(const Fixture& fixture, uint32_t rowCount) {
-    std::printf("R3AF immutable image: rows=%u\n", rowCount);
+    std::printf("%s immutable image: rows=%u\n", kQualificationName, rowCount);
     const std::vector<uint8_t> before = readBytes(fixture.path);
+#if defined(GX_R3AG_QUALIFICATION)
+    const std::string sourceHashBefore = sha256File(fixture.path);
+    CHECK(sourceHashBefore.size() == 64);
+    std::printf("  source SHA-256 before=%s\n", sourceHashBefore.c_str());
+#endif
     std::unique_ptr<Database> hosted;
     std::vector<ScanRow> rows;
     CHECK(loadHostedRows(fixture, hosted, rows));
@@ -546,6 +732,9 @@ void testFixture(const Fixture& fixture, uint32_t rowCount) {
     CHECK(openProvider(fixture, 0, buffer, context));
     CHECK(context.active && context.pageCount == fixture.pageCount);
     CHECK(g_readOnlyOpenCount > 0);
+    const uint8_t writeProbe = 0;
+    CHECK(gx_db_file_write_at(context.fileHandle, 0, &writeProbe, 1) ==
+          GX_DB_FILE_READ_ONLY);
 
     if (rowCount == 0) {
         CHECK(fixture.roots[0] == 0);
@@ -556,6 +745,11 @@ void testFixture(const Fixture& fixture, uint32_t rowCount) {
         CHECK(hostedResult.empty());
         CHECK(gxNativeSqlIndexPageProviderClose(&context) == GX_NATIVE_SQL_IMAGE_OK);
         CHECK(readBytes(fixture.path) == before);
+#if defined(GX_R3AG_QUALIFICATION)
+        const std::string sourceHashAfter = sha256File(fixture.path);
+        CHECK(sourceHashAfter == sourceHashBefore);
+        std::printf("  source SHA-256 after =%s\n", sourceHashAfter.c_str());
+#endif
         CHECK(hosted->close().isOk());
         return;
     }
@@ -637,7 +831,10 @@ void testFixture(const Fixture& fixture, uint32_t rowCount) {
     const RangeCase cases[] = {
         {&lower32, true, &upper32, true, &lowValue, &highValue},
         {&lower32, true, nullptr, true, &lowValue, nullptr},
-        {nullptr, true, nullptr, true, nullptr, nullptr}
+        {nullptr, true, nullptr, true, nullptr, nullptr},
+        {nullptr, true, &upper32, true, nullptr, &highValue},
+        {&lower32, true, &upper32, false, &lowValue, &highValue},
+        {&lower32, false, &upper32, true, &lowValue, &highValue}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         LocatorCollector actual;
@@ -645,14 +842,16 @@ void testFixture(const Fixture& fixture, uint32_t rowCount) {
                        cases[i].upper, cases[i].upperInclusive, actual) ==
               GxIndexLookupStatus::Complete);
         const std::vector<RowLocator> independent = expectedRange(
-            rows, 2, DbType::Int32, cases[i].lowValue, true,
-            cases[i].highValue, true);
+            rows, 2, DbType::Int32, cases[i].lowValue, cases[i].lowerInclusive,
+            cases[i].highValue, cases[i].upperInclusive);
         IndexRangeBound bound;
         if (cases[i].lowValue) {
-            bound.hasLower = true; bound.lowerInclusive = true; bound.lower = *cases[i].lowValue;
+            bound.hasLower = true; bound.lowerInclusive = cases[i].lowerInclusive;
+            bound.lower = *cases[i].lowValue;
         }
         if (cases[i].highValue) {
-            bound.hasUpper = true; bound.upperInclusive = true; bound.upper = *cases[i].highValue;
+            bound.hasUpper = true; bound.upperInclusive = cases[i].upperInclusive;
+            bound.upper = *cases[i].highValue;
         }
         std::vector<RowLocator> hostedRange;
         CHECK(hosted->indexRange(fixture.indexIds[1], bound, hostedRange).isOk());
@@ -687,6 +886,11 @@ void testFixture(const Fixture& fixture, uint32_t rowCount) {
     CHECK(gxNativeSqlIndexPageProviderClose(&context) == GX_NATIVE_SQL_IMAGE_OK);
     CHECK(!context.active && context.fileHandle == GX_DB_FILE_INVALID_HANDLE);
     CHECK(readBytes(fixture.path) == before);
+#if defined(GX_R3AG_QUALIFICATION)
+    const std::string sourceHashAfter = sha256File(fixture.path);
+    CHECK(sourceHashAfter == sourceHashBefore);
+    std::printf("  source SHA-256 after =%s\n", sourceHashAfter.c_str());
+#endif
     hosted->close();
 }
 
@@ -696,7 +900,7 @@ void testTruncatedAndInvalidHandle(const Fixture& fixture) {
     if (!bytes.empty()) bytes.pop_back();
     CHECK(writeBytes(truncatedPath, bytes));
     g_imagePath = truncatedPath;
-    g_bridgePath = "/R3AF/IMAGE.GDB";
+    g_bridgePath = kBridgeDatabasePath;
     GxNativeSqlIndexPageProviderContext context;
     gxNativeSqlIndexPageProviderInit(&context);
     std::vector<uint8_t> buffer(fixture.pageSize);
@@ -707,7 +911,7 @@ void testTruncatedAndInvalidHandle(const Fixture& fixture) {
     identity.indexRootPageId = fixture.roots[0];
     identity.ownerIndexId = fixture.indexIds[0];
     identity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
-    CHECK(gxNativeSqlIndexPageProviderOpen(&context, "/R3AF/IMAGE.gxdb",
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
         &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_TRUNCATED);
     std::remove(truncatedPath.c_str());
 
@@ -749,6 +953,17 @@ void testProviderFailureAfterVisitor(const Fixture& fixture) {
     CHECK(!partial.locators.empty() && !context.borrowed);
     partial.locators.clear();
     CHECK(partial.locators.empty());
+#if defined(GX_R3AG_QUALIFICATION)
+    std::vector<RowLocator> published;
+    g_shortReadAt = 0;
+    g_scheduleShortReadAfterPointCallback = true;
+    const GxIndexLookupStatus stagedStatus = runLookupStaged(
+        fixture, context, key, published);
+    CHECK(stagedStatus != GxIndexLookupStatus::Complete);
+    CHECK(context.error == GX_NATIVE_SQL_IMAGE_TRUNCATED);
+    CHECK(published.empty());
+    CHECK(!context.borrowed);
+#endif
     CHECK(gxNativeSqlIndexPageProviderClose(&context) == GX_NATIVE_SQL_IMAGE_OK);
 }
 
@@ -795,6 +1010,93 @@ void testCorruptionCopies(const Fixture& leaf, const Fixture& multilevel) {
     }
 }
 
+#if defined(GX_R3AG_QUALIFICATION)
+void testUnexpectedPageType(const Fixture& fixture) {
+    Fixture copy = fixture;
+    copy.path += ".wrong_type";
+    CHECK(writeBytes(copy.path, readBytes(fixture.path)));
+    CHECK(mutatePageType(copy.path, copy.pageSize, copy.roots[0],
+                         static_cast<uint16_t>(PageType::Data)));
+    std::vector<uint8_t> buffer;
+    GxNativeSqlIndexPageProviderContext context;
+    CHECK(openProvider(copy, 0, buffer, context));
+    GxIndexPageProvider provider = gxNativeSqlIndexPageProviderBind(&context);
+    GxIndexPageView view = {};
+    CHECK(provider.acquire(provider.context, fixture.roots[0], &view) ==
+          GxIndexPageProviderStatus::Error);
+    CHECK(context.error == GX_NATIVE_SQL_IMAGE_CORRUPT_PAGE);
+    CHECK(!context.borrowed);
+    CHECK(gxNativeSqlIndexPageProviderClose(&context) ==
+          GX_NATIVE_SQL_IMAGE_OK);
+    std::remove(copy.path.c_str());
+}
+
+void testProviderOpenFailures(const Fixture& fixture) {
+    std::vector<uint8_t> buffer(fixture.pageSize);
+    GxNativeSqlIndexPageProviderContext context;
+    gxNativeSqlIndexPageProviderInit(&context);
+    GxNativeSqlIndexImageIdentity identity = {};
+    identity.pageSize = fixture.pageSize;
+    identity.pageCount = fixture.pageCount;
+    identity.catalogRootPageId = fixture.catalogRootPageId;
+    identity.indexRootPageId = fixture.roots[0];
+    identity.ownerIndexId = fixture.indexIds[0];
+    identity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
+    g_imagePath = fixture.path;
+    g_bridgePath = kBridgeDatabasePath;
+
+    CHECK(gxNativeSqlIndexPageProviderOpen(nullptr, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) ==
+        GX_NATIVE_SQL_IMAGE_INVALID_ARGUMENT);
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, nullptr, &identity,
+        buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_INVALID_ARGUMENT);
+    identity.pageSize = 256;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_INVALID_ARGUMENT);
+    identity.pageSize = fixture.pageSize;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size() - 1) ==
+        GX_NATIVE_SQL_IMAGE_INVALID_ARGUMENT);
+
+    g_imagePath = fixture.path + ".missing";
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_FILE_OPEN);
+    CHECK(context.nativeFileStatus == GX_DB_FILE_NOT_FOUND);
+
+    g_imagePath = fixture.path;
+    g_failSize = true;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) == GX_NATIVE_SQL_IMAGE_FILE_SIZE);
+    CHECK(context.nativeFileStatus == GX_DB_FILE_IO);
+    CHECK(context.cleanupFileStatus == GX_DB_FILE_OK);
+    g_failSize = false;
+
+    Fixture badHeader = fixture;
+    badHeader.path += ".bad_header";
+    std::vector<uint8_t> header = readBytes(fixture.path);
+    if (!header.empty()) header[0] ^= 0xff;
+    CHECK(writeBytes(badHeader.path, header));
+    g_imagePath = badHeader.path;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) ==
+        GX_NATIVE_SQL_IMAGE_HEADER_CORRUPT);
+    CHECK(!context.active);
+    std::remove(badHeader.path.c_str());
+
+    Fixture unsupportedVersion = fixture;
+    unsupportedVersion.path += ".unsupported_version";
+    CHECK(writeBytes(unsupportedVersion.path, readBytes(fixture.path)));
+    CHECK(mutateHeaderFormatMajor(unsupportedVersion.path, kFormatMajor + 1));
+    g_imagePath = unsupportedVersion.path;
+    CHECK(gxNativeSqlIndexPageProviderOpen(&context, kLogicalDatabasePath,
+        &identity, buffer.data(), buffer.size()) ==
+        GX_NATIVE_SQL_IMAGE_HEADER_CORRUPT);
+    CHECK(!context.active);
+    std::remove(unsupportedVersion.path.c_str());
+    g_imagePath = fixture.path;
+}
+#endif
+
 } // namespace
 
 // The real Server bridge object refers to production VFS symbols for its
@@ -829,6 +1131,12 @@ int main() {
     if (multilevel.pageCount) {
         testFixture(multilevel, 80);
         testIdentityAndModes(multilevel);
+#if defined(GX_R3AG_QUALIFICATION)
+        testRootOwnerAssociation(multilevel);
+        testVisitorExitReleasesBorrow(multilevel);
+        testProviderOpenFailures(multilevel);
+        testUnexpectedPageType(leaf);
+#endif
         testTruncatedAndInvalidHandle(multilevel);
         testProviderFailureAfterVisitor(multilevel);
         testCorruptionCopies(leaf, multilevel);
@@ -838,7 +1146,8 @@ int main() {
     removeDatabaseFiles(leaf.path);
     removeDatabaseFiles(multilevel.path);
     gx_db_file_bind_ops(nullptr);
-    std::printf("NDB1R4P11R3AF native SQL immutable image provider: %u passed, %u failed\n",
+    std::printf("NDB1R4P11%s native SQL immutable image provider: %u passed, %u failed\n",
+                kQualificationName,
                 g_checks - g_failures, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

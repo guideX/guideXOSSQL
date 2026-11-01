@@ -100,10 +100,13 @@ void releasePage(void* opaque, uint64_t pageId, const GxIndexPageView* view) {
 GxNativeSqlImageError closeAfterFailure(
     GxNativeSqlIndexPageProviderContext* context,
     GxNativeSqlImageError failure) {
+    const GxDbFileStatus operationStatus = context->nativeFileStatus;
+    context->cleanupFileStatus = GX_DB_FILE_OK;
     if (context->fileHandle != GX_DB_FILE_INVALID_HANDLE) {
-        context->nativeFileStatus = gx_db_file_close(context->fileHandle);
+        context->cleanupFileStatus = gx_db_file_close(context->fileHandle);
         context->fileHandle = GX_DB_FILE_INVALID_HANDLE;
     }
+    context->nativeFileStatus = operationStatus;
     context->active = 0;
     context->error = failure;
     return failure;
@@ -176,6 +179,7 @@ void gxNativeSqlIndexPageProviderInit(
     context->indexRootPageId = 0;
     context->ownerIndexId = 0;
     context->nativeFileStatus = GX_DB_FILE_OK;
+    context->cleanupFileStatus = GX_DB_FILE_OK;
     context->error = GX_NATIVE_SQL_IMAGE_OK;
 }
 
