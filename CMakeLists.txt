@@ -404,6 +404,9 @@ if(GX_GUIDEXOS_SERVER_SOURCE_DIR AND
                 -iquote "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/include")
         endif()
         add_test(NAME database_ndb1r4p11r3ag_test COMMAND database_ndb1r4p11r3ag_test)
+        add_test(NAME database_ndb1r4p11rah_fixture_test
+            COMMAND database_ndb1r4p11r3ag_test --verify-fixture
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/NDB1R4P11R3AH")
         add_test(NAME database_ndb1r4p11r3ag_native_link
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/qualify_ndb1r4p11r3ag_native_link.ps1"
