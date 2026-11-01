@@ -14,7 +14,7 @@ qualification; no QEMU, QAC, or guest execution occurred in R3AI.
 
 | Repository | Branch | Starting HEAD | Ending HEAD |
 |---|---|---|---|
-| SQL | `main` | `80a594e4a30b652a2d207ac60d8100b214885c4a` | This report commit (exact ID returned at phase completion) |
+| SQL | `main` | `80a594e4a30b652a2d207ac60d8100b214885c4a` | Final local report commit (exact ending HEAD returned at phase completion) |
 | Server | `codex/ndb1r4p11rah-sql-read-integration` | `552dd4ee17b26cf0b367f03dd1d8a46a443ff29c` | `3e102c3bce7e1a3ecef8634a6fa640b05e72ec10` |
 
 The Server branch started at integration baseline
@@ -243,10 +243,10 @@ cmake.exe --build build-r3ai-final --parallel 8
 ctest.exe --test-dir build-r3ai-final --output-on-failure
 ```
 
-The build completed all 143/143 steps successfully. R3AH's preceding full
-aggregate was 39/39, and its production-writer fixture verification reported
-340 checks; R3AI reran the full aggregate against the final SQL production
-sources.
+The build completed all 143/143 steps successfully. In this R3AI aggregate,
+`database_ndb1r4p11r3ag_test` reported 340 passed/0 failed and the
+`database_ndb1r4p11rah_fixture_test` reported 340 passed/0 failed. R3AH's
+preceding full aggregate was also 39/39.
 
 ### Server builds and symbols
 
