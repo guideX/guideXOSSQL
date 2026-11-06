@@ -1,8 +1,8 @@
 # NDB1R4P11R3AN RAM Disk CR3/PTE Mapping Provenance
 
-**Phase:** NATIVE_RAMDISK_CR3_PTE_MAPPING_PROVENANCE  
-**Outcome:** C — NATIVE_RAMDISK_MAPPING_GUEST_PENDING  
-**Run status:** Diagnostic candidate prepared; no R3AN guest was started.  
+**Phase:** NATIVE_RAMDISK_CR3_PTE_MAPPING_PROVENANCE
+**Outcome:** C — NATIVE_RAMDISK_MAPPING_GUEST_PENDING
+**Run status:** Diagnostic candidate prepared; no R3AN guest was started.
 **Date:** 2026-11-05
 
 ## Repository identity and scope
