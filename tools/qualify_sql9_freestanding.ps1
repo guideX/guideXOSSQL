@@ -73,7 +73,8 @@ $sources = @(
     "database/database_sql_tokenizer.cpp",
     "database/database_sql_parser.cpp",
     "database/database_sql_expr.cpp",
-    "database/database_sql.cpp"
+    "database/database_sql.cpp",
+    "database/native/gx_native_sql_read_service.cpp"
 )
 
 # Mirrors kernel/arch/amd64/Makefile.arch and the common CFLAGS in
@@ -88,7 +89,7 @@ $flags = @(
     "-D__x86_64__", "-I$serverKernelRoot", "-I$serverRoot",
     "-I$(Join-Path $serverKernelRoot 'core\include')",
     "-I$(Join-Path $serverKernelRoot 'arch\amd64\include')",
-    "-Idatabase/portable", "-Idatabase",
+    "-Idatabase/native", "-Idatabase/portable", "-Idatabase",
     "-fdiagnostics-color=never", "-H"
 )
 

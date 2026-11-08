@@ -336,6 +336,7 @@ if(GX_GUIDEXOS_SERVER_SOURCE_DIR AND
    EXISTS "${GX_GUIDEXOS_SERVER_SOURCE_DIR}/kernel/core/native_database_file.cpp")
     add_library(gxos_native_sql_index_page_provider STATIC
         database/native/gx_native_sql_index_page_provider.cpp
+        database/native/gx_native_sql_read_service.cpp
     )
     target_include_directories(gxos_native_sql_index_page_provider PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/database/native"
