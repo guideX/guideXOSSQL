@@ -1,8 +1,10 @@
 # NDB1R4P11R3AN RAM Disk CR3/PTE Mapping Provenance
 
 **Phase:** NATIVE_RAMDISK_CR3_PTE_MAPPING_PROVENANCE
-**Outcome:** C — NATIVE_RAMDISK_MAPPING_GUEST_PENDING
-**Run status:** Diagnostic candidate prepared; no R3AN guest was started.
+**Original outcome (2026-11-05):** C — NATIVE_RAMDISK_MAPPING_GUEST_PENDING
+**Initial run status (2026-11-05):** Diagnostic candidate prepared; no R3AN guest was started.
+**Latest R1 result (2026-11-07):** Mapping defect confirmed; SQL guest read not accepted.
+**Current run status:** One QAC-managed R3AN guest boot completed; FAT32 mount failed before SQL fixture/index execution. No repair was applied.
 **Date:** 2026-11-05
 
 ## Repository identity and scope
@@ -15,9 +17,9 @@
 
 The isolated Server worktree was clean at its stated starting commit. Existing untracked output and evidence directories were preserved and not staged. The only staged Server files were the loader/kernel diagnostics, hosted PTE test and runner, and candidate packaging script. No reset, stash, rebase, clean, push, or merge was performed.
 
-## Outcome and evidence boundary
+## Initial outcome and evidence boundary (2026-11-05)
 
-R3AN adds bounded, gated page-table and byte-provenance diagnostics. Its ISO, ESP, kernel, loader, RAM disk, SQL fixture, and trusted fixture manifest were built and hash-checked. The R3AN guest did not run because QAC already had an owned acceptance guest for another Server workstream and another queued acceptance reservation. No R3AN reservation was requested, no guest was launched, and no other reservation was touched.
+R3AN adds bounded, gated page-table and byte-provenance diagnostics. Its ISO, ESP, kernel, loader, RAM disk, SQL fixture, and trusted fixture manifest were built and hash-checked. At this initial phase closeout, the R3AN guest had not run because QAC already had an owned acceptance guest for another Server workstream and another queued acceptance reservation. No R3AN reservation was requested, no guest was launched, and no other reservation was touched.
 
 Therefore this phase has no R3AN runtime CR3 values, PTEs, translated physical addresses, allocation addresses for this candidate, or runtime byte samples. The R3AM guest observations below are historical context only; they are not attributed to R3AN. The R3AN candidate manifest records guest qualification as pending.
 
@@ -118,16 +120,40 @@ Ordinary and gated AMD64 kernels and UEFI loaders built successfully in isolated
 
 The ISO verifier reports a bootable UEFI El Torito image (platform 0xEF), boot image LBA 32. The ESP verifier confirms the diagnostic loader, kernel ELF, and RAM disk hashes above. The candidate is at out/ndb1r4p11r3an/boot-candidate/guideXOS-NDB1R4P11R3AN-amd64.iso in the Server integration worktree. No guest evidence or SQL acceptance is implied by successful packaging.
 
-## QAC admission, SQL frontier, and cleanup
+## Initial QAC admission, SQL frontier, and cleanup (2026-11-05)
 
 The read-only QAC census showed QAC v2.0.0 online with one managed QEMU acceptance process, PID 5924, owned by active reservation 2755eece88ce4fd2a1f7cb85463f831e for project guideXOSServer; the verified wrapper PID was 10048. A separate acceptance request, reservation be8b4c6fb57d49c2a901ebb8dee27b89 for guideXOSServer-AARCH64-ABI3-Studio, was queued. R3AN did not request admission, poll for availability, launch a QEMU process, or disturb either workstream.
 
 Because the candidate never booted, no SQL guest marker was emitted. The fixture was not opened, IX_Rows_K64 point lookup (root 234, owner 1, 73 ordered locators) and IX_Rows_K32 range scan (root 148, owner 2, 32 ordered locators) did not run, and native SQL acceptance was not reached. No R3AN QMP or serial log exists. There was no R3AN-owned guest to shut down or reservation to release; the other QAC guest remains owned by its workstream. The prepared ISO hash is unchanged from packaging verification.
 
-## Remaining uncertainty and next correction
+## Initial remaining uncertainty and next correction (superseded by R3AN-R1)
 
-Outcome C is required because guest authorization/admission was unavailable. The single smallest missing evidence set is one admitted boot of the exact candidate with MAP-A, MAP-B, MAP-D, and MAP-E PTE output plus first-16-byte samples at UEFI load, MAP-A, MAP-B, MAP-D, and kernel entry. It will establish whether the kernel's active translation changes and whether original physical bytes remain correct across CR3 activation.
+The initial Outcome C closeout was required because guest authorization/admission was unavailable. The single smallest missing evidence set was one admitted boot of the exact candidate with MAP-A, MAP-B, MAP-D, and MAP-E PTE output plus first-16-byte samples at UEFI load, MAP-A, MAP-B, MAP-D, and kernel entry. The R3AN-R1 section below supplies that evidence.
 
 No repair is justified from R3AN because no R3AN mapping defect has been observed. If an admitted run confirms that the RAM disk's numerical VA is consumed by the kernel image mapping and resolves into zero-initialized kernel backing, the next phase should choose a noncolliding kernel virtual address for the RAM disk and make that address contract explicit in BootInfo (or relocate the conflicting kernel virtual span). Simply restoring the identity PTE at the current address may collide with the kernel's linked BSS range, so the mapping correction must preserve both kernel BSS and RAM disk access. If MAP-E instead shows the intended translation, compare backing-byte and ownership evidence before proposing any overwrite or lifetime repair.
 
 R3AN made no mapping, zeroing, FAT32, RAM-disk ownership, SQL, or writable-storage change.
+
+## R3AN-R1 admitted guest result — 2026-11-07
+
+The current SQL HEAD was `cb08e0ebdf3fb25bb9aae77aaecbc6490d807e1b`; the isolated Server HEAD remained `5af7597497ddead12e63ccad87160ffaf5077ee5`. The frozen ISO hash was verified before launch and remained `95c74d7d36deaad08fd712961cad42c283d5746e78b9bd37d552b439c5a0183a` afterward. The only SQL changes since the candidate source commit were the two qualification documents; no SQL production source changed.
+
+A fresh QAC census showed the coordinator online with zero QEMU processes, reservations, queued requests, or blocked requests. QAC granted one `guideXOSServer` acceptance reservation (`23872e3d0240484f8a8d151606c88d85`) for the single R3AN boot. The harness failed to observe its launch notification within its bounded admission window, but QAC inspection verified the reservation owner and direct child (`qemu-system-x86_64.exe`, PID 29304). The prepared QMP helper also had a bytes-to-text writer mismatch, so recovery used a direct binary QMP session against the recorded loopback endpoint. The guest was reconciled and shut down there; no second launch was made.
+
+### Mapping and byte provenance
+
+MAP-A, MAP-B, MAP-D, and MAP-E all reported CR3 root `0x3DD3C000`. MAP-A ran before the kernel `MapRange` override and showed identity translations. MAP-C was unavailable by source ordering. The RAM disk allocation was `[0x155BF000, 0x190BF000)` with length `0x03B00000`; the kernel virtual span was `[0x00100000, 0x22BB5E80)`, and its physical allocation began at `0x190BF000`. The physical allocations did not overlap, while the virtual address ranges did.
+
+| Stage | RAM disk VA samples | Actual PA samples | Result |
+|---|---|---|---|
+| MAP-A | `0x155BF000`, `0x155C0000`, `0x190BE000` | same three addresses | Present 4 KiB identity PTEs; `MATCHES_BACKING` |
+| MAP-B and MAP-D | same three addresses | `0x2E57E000`, `0x2E57F000`, `0x3207D000` | Present 4 KiB PTEs; `WRONG_BACKING`; each target overlaps the kernel physical destination |
+| MAP-E, active kernel CR3 | same three addresses | `0x2E57E000`, `0x2E57F000`, `0x3207D000` | Same wrong translations; base-page `bytes16=00000000000000000000000000000000` |
+
+The MAP-B/D/E PTEs were respectively `0x2E57E003`, `0x2E57F003`, and `0x3207D003` (present, writable, supervisor, executable, 4 KiB leaves). QMP independently read active CR3 as `0x3DD3C000`. Immediately before graceful shutdown, QMP `xp/16bx 0x155BF000` read `EB 58 90 47 55 49 44 45 58 4F 53 00 02 10 20 00`, matching the offline and UEFI load/handoff samples. The sampled original physical RAM disk bytes remained correct while the kernel's numerical RAM disk VA resolved into different, zero-filled kernel-image backing.
+
+The first kernel RAM-disk handoff, attach, block destination, and FAT read samples contained zeros. FAT diagnostics read bytes-per-sector as `0x0000` and rejected the boot sector with `FAT32_BYTES_PER_SECTOR_INVALID`; VFS did not register a filesystem. The SQL diagnostic emitted `SQL_NATIVE_R3AI BEGIN`, `FAIL code=VFS_UNAVAILABLE_OR_WRITABLE`, and `END FAIL`. The point lookup and range scan did not execute. The 73 point and 32 range locator arrays had passed the preflight source-to-manifest ordered comparison, and the diagnostic compares runtime locators element-by-element, but there is no guest runtime locator result to accept.
+
+QMP `quit` returned successfully. A post-run QAC census verified zero QEMU processes, reservations, queued requests, and blocked requests; the owned guest and reservation were released, and no unrelated process was changed. The candidate ISO and original R3AL ISO hashes remained unchanged. No mapping repair, rebuild, repackaging, SQL production edit, push, or merge was performed.
+
+Raw serial, QMP, QAC cleanup, mapping, provenance, and outcome evidence is preserved under `E:\CodexArtifacts\NDB1R4P11R3ANR1\` (`serial.log`, `qmp-observations.jsonl`, `qmp-owner-recovery.json`, `qac-postrun.json`, `guest-mapping-evidence.json`, `provenance-summary.json`, and `outcome.json`).
