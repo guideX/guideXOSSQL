@@ -106,5 +106,5 @@ The separate 20-gate R3AV procedure is [NDB1R4P11R3AV_NATIVE_RAMDISK_GUEST_ACCEP
 ## Final commits
 
 - Server integration worktree: `e1c8c4a71c1a01fec7d7a6ddce095fd5c4986082`.
-- SQL repository: this report and the R3AV procedure are committed together on `main`; the exact containing commit hash is the final SQL `HEAD` reported in the closeout.
+- SQL repository: the report and R3AV procedure were first committed together on `main` as `0a935ab040993eed0c928e29d184a3466a613f42`. A follow-up documentation correction and the final SQL `HEAD` are reported in the closeout.
 
