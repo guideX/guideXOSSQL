@@ -86,4 +86,12 @@ GxNativeSqlReadStatus gxNativeSqlExecuteRead(
     size_t resultCapacity,
     GxNativeSqlReadResponse* response);
 
+// Verifies the one approved immutable fixture using the production read-only
+// provider, header checks, and a trusted catalog index root. The provider is
+// always closed before this function returns; no VFS/SQL pointer is retained.
+GxNativeSqlReadStatus gxNativeSqlValidateDatabase(
+    GxNativeSqlReadFixture fixture,
+    GxNativeSqlImageError* imageError,
+    GxNativeSqlImageError* cleanupError);
+
 #endif

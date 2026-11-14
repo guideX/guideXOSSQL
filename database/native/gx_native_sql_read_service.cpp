@@ -396,3 +396,77 @@ GxNativeSqlReadStatus gxNativeSqlExecuteRead(
     response->status = GX_NATIVE_SQL_READ_OK;
     return response->status;
 }
+
+GxNativeSqlReadStatus gxNativeSqlValidateDatabase(
+    GxNativeSqlReadFixture fixture,
+    GxNativeSqlImageError* imageError,
+    GxNativeSqlImageError* cleanupError) {
+    if (!imageError || !cleanupError) return GX_NATIVE_SQL_READ_INVALID_REQUEST;
+    *imageError = GX_NATIVE_SQL_IMAGE_OK;
+    *cleanupError = GX_NATIVE_SQL_IMAGE_OK;
+    if (fixture != GX_NATIVE_SQL_FIXTURE_R3AH_MULTILEVEL) {
+        return GX_NATIVE_SQL_READ_INVALID_REQUEST;
+    }
+
+    IndexIdentity index = {};
+    if (!identityFor(GX_NATIVE_SQL_INDEX_ROWS_K64, &index)) {
+        return GX_NATIVE_SQL_READ_INVALID_REQUEST;
+    }
+
+    uint8_t pageBuffer[kPageSize] = {};
+    GxNativeSqlIndexPageProviderContext context = {};
+    gxNativeSqlIndexPageProviderInit(&context);
+    GxNativeSqlIndexImageIdentity imageIdentity = {};
+    imageIdentity.pageSize = kPageSize;
+    imageIdentity.pageCount = kPageCount;
+    imageIdentity.catalogRootPageId = kCatalogRootPageId;
+    imageIdentity.indexRootPageId = index.rootPageId;
+    imageIdentity.ownerIndexId = index.ownerIndexId;
+    imageIdentity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
+
+    *imageError = gxNativeSqlIndexPageProviderOpen(
+        &context, kFixturePath, &imageIdentity, pageBuffer, sizeof(pageBuffer));
+    if (*imageError != GX_NATIVE_SQL_IMAGE_OK) {
+        GxNativeSqlReadStatus status = imageFailureStatus(*imageError);
+        if (context.active) {
+            *cleanupError = gxNativeSqlIndexPageProviderClose(&context);
+        } else if (context.fileHandle != GX_DB_FILE_INVALID_HANDLE) {
+            *cleanupError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+        }
+        return *cleanupError == GX_NATIVE_SQL_IMAGE_OK
+            ? status : GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    }
+
+    uint8_t readOnlyMount = 0;
+    const GxDbFileStatus mountStatus = gx_db_file_is_read_only(
+        context.fileHandle, &readOnlyMount);
+    GxNativeSqlReadStatus status = GX_NATIVE_SQL_READ_OK;
+    if (mountStatus != GX_DB_FILE_OK) {
+        *imageError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+        status = GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    } else if (!readOnlyMount) {
+        *imageError = GX_NATIVE_SQL_IMAGE_UNSUPPORTED_MODE;
+        status = GX_NATIVE_SQL_READ_UNSUPPORTED_OPERATION;
+    } else if (!headerMatches(context)) {
+        *imageError = GX_NATIVE_SQL_IMAGE_METADATA_MISMATCH;
+        status = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
+    } else if (!selectedRootMatches(&context, index)) {
+        if (context.error != GX_NATIVE_SQL_IMAGE_OK) {
+            *imageError = context.error;
+            status = imageFailureStatus(context.error);
+        } else {
+            *imageError = GX_NATIVE_SQL_IMAGE_INVALID_ROOT;
+            status = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
+        }
+    }
+
+    if (context.active) {
+        *cleanupError = gxNativeSqlIndexPageProviderClose(&context);
+    } else if (context.fileHandle != GX_DB_FILE_INVALID_HANDLE) {
+        *cleanupError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+    }
+    if (*cleanupError != GX_NATIVE_SQL_IMAGE_OK) {
+        return GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    }
+    return status;
+}
