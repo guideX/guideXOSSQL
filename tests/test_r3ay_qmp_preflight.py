@@ -9,7 +9,8 @@ import threading
 import time
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from tools import r3ay_qmp_preflight as qmp
 
@@ -61,6 +62,7 @@ def observation(pid=28664, owner_pid=25408, start=START, port=51288,
 def trusted_evidence(state=qmp.OwnershipState.OWNED_LISTENER_VERIFIED):
     return qmp.OwnershipEvidence(
         state, endpoint(), "a" * 32, 28664, 25408, "test",
+        observation=observation(),
         qac_observed_at_utc=datetime.now(timezone.utc).isoformat())
 
 
@@ -101,6 +103,189 @@ class OwnershipTests(unittest.TestCase):
     def verify(self, obs=None, qac=None, ep=None, exe=EXE):
         return qmp.evaluate_ownership(qac or admission(), ep or endpoint(),
                                       obs or observation(), expected_executable=exe)
+
+    def test_qac_freshness_boundary_and_r3azr1_age_are_deterministic(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        with patch.object(qmp, "_utc_now", return_value=now), \
+                patch.object(qmp, "_monotonic", return_value=100.0):
+            fresh = admission()
+            fresh["observedAtUtc"] = (now - timedelta(seconds=2.0)).isoformat()
+            self.assertEqual(self.verify(qac=fresh).state,
+                             qmp.OwnershipState.OWNED_LISTENER_VERIFIED)
+
+            r3azr1 = admission()
+            r3azr1["observedAtUtc"] = (now - timedelta(seconds=6.263)).isoformat()
+            rejected = self.verify(qac=r3azr1)
+            self.assertEqual(rejected.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+            self.assertIn("6.263 seconds", rejected.reason)
+
+    def test_offset_timestamps_are_utc_normalized_and_naive_or_missing_are_rejected(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        local = timezone(timedelta(hours=-8))
+        qac = admission()
+        qac["observedAtUtc"] = (now - timedelta(seconds=1)).astimezone(local).isoformat()
+        with patch.object(qmp, "_utc_now", return_value=now):
+            self.assertEqual(self.verify(qac=qac).state,
+                             qmp.OwnershipState.OWNED_LISTENER_VERIFIED)
+
+            for timestamp in (None, "not-a-timestamp", now.replace(tzinfo=None).isoformat()):
+                malformed = admission()
+                malformed["observedAtUtc"] = timestamp
+                result = self.verify(qac=malformed)
+                self.assertEqual(result.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+                self.assertIn("QAC observation timestamp", result.reason)
+
+    def test_require_owned_enforces_two_seconds_on_both_clocks(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        evidence = qmp.OwnershipEvidence(
+            qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "a" * 32,
+            28664, 25408, "boundary", observation=observation(),
+            verified_at_monotonic=100.0,
+            qac_observed_at_utc=(now - timedelta(seconds=2.0)).isoformat(),
+        )
+        with patch.object(qmp, "_utc_now", return_value=now), \
+                patch.object(qmp, "_monotonic", return_value=102.0):
+            qmp.require_owned(evidence, endpoint())
+
+        with patch.object(qmp, "_utc_now", return_value=now), \
+                patch.object(qmp, "_monotonic", return_value=102.001):
+            with self.assertRaisesRegex(qmp.PreflightError, "evidence is stale"):
+                qmp.require_owned(evidence, endpoint())
+
+        with patch.object(qmp, "_utc_now", return_value=now + timedelta(milliseconds=2)), \
+                patch.object(qmp, "_monotonic", return_value=101.0):
+            with self.assertRaisesRegex(qmp.PreflightError, "QAC reservation evidence is stale"):
+                qmp.require_owned(evidence, endpoint())
+
+    def test_final_authoritative_snapshot_is_acquired_after_slow_os_readiness(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        clocks = {"utc": now, "mono": 50.0}
+        calls = []
+        initial = admission()
+
+        def utc_now():
+            return clocks["utc"]
+
+        def monotonic():
+            return clocks["mono"]
+
+        def provider():
+            current = json.loads(json.dumps(initial))
+            current["observedAtUtc"] = clocks["utc"].isoformat()
+            calls.append(current["observedAtUtc"])
+            return current
+
+        def slow_os_observation(_pid, _port):
+            clocks["utc"] += timedelta(seconds=6.263)
+            clocks["mono"] += 6.263
+            return observation()
+
+        with patch.object(qmp, "_utc_now", side_effect=utc_now), \
+                patch.object(qmp, "_monotonic", side_effect=monotonic):
+            result = qmp.poll_ownership(
+                provider, endpoint(), expected_executable=EXE,
+                timeout_seconds=5, observe=slow_os_observation,
+            )
+            self.assertEqual(result.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
+                             result.reason)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result.qac_observed_at_utc, calls[-1])
+            qmp.require_owned(result, endpoint())
+
+    def test_stale_caller_snapshot_is_not_refreshed_or_used_for_os_access(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        stale = admission()
+        stale["observedAtUtc"] = (now - timedelta(seconds=6.263)).isoformat()
+        with patch.object(qmp, "_utc_now", return_value=now):
+            result = qmp.poll_ownership(
+                stale, endpoint(), expected_executable=EXE,
+                observe=lambda *_args: self.fail("stale caller data must fail before OS probing"),
+            )
+        self.assertEqual(result.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+        self.assertIn("6.263 seconds", result.reason)
+
+    def test_reservation_release_and_identity_changes_during_readiness_fail_closed(self):
+        initial = admission()
+
+        released = json.loads(json.dumps(initial))
+        released["relationship"]["state"] = "Released"
+        released["relationship"]["running"] = False
+        released["relationship"]["reservation"]["state"] = "Released"
+        released["relationship"]["reservation"]["ownerLiveness"] = "Stopped"
+
+        changed_pid = json.loads(json.dumps(initial))
+        changed_pid["qemuPid"] = 28665
+        changed_pid["relationship"]["qemuPid"] = 28665
+        changed_pid["relationship"]["reservation"]["processId"] = 28665
+        changed_pid["relationship"]["listedProcess"]["pid"] = 28665
+
+        changed_reservation = json.loads(json.dumps(initial))
+        changed_id = uuid.uuid4().hex
+        changed_reservation["reservationId"] = changed_id
+        changed_reservation["relationship"]["reservationId"] = changed_id
+        changed_reservation["relationship"]["reservation"]["id"] = changed_id
+
+        for final, reason in ((released, "Running"), (changed_pid, "child PID"),
+                              (changed_reservation, "reservation")):
+            with self.subTest(reason=reason):
+                snapshots = [initial, final]
+
+                def provider():
+                    current = json.loads(json.dumps(snapshots.pop(0)))
+                    current["observedAtUtc"] = datetime.now(timezone.utc).isoformat()
+                    return current
+
+                result = qmp.poll_ownership(
+                    provider, endpoint(), expected_executable=EXE,
+                    timeout_seconds=0, observe=lambda *_args: observation(),
+                )
+                self.assertEqual(result.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+                self.assertFalse(snapshots)
+
+        snapshots = [initial, released]
+
+        def release_provider():
+            current = json.loads(json.dumps(snapshots.pop(0)))
+            current["observedAtUtc"] = datetime.now(timezone.utc).isoformat()
+            return current
+
+        missing = observation()
+        missing["listeners"] = []
+        released_while_missing = qmp.poll_ownership(
+            release_provider, endpoint(), expected_executable=EXE,
+            timeout_seconds=0, observe=lambda *_args: missing,
+        )
+        self.assertEqual(released_while_missing.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+        self.assertIn("released during readiness checks", released_while_missing.reason)
+        self.assertFalse(snapshots)
+
+    def test_fresh_revalidation_can_qualify_qac_owned_cleanup_after_qmp_protocol_failure(self):
+        now = datetime(2026, 11, 14, 20, 0, tzinfo=timezone.utc)
+        stale = admission()
+        stale["observedAtUtc"] = (now - timedelta(seconds=6.263)).isoformat()
+        with patch.object(qmp, "_utc_now", return_value=now):
+            unknown = self.verify(qac=stale)
+            self.assertEqual(unknown.state, qmp.OwnershipState.OWNERSHIP_UNKNOWN)
+            with self.assertRaises(qmp.PreflightError):
+                qmp.require_owned(unknown, endpoint())
+
+        refreshed = admission()
+        calls = 0
+
+        def provider():
+            nonlocal calls
+            calls += 1
+            current = json.loads(json.dumps(refreshed))
+            current["observedAtUtc"] = datetime.now(timezone.utc).isoformat()
+            return current
+
+        cleanup_eligibility = qmp.poll_ownership(
+            provider, endpoint(), expected_executable=EXE,
+            timeout_seconds=0, observe=lambda *_args: observation(),
+        )
+        self.assertEqual(cleanup_eligibility.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED)
+        self.assertEqual(calls, 2)
+        qmp.require_owned(cleanup_eligibility, endpoint())
 
     def test_owned_foreign_unexpected_missing_and_wrong_port_are_distinct(self):
         self.assertEqual(self.verify().state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED)
@@ -279,12 +464,24 @@ class ProtocolTests(unittest.TestCase):
                 qac_observed_at_utc=datetime.now(timezone.utc).isoformat())
             with self.assertRaisesRegex(qmp.PreflightError, "identity changed"):
                 client.quit(changed)
+            with self.assertRaisesRegex(qmp.PreflightError, "not verified"):
+                client.continue_guest(trusted_evidence(qmp.OwnershipState.OWNERSHIP_UNKNOWN))
             stale = qmp.OwnershipEvidence(
                 qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "a" * 32,
                 28664, 25408, "stale snapshot",
                 verified_at_monotonic=time.monotonic() - 3)
             with self.assertRaisesRegex(qmp.PreflightError, "stale"):
                 client.quit(stale)
+
+            reused = qmp.OwnershipEvidence(
+                qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "a" * 32,
+                28664, 25408, "reused PID",
+                observation=observation(start="2026-11-12T03:07:00Z"),
+                qac_observed_at_utc=datetime.now(timezone.utc).isoformat())
+            with self.assertRaisesRegex(qmp.PreflightError, "PID was reused"):
+                client.continue_guest(reused)
+            with self.assertRaisesRegex(qmp.PreflightError, "PID was reused"):
+                client.quit(reused)
             right.setblocking(False)
             with self.assertRaises(BlockingIOError):
                 right.recv(4096)
@@ -373,12 +570,16 @@ conn.close(); server.close()
             test_admission = {"reservationId": rid, "qemuPid": child.pid,
                               "relationship": relation,
                               "observedAtUtc": datetime.now(timezone.utc).isoformat()}
-            def refresh_ownership():
+
+            def authoritative_snapshot():
                 test_admission["observedAtUtc"] = datetime.now(timezone.utc).isoformat()
-                return qmp.poll_ownership(test_admission, ep, expected_executable=exe,
+                return test_admission
+
+            def refresh_ownership():
+                return qmp.poll_ownership(authoritative_snapshot, ep, expected_executable=exe,
                                           timeout_seconds=1, interval_seconds=0.1)
 
-            owned = qmp.poll_ownership(test_admission, ep, expected_executable=exe,
+            owned = qmp.poll_ownership(authoritative_snapshot, ep, expected_executable=exe,
                                        timeout_seconds=5, interval_seconds=0.1)
             self.assertEqual(owned.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
                              f"{owned.reason}; snapshot={owned.observation!r}")

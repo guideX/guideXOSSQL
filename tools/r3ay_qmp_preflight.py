@@ -43,6 +43,16 @@ class OwnershipState(str, enum.Enum):
 MAX_QAC_SNAPSHOT_AGE_SECONDS = 2.0
 
 
+def _utc_now() -> _datetime.datetime:
+    """Return an aware UTC wall clock for QAC snapshot-age checks."""
+    return _datetime.datetime.now(_datetime.timezone.utc)
+
+
+def _monotonic() -> float:
+    """Return a monotonic clock for local elapsed-time checks."""
+    return time.monotonic()
+
+
 @dataclass(frozen=True)
 class QmpEndpoint:
     transport: str
@@ -148,9 +158,9 @@ def _same_path(left: Any, right: Any) -> bool:
     return normalize(left) == normalize(right)
 
 
-def _parse_time(value: Any) -> _datetime.datetime:
+def _parse_time(value: Any, *, field_name: str = "process start time") -> _datetime.datetime:
     if not isinstance(value, str):
-        raise PreflightError("process start time is missing")
+        raise PreflightError(f"{field_name} is missing")
     match = re.fullmatch(r"/Date\((-?\d+)(?:[+-]\d+)?\)/", value)
     if match:
         return _datetime.datetime.fromtimestamp(
@@ -160,9 +170,9 @@ def _parse_time(value: Any) -> _datetime.datetime:
     try:
         parsed = _datetime.datetime.fromisoformat(text)
     except ValueError as exc:
-        raise PreflightError("process start time has an unsupported format") from exc
+        raise PreflightError(f"{field_name} has an unsupported format") from exc
     if parsed.tzinfo is None:
-        raise PreflightError("process start time must include a UTC offset")
+        raise PreflightError(f"{field_name} must include a UTC offset")
     return parsed.astimezone(_datetime.timezone.utc)
 
 
@@ -190,10 +200,17 @@ def validate_qac_relationship(admission: Any) -> tuple[dict[str, Any], dict[str,
     """Validate the current Running reservation and return (relationship, reservation)."""
     if not isinstance(admission, dict):
         raise PreflightError("QAC admission must be a JSON object")
-    observed_at = _parse_time(admission.get("observedAtUtc"))
-    qac_age = (_datetime.datetime.now(_datetime.timezone.utc) - observed_at).total_seconds()
+    observed_at = _parse_time(admission.get("observedAtUtc"), field_name="QAC observation timestamp")
+    qac_age = (_utc_now() - observed_at).total_seconds()
     if qac_age < -0.5 or qac_age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
         raise PreflightError(f"QAC reservation observation is stale or future-dated ({qac_age:.3f} seconds)")
+    return _validate_qac_relationship_identity(admission)
+
+
+def _validate_qac_relationship_identity(admission: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Check QAC identity fields without using the snapshot as fresh authorization."""
+    if not isinstance(admission, dict):
+        raise PreflightError("QAC admission must be a JSON object")
     relationship = admission.get("relationship")
     if not isinstance(relationship, dict):
         raise PreflightError("QAC reservation/process relationship is unavailable")
@@ -235,8 +252,9 @@ def validate_qac_relationship(admission: Any) -> tuple[dict[str, Any], dict[str,
     if owner_pid is None or owner_pid != _owner_pid(relationship.get("owner")):
         raise PreflightError("QAC owner PID is absent or inconsistent")
     try:
-        listed_start = _parse_time(process.get("start"))
-        reservation_start = _parse_time(reservation.get("processStartTimeUtc"))
+        listed_start = _parse_time(process.get("start"), field_name="QAC listed child start time")
+        reservation_start = _parse_time(reservation.get("processStartTimeUtc"),
+                                        field_name="QAC reservation child start time")
     except PreflightError as exc:
         raise PreflightError(f"QAC listed child start identity is unavailable: {exc}") from exc
     if abs((listed_start - reservation_start).total_seconds() * 1000) > 5:
@@ -253,19 +271,19 @@ class OwnershipEvidence:
     owner_pid: int | None
     reason: str
     observation: dict[str, Any] = field(default_factory=dict)
-    verified_at_monotonic: float = field(default_factory=time.monotonic)
+    verified_at_monotonic: float = field(default_factory=lambda: _monotonic())
     qac_observed_at_utc: str | None = None
 
     @property
     def verified(self) -> bool:
         if self.state is not OwnershipState.OWNED_LISTENER_VERIFIED or not self.qac_observed_at_utc:
             return False
-        age = time.monotonic() - self.verified_at_monotonic
+        age = _monotonic() - self.verified_at_monotonic
         if age < 0 or age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
             return False
         try:
-            qac_age = (_datetime.datetime.now(_datetime.timezone.utc)
-                       - _parse_time(self.qac_observed_at_utc)).total_seconds()
+            qac_age = (_utc_now() - _parse_time(
+                self.qac_observed_at_utc, field_name="QAC observation timestamp")).total_seconds()
         except PreflightError:
             return False
         return -0.5 <= qac_age <= MAX_QAC_SNAPSHOT_AGE_SECONDS
@@ -317,10 +335,14 @@ def evaluate_ownership(
     *,
     expected_executable: str,
     start_tolerance_ms: int = 5,
+    _readiness_only: bool = False,
 ) -> OwnershipEvidence:
     """Classify one OS snapshot without converting inspection errors into ownership mismatch."""
     try:
-        relationship, reservation = validate_qac_relationship(admission)
+        relationship, reservation = (
+            _validate_qac_relationship_identity(admission)
+            if _readiness_only else validate_qac_relationship(admission)
+        )
     except PreflightError as exc:
         return OwnershipEvidence(
             OwnershipState.OWNERSHIP_UNKNOWN,
@@ -399,11 +421,17 @@ def evaluate_ownership(
         return OwnershipEvidence(OwnershipState.OWNERSHIP_UNKNOWN, endpoint, reservation_id, qpid, owner_pid,
                                  process_reason, observation)
     qac_observed_at = admission.get("observedAtUtc")
-    qac_age = (_datetime.datetime.now(_datetime.timezone.utc) - _parse_time(qac_observed_at)).total_seconds()
-    if qac_age < -0.5 or qac_age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
-        return OwnershipEvidence(OwnershipState.OWNERSHIP_UNKNOWN, endpoint, reservation_id, qpid, owner_pid,
-                                 f"QAC reservation snapshot expired during OS inspection ({qac_age:.3f} seconds)",
-                                 observation)
+    if not _readiness_only:
+        try:
+            qac_age = (_utc_now() - _parse_time(
+                qac_observed_at, field_name="QAC observation timestamp")).total_seconds()
+        except PreflightError as exc:
+            return OwnershipEvidence(OwnershipState.OWNERSHIP_UNKNOWN, endpoint, reservation_id, qpid,
+                                     owner_pid, str(exc), observation)
+        if qac_age < -0.5 or qac_age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
+            return OwnershipEvidence(OwnershipState.OWNERSHIP_UNKNOWN, endpoint, reservation_id, qpid, owner_pid,
+                                     f"QAC reservation snapshot expired during OS inspection ({qac_age:.3f} seconds)",
+                                     observation)
     return OwnershipEvidence(OwnershipState.OWNED_LISTENER_VERIFIED, endpoint, reservation_id, qpid, owner_pid,
                              "exact endpoint listener PID, QAC child identity, and live command line agree",
                              observation, qac_observed_at_utc=qac_observed_at)
@@ -493,67 +521,153 @@ def poll_ownership(
     interval_seconds: float = 0.2,
     observe: Callable[[int, int], dict[str, Any]] = observe_windows_process_and_listeners,
 ) -> OwnershipEvidence:
-    """Poll briefly for listener readiness while retaining unknown/error evidence."""
+    """Probe readiness, then correlate the last OS observation with a fresh QAC census.
+
+    A callable admission is invoked once to establish the reservation identity and once
+    after the listener is ready. The first snapshot is only an identity anchor during
+    readiness checks; only the final snapshot can authorize QMP access.
+    """
+    initial_admission: Any = None
     try:
-        current_admission = admission() if callable(admission) else admission
-        relationship, _ = validate_qac_relationship(current_admission)
-    except PreflightError as exc:
-        return evaluate_ownership(current_admission if "current_admission" in locals() else admission,
-                                  endpoint, {}, expected_executable=expected_executable)
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    last: OwnershipEvidence | None = None
+        initial_admission = admission() if callable(admission) else admission
+        relationship, reservation = validate_qac_relationship(initial_admission)
+    except Exception as exc:
+        admission_object = initial_admission if isinstance(initial_admission, dict) else None
+        return OwnershipEvidence(
+            OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
+            admission_object.get("reservationId") if admission_object else None,
+            admission_object.get("qemuPid") if admission_object else None,
+            None, f"QAC admission could not establish the expected reservation identity: {exc}",
+            {"admissionError": repr(exc)},
+        )
+    deadline = _monotonic() + max(0.0, timeout_seconds)
     attempts: list[dict[str, Any]] = []
-    while True:
+    provider = admission if callable(admission) else None
+
+    def with_attempts(evidence: OwnershipEvidence) -> OwnershipEvidence:
+        return OwnershipEvidence(
+            evidence.state, evidence.endpoint, evidence.reservation_id, evidence.qemu_pid,
+            evidence.owner_pid, evidence.reason,
+            {"attempts": attempts, "last": evidence.observation},
+            verified_at_monotonic=evidence.verified_at_monotonic,
+            qac_observed_at_utc=evidence.qac_observed_at_utc,
+        )
+
+    def same_reservation_identity(fresh_admission: Any) -> tuple[bool, str]:
         try:
-            if callable(admission):
-                current_admission = admission()
-                refreshed_relationship, _ = validate_qac_relationship(current_admission)
-                if (refreshed_relationship.get("reservationId") != relationship.get("reservationId")
-                        or refreshed_relationship.get("qemuPid") != relationship.get("qemuPid")
-                        or _owner_pid(refreshed_relationship.get("owner"))
-                        != _owner_pid(relationship.get("owner"))):
-                    return OwnershipEvidence(
-                        OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
-                        current_admission.get("reservationId")
-                        if isinstance(current_admission, dict) else None,
-                        refreshed_relationship.get("qemuPid"),
-                        _owner_pid(refreshed_relationship.get("owner")),
-                        "QAC reservation or owner changed during listener readiness polling",
-                        {"attempts": attempts},
-                    )
+            fresh_relationship, fresh_reservation = validate_qac_relationship(fresh_admission)
+            expected_owner_pid = _owner_pid(reservation.get("owner"))
+            fresh_owner_pid = _owner_pid(fresh_reservation.get("owner"))
+            if (fresh_admission.get("reservationId") != initial_admission.get("reservationId")
+                    or fresh_relationship.get("reservationId") != relationship.get("reservationId")
+                    or fresh_relationship.get("qemuPid") != relationship.get("qemuPid")
+                    or fresh_owner_pid != expected_owner_pid
+                    or not _same_path(fresh_relationship.get("processIdentity"),
+                                      relationship.get("processIdentity"))):
+                return False, "QAC reservation, owner, child PID, or executable changed during readiness checks"
+            initial_start = _parse_time(reservation.get("processStartTimeUtc"),
+                                        field_name="initial QAC child start time")
+            fresh_start = _parse_time(fresh_reservation.get("processStartTimeUtc"),
+                                      field_name="fresh QAC child start time")
+            delta_ms = abs((initial_start - fresh_start).total_seconds() * 1000)
+            if delta_ms > 5:
+                return False, f"QAC child start identity changed during readiness checks ({delta_ms:.3f} ms)"
+            return True, "same QAC reservation and child identity"
+        except Exception as exc:
+            return False, f"fresh QAC reservation could not be validated: {exc}"
+
+    while True:
+        inspection_error: Exception | None = None
+        snapshot: dict[str, Any] = {}
+        try:
             snapshot = observe(relationship["qemuPid"], endpoint.port)
-            evidence = evaluate_ownership(current_admission, endpoint, snapshot,
+            readiness = evaluate_ownership(
+                initial_admission, endpoint, snapshot,
+                expected_executable=expected_executable, _readiness_only=True,
+            )
+        except Exception as exc:
+            inspection_error = exc
+            readiness = OwnershipEvidence(
+                OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
+                initial_admission.get("reservationId"), relationship.get("qemuPid"),
+                _owner_pid(reservation.get("owner")), f"OS ownership inspection failed: {exc}",
+                {"inspectionError": repr(exc)},
+            )
+
+        if readiness.state is OwnershipState.OWNED_LISTENER_VERIFIED:
+            final_admission = initial_admission
+            if provider is not None:
+                try:
+                    final_admission = provider()
+                except Exception as exc:
+                    attempts.append({"state": OwnershipState.OWNERSHIP_UNKNOWN.value,
+                                     "reason": f"fresh QAC census failed: {exc}",
+                                     "observation": {"admissionError": repr(exc)}})
+                    return with_attempts(OwnershipEvidence(
+                        OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
+                        initial_admission.get("reservationId"), relationship.get("qemuPid"),
+                        _owner_pid(reservation.get("owner")), f"fresh QAC census failed: {exc}",
+                        snapshot,
+                    ))
+                same_identity, identity_reason = same_reservation_identity(final_admission)
+                if not same_identity:
+                    attempts.append({"state": OwnershipState.OWNERSHIP_UNKNOWN.value,
+                                     "reason": identity_reason, "observation": snapshot})
+                    return with_attempts(OwnershipEvidence(
+                        OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
+                        final_admission.get("reservationId")
+                        if isinstance(final_admission, dict) else None,
+                        final_admission.get("qemuPid") if isinstance(final_admission, dict) else None,
+                        None, identity_reason, snapshot,
+                    ))
+            verified = evaluate_ownership(final_admission, endpoint, snapshot,
                                           expected_executable=expected_executable)
-        except PreflightError as exc:
-            evidence = OwnershipEvidence(OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
-                                         current_admission.get("reservationId")
-                                         if isinstance(current_admission, dict) else None,
-                                         relationship.get("qemuPid"),
-                                         _owner_pid(relationship.get("owner")), str(exc),
-                                         {"inspectionError": str(exc)})
-        attempts.append({"state": evidence.state.value, "reason": evidence.reason,
-                         "observation": evidence.observation})
-        if evidence.state is not OwnershipState.LISTENER_MISSING:
-            evidence = OwnershipEvidence(evidence.state, evidence.endpoint, evidence.reservation_id,
-                                         evidence.qemu_pid, evidence.owner_pid, evidence.reason,
-                                         {"attempts": attempts, "last": evidence.observation},
-                                         qac_observed_at_utc=evidence.qac_observed_at_utc)
-            if evidence.state is not OwnershipState.OWNERSHIP_UNKNOWN or timeout_seconds <= 0:
-                return evidence
-            # A failed OS query is inconclusive. Retry only within this bounded preflight.
-            last = evidence
-        remaining = deadline - time.monotonic()
+            attempts.append({"state": verified.state.value, "reason": verified.reason,
+                             "observation": verified.observation,
+                             "qacObservedAtUtc": verified.qac_observed_at_utc})
+            return with_attempts(verified)
+
+        attempts.append({"state": readiness.state.value, "reason": readiness.reason,
+                         "observation": readiness.observation})
+        if readiness.state not in (OwnershipState.LISTENER_MISSING,
+                                   OwnershipState.OWNERSHIP_UNKNOWN):
+            return with_attempts(readiness)
+        if readiness.state is OwnershipState.OWNERSHIP_UNKNOWN and inspection_error is None:
+            # Identity mismatches and malformed OS rows are terminal, not readiness delays.
+            return with_attempts(readiness)
+        remaining = deadline - _monotonic()
         if remaining <= 0:
-            if last is not None:
-                return last
-            return OwnershipEvidence(OwnershipState.LISTENER_MISSING, endpoint,
-                                     admission.get("reservationId"), relationship.get("qemuPid"),
-                                     _owner_pid(relationship.get("owner")),
-                                     "listener remained absent for the bounded readiness interval",
-                                     {"attempts": attempts})
-        if not attempts or attempts[-1]["state"] == OwnershipState.LISTENER_MISSING.value:
+            if readiness.state is OwnershipState.LISTENER_MISSING:
+                if provider is not None:
+                    try:
+                        final_admission = provider()
+                        still_same, identity_reason = same_reservation_identity(final_admission)
+                    except Exception as exc:
+                        still_same = False
+                        identity_reason = f"final QAC revalidation failed: {exc}"
+                        final_admission = None
+                    if not still_same:
+                        attempts.append({"state": OwnershipState.OWNERSHIP_UNKNOWN.value,
+                                         "reason": identity_reason,
+                                         "observation": {"qacRevalidation": final_admission}})
+                        return with_attempts(OwnershipEvidence(
+                            OwnershipState.OWNERSHIP_UNKNOWN, endpoint,
+                            final_admission.get("reservationId")
+                            if isinstance(final_admission, dict) else None,
+                            final_admission.get("qemuPid")
+                            if isinstance(final_admission, dict) else None,
+                            None, f"QAC reservation changed or was released during readiness checks: {identity_reason}",
+                            {"lastOsObservation": snapshot, "qacRevalidation": final_admission},
+                        ))
+                readiness = OwnershipEvidence(
+                    OwnershipState.LISTENER_MISSING, endpoint, initial_admission.get("reservationId"),
+                    relationship.get("qemuPid"), _owner_pid(reservation.get("owner")),
+                    "listener remained absent for the bounded readiness interval", snapshot,
+                )
+            return with_attempts(readiness)
+        if readiness.state is OwnershipState.LISTENER_MISSING:
             attempts[-1]["state"] = OwnershipState.LISTENER_NOT_YET_READY.value
-        time.sleep(min(interval_seconds, remaining))
+        time.sleep(min(max(0.0, interval_seconds), remaining))
 
 
 def require_owned(evidence: OwnershipEvidence, endpoint: QmpEndpoint | None = None) -> None:
@@ -564,18 +678,62 @@ def require_owned(evidence: OwnershipEvidence, endpoint: QmpEndpoint | None = No
         raise PreflightError(f"QMP command refused because listener ownership is not verified ({state})")
     if endpoint is not None and endpoint != evidence.endpoint:
         raise PreflightError("QMP endpoint differs from the verified ownership evidence")
-    age = time.monotonic() - evidence.verified_at_monotonic
-    if age < 0 or age > 2.0:
+    age = _monotonic() - evidence.verified_at_monotonic
+    if age < 0 or age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
         raise PreflightError(f"QMP ownership evidence is stale ({age:.3f} seconds old)")
     if not evidence.qac_observed_at_utc:
         raise PreflightError("QMP ownership evidence has no fresh QAC observation timestamp")
     try:
-        qac_age = (_datetime.datetime.now(_datetime.timezone.utc)
-                   - _parse_time(evidence.qac_observed_at_utc)).total_seconds()
+        qac_age = (_utc_now() - _parse_time(
+            evidence.qac_observed_at_utc, field_name="QAC observation timestamp")).total_seconds()
     except PreflightError as exc:
         raise PreflightError(f"QMP ownership evidence has an invalid QAC timestamp: {exc}") from exc
     if qac_age < -0.5 or qac_age > MAX_QAC_SNAPSHOT_AGE_SECONDS:
         raise PreflightError(f"QMP QAC reservation evidence is stale ({qac_age:.3f} seconds old)")
+
+
+def _require_same_owned_identity(
+    original: OwnershipEvidence,
+    fresh: OwnershipEvidence,
+    endpoint: QmpEndpoint,
+    operation: str,
+) -> None:
+    """Keep guarded QMP operations on the same reservation and exact process instance."""
+    require_owned(fresh, endpoint)
+    if (original.endpoint != endpoint
+            or original.reservation_id != fresh.reservation_id
+            or original.qemu_pid != fresh.qemu_pid
+            or original.owner_pid != fresh.owner_pid):
+        raise PreflightError(
+            f"QMP {operation} refused because reservation, owner, or child identity changed"
+        )
+    original_process = _latest_os_snapshot(original).get("process")
+    fresh_process = _latest_os_snapshot(fresh).get("process")
+    if not isinstance(original_process, dict) or not isinstance(fresh_process, dict):
+        raise PreflightError(f"QMP {operation} refused because process identity evidence is missing")
+    if (original_process.get("ProcessId") != fresh_process.get("ProcessId")
+            or original_process.get("ParentProcessId") != fresh_process.get("ParentProcessId")
+            or not _same_path(original_process.get("ExecutablePath"),
+                              fresh_process.get("ExecutablePath"))):
+        raise PreflightError(f"QMP {operation} refused because QEMU process identity changed")
+    try:
+        original_start = _parse_time(original_process.get("CreationTimeUtc"),
+                                     field_name="original OS process start time")
+        fresh_start = _parse_time(fresh_process.get("CreationTimeUtc"),
+                                  field_name="fresh OS process start time")
+    except PreflightError as exc:
+        raise PreflightError(f"QMP {operation} refused because process start identity is invalid: {exc}") from exc
+    delta_ms = abs((original_start - fresh_start).total_seconds() * 1000)
+    if delta_ms > 5:
+        raise PreflightError(f"QMP {operation} refused because PID was reused ({delta_ms:.3f} ms start delta)")
+    for process in (original_process, fresh_process):
+        command_line = process.get("CommandLine")
+        try:
+            process_endpoint = parse_qmp_command_line(command_line)
+        except PreflightError as exc:
+            raise PreflightError(f"QMP {operation} refused because live QEMU command line is invalid: {exc}") from exc
+        if process_endpoint != endpoint:
+            raise PreflightError(f"QMP {operation} refused because live QEMU endpoint changed")
 
 
 def _latest_os_snapshot(evidence: OwnershipEvidence) -> dict[str, Any]:
@@ -667,10 +825,7 @@ class QmpClient:
                 raise QmpProtocolError("QMP greeting is missing the QMP object")
             client.greeting = greeting
             fresh_evidence = reverify()
-            require_owned(fresh_evidence, endpoint)
-            if (fresh_evidence.reservation_id != evidence.reservation_id
-                    or fresh_evidence.qemu_pid != evidence.qemu_pid):
-                raise PreflightError("QMP connection refused because reservation or child changed")
+            _require_same_owned_identity(evidence, fresh_evidence, endpoint, "connection")
             require_connected_peer(fresh_evidence, endpoint, client.stream.getsockname())
             client.evidence = fresh_evidence
             capabilities = client.command("qmp_capabilities")
@@ -773,20 +928,16 @@ class QmpClient:
 
     def quit(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
         """Send quit only with a fresh successful ownership snapshot for the same endpoint."""
-        require_owned(fresh_evidence, self.endpoint)
-        if (fresh_evidence.reservation_id != self.evidence.reservation_id
-                or fresh_evidence.qemu_pid != self.evidence.qemu_pid):
-            raise PreflightError("QMP quit refused because reservation or child identity changed")
+        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "quit")
+        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
         if not self.capabilities_ready:
             raise PreflightError("QMP quit refused before capabilities negotiation")
         return self._exchange("quit")
 
     def continue_guest(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
         """Resume a -S guest only after revalidating the same current QAC-owned listener."""
-        require_owned(fresh_evidence, self.endpoint)
-        if (fresh_evidence.reservation_id != self.evidence.reservation_id
-                or fresh_evidence.qemu_pid != self.evidence.qemu_pid):
-            raise PreflightError("QMP cont refused because reservation or child identity changed")
+        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "cont")
+        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
         if not self.capabilities_ready or not isinstance(self.initial_status, dict):
             raise PreflightError("QMP cont refused before capabilities and status negotiation")
         if self.initial_status.get("running") is not False:
