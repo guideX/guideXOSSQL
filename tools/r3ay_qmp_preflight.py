@@ -904,6 +904,37 @@ class QmpClient:
                 raise PreflightError("QMP HMP command is outside the read-only inspection allowlist")
         return self._exchange(execute, arguments)
 
+    def move_pointer(self, fresh_evidence: OwnershipEvidence,
+                     delta_x: int, delta_y: int) -> dict[str, Any]:
+        """Move the guest pointer only with fresh evidence for this QAC-owned QMP peer."""
+        if (isinstance(delta_x, bool) or not isinstance(delta_x, int)
+                or isinstance(delta_y, bool) or not isinstance(delta_y, int)
+                or not -4096 <= delta_x <= 4096 or not -4096 <= delta_y <= 4096):
+            raise PreflightError("QMP pointer movement is outside the bounded relative-input range")
+        return self._send_guarded_input(fresh_evidence, [{
+            "type": "rel", "data": {"axis": "x", "value": delta_x}}, {
+            "type": "rel", "data": {"axis": "y", "value": delta_y}}])
+
+    def left_button(self, fresh_evidence: OwnershipEvidence, down: bool) -> dict[str, Any]:
+        """Send one left-button transition to the guest after ownership revalidation."""
+        if not isinstance(down, bool):
+            raise PreflightError("QMP left-button state must be a boolean")
+        return self._send_guarded_input(fresh_evidence, [{
+            "type": "btn", "data": {"button": "left", "down": down}}])
+
+    def _send_guarded_input(self, fresh_evidence: OwnershipEvidence,
+                            events: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self.capabilities_ready:
+            raise PreflightError("QMP input refused before capabilities negotiation")
+        if not isinstance(self.initial_status, dict) or self.initial_status.get("running") is not True:
+            raise PreflightError("QMP input refused unless the guest is verified running")
+        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "input")
+        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
+        reply = self._exchange("input-send-event", {"events": events})
+        if "error" in reply or reply.get("return") != {}:
+            raise QmpProtocolError("QMP guest input event was rejected")
+        return reply
+
     def _exchange(self, execute: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         self.count += 1
         request_id = f"{self.request_prefix}-{self.count}"

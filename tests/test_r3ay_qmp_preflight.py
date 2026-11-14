@@ -455,9 +455,15 @@ class ProtocolTests(unittest.TestCase):
             client.capabilities_ready = True
             for operation, arguments in (("quit", None), ("cont", None),
                                          ("system_reset", None),
-                                         ("human-monitor-command", {"command-line": "quit"})):
+                                         ("human-monitor-command", {"command-line": "quit"}),
+                                         ("input-send-event", {"events": []})):
                 with self.subTest(operation=operation), self.assertRaises(qmp.PreflightError):
                     client.command(operation, arguments)
+            client.initial_status = {"running": True}
+            with self.assertRaisesRegex(qmp.PreflightError, "bounded relative-input range"):
+                client.move_pointer(trusted_evidence(), 4097, 0)
+            with self.assertRaisesRegex(qmp.PreflightError, "must be a boolean"):
+                client.left_button(trusted_evidence(), 1)
             changed = qmp.OwnershipEvidence(
                 qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "b" * 32,
                 28664, 25408, "changed reservation",
@@ -592,6 +598,18 @@ conn.close(); server.close()
                              before_cont.reason)
             resumed = client.continue_guest(before_cont)
             self.assertTrue(resumed["return"]["running"])
+            before_input = refresh_ownership()
+            self.assertEqual(before_input.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
+                             f"{before_input.reason}; snapshot={before_input.observation!r}")
+            self.assertNotIn("error", client.move_pointer(before_input, 1, 1))
+            before_button = refresh_ownership()
+            self.assertEqual(before_button.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
+                             f"{before_button.reason}; snapshot={before_button.observation!r}")
+            self.assertNotIn("error", client.left_button(before_button, True))
+            before_release = refresh_ownership()
+            self.assertEqual(before_release.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
+                             f"{before_release.reason}; snapshot={before_release.observation!r}")
+            self.assertNotIn("error", client.left_button(before_release, False))
             reply = client.command("human-monitor-command",
                                    {"command-line": "info registers"})
             self.assertEqual(qmp.parse_qmp_register(reply, reply["id"], "CR0"), 0x80010033)
