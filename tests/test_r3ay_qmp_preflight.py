@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -13,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from tools import r3ay_qmp_preflight as qmp
+from tools import r3bg_input_qualification as r3bg
 
 
 EXE = r"C:\Program Files\QEMU\qemu-system-x86_64.exe"
@@ -460,6 +463,8 @@ class ProtocolTests(unittest.TestCase):
                 with self.subTest(operation=operation), self.assertRaises(qmp.PreflightError):
                     client.command(operation, arguments)
             client.initial_status = {"running": True}
+            client.input_send_event_available = True
+            client.current_mouse_available = True
             with self.assertRaisesRegex(qmp.PreflightError, "bounded relative-input range"):
                 client.move_pointer(trusted_evidence(), 4097, 0)
             with self.assertRaisesRegex(qmp.PreflightError, "must be a boolean"):
@@ -471,13 +476,19 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(qmp.PreflightError, "identity changed"):
                 client.quit(changed)
             with self.assertRaisesRegex(qmp.PreflightError, "not verified"):
-                client.continue_guest(trusted_evidence(qmp.OwnershipState.OWNERSHIP_UNKNOWN))
+                client.continue_guest(trusted_evidence(qmp.OwnershipState.OWNERSHIP_UNKNOWN),
+                                      reverify=trusted_evidence)
             stale = qmp.OwnershipEvidence(
                 qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "a" * 32,
                 28664, 25408, "stale snapshot",
-                verified_at_monotonic=time.monotonic() - 3)
-            with self.assertRaisesRegex(qmp.PreflightError, "stale"):
-                client.quit(stale)
+                verified_at_monotonic=100.0 - 3.618)
+            with patch.object(qmp, "_monotonic", return_value=100.0):
+                with self.assertRaisesRegex(qmp.PreflightError, "3.618 seconds"):
+                    client.quit(stale)
+                with self.assertRaisesRegex(qmp.PreflightError, "3.618 seconds"):
+                    client.move_pointer(stale, 1, 0)
+            with self.assertRaisesRegex(qmp.PreflightError, "not verified"):
+                client.move_pointer(trusted_evidence(qmp.OwnershipState.OWNERSHIP_UNKNOWN), 1, 0)
 
             reused = qmp.OwnershipEvidence(
                 qmp.OwnershipState.OWNED_LISTENER_VERIFIED, endpoint(), "a" * 32,
@@ -485,7 +496,7 @@ class ProtocolTests(unittest.TestCase):
                 observation=observation(start="2026-11-12T03:07:00Z"),
                 qac_observed_at_utc=datetime.now(timezone.utc).isoformat())
             with self.assertRaisesRegex(qmp.PreflightError, "PID was reused"):
-                client.continue_guest(reused)
+                client.continue_guest(reused, reverify=trusted_evidence)
             with self.assertRaisesRegex(qmp.PreflightError, "PID was reused"):
                 client.quit(reused)
             right.setblocking(False)
@@ -506,6 +517,7 @@ class WindowsOwnershipIntegrationTest(unittest.TestCase):
         server_code = r'''
 import json, socket, sys, time
 value = sys.argv[sys.argv.index("-qmp") + 1]
+trace_path = sys.argv[sys.argv.index("-trace") + 1]
 hostport = value.split(",", 1)[0].removeprefix("tcp:")
 host, port = hostport.rsplit(":", 1)
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -526,6 +538,25 @@ while True:
     name = request["execute"]
     if name == "query-status":
         response = {"return":{"status":"running" if running else "prelaunch","running":running}}
+    elif name == "query-qmp-schema":
+        response = {"return":[{"name":"input-send-event","meta-type":"command"}]}
+    elif name == "query-mice":
+        response = {"return":[{"name":"QEMU PS/2 Mouse","current":True,"absolute":False}]}
+    elif name == "screendump":
+        import struct, zlib
+        def chunk(kind, data):
+            body = kind + data
+            return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+        png = (b"\x89PNG\r\n\x1a\n" +
+               chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)) +
+               chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff")) + chunk(b"IEND", b""))
+        with open(request["arguments"]["filename"], "wb") as image:
+            image.write(png)
+        response = {"return":{}}
+    elif name == "input-send-event":
+        with open(trace_path, "a", encoding="utf-8") as trace:
+            trace.write(json.dumps(request["arguments"]["events"], separators=(",", ":")) + "\n")
+        response = {"return":{}}
     elif name == "cont":
         running = True
         response = {"return":{}}
@@ -539,7 +570,11 @@ while True:
     if name == "quit": break
 conn.close(); server.close()
 '''
-        child = subprocess.Popen([sys.executable, "-u", "-c", server_code, "-qmp", ep.qemu_value],
+        trace_path = Path(tempfile.gettempdir()) / f"r3bg-qmp-trace-{uuid.uuid4().hex}.jsonl"
+        screenshot_path = trace_path.with_suffix(".png")
+        ledger_path = trace_path.with_suffix(".ledger")
+        child = subprocess.Popen([sys.executable, "-u", "-c", server_code, "-qmp", ep.qemu_value,
+                                  "-trace", str(trace_path)],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, text=True, encoding="utf-8")
         client = None
@@ -576,9 +611,11 @@ conn.close(); server.close()
             test_admission = {"reservationId": rid, "qemuPid": child.pid,
                               "relationship": relation,
                               "observedAtUtc": datetime.now(timezone.utc).isoformat()}
+            qac_snapshot_times = []
 
             def authoritative_snapshot():
                 test_admission["observedAtUtc"] = datetime.now(timezone.utc).isoformat()
+                qac_snapshot_times.append(test_admission["observedAtUtc"])
                 return test_admission
 
             def refresh_ownership():
@@ -596,29 +633,48 @@ conn.close(); server.close()
             before_cont = refresh_ownership()
             self.assertEqual(before_cont.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
                              before_cont.reason)
-            resumed = client.continue_guest(before_cont)
+            resumed = client.continue_guest(before_cont, reverify=refresh_ownership)
             self.assertTrue(resumed["return"]["running"])
-            before_input = refresh_ownership()
-            self.assertEqual(before_input.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
-                             f"{before_input.reason}; snapshot={before_input.observation!r}")
-            self.assertNotIn("error", client.move_pointer(before_input, 1, 1))
-            before_button = refresh_ownership()
-            self.assertEqual(before_button.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
-                             f"{before_button.reason}; snapshot={before_button.observation!r}")
-            self.assertNotIn("error", client.left_button(before_button, True))
-            before_release = refresh_ownership()
-            self.assertEqual(before_release.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
-                             f"{before_release.reason}; snapshot={before_release.observation!r}")
-            self.assertNotIn("error", client.left_button(before_release, False))
+            ledger = r3bg.InputActionLedger(ledger_path)
+            operations = r3bg.FreshQmpOperations(
+                client, authoritative_snapshot, exe, ledger,
+                timeout_seconds=1, interval_seconds=0.1)
+            schema = operations.query_qmp_schema()
+            self.assertIsNone(schema.get("error"))
+            self.assertTrue(client.input_send_event_available)
+            mice = operations.query_mice()
+            self.assertEqual(mice["return"][0]["name"], "QEMU PS/2 Mouse")
+            screenshot = operations.screendump(screenshot_path)
+            self.assertEqual(screenshot["source"], "qmp-screendump")
+            self.assertEqual((screenshot["width"], screenshot["height"]), (1, 1))
+            self.assertEqual(screenshot["guestIdentity"]["reservationId"], rid)
+            self.assertNotIn("error", operations.send_input(
+                "move-pointer-1", [{"type":"rel", "data":{"axis":"x", "value":1}}]))
+            self.assertNotIn("error", operations.send_input(
+                "left-down-1", [{"type":"btn", "data":{"button":"left", "down":True}}]))
+            self.assertNotIn("error", operations.send_input(
+                "left-up-1", [{"type":"btn", "data":{"button":"left", "down":False}}]))
+            self.assertNotIn("error", operations.send_input(
+                "tab-down-1", [{"type":"key", "data":{"key":{"type":"qcode", "data":"tab"}, "down":True}}]))
+            self.assertNotIn("error", operations.send_input(
+                "tab-up-1", [{"type":"key", "data":{"key":{"type":"qcode", "data":"tab"}, "down":False}}]))
             reply = client.command("human-monitor-command",
-                                   {"command-line": "info registers"})
+                                   {"command-line": "info registers"},
+                                   fresh_evidence=refresh_ownership())
             self.assertEqual(qmp.parse_qmp_register(reply, reply["id"], "CR0"), 0x80010033)
-            fresh = refresh_ownership()
-            self.assertEqual(fresh.state, qmp.OwnershipState.OWNED_LISTENER_VERIFIED,
-                             f"{fresh.reason}; snapshot={fresh.observation!r}")
-            self.assertNotIn("error", client.quit(fresh))
+            self.assertNotIn("error", operations.quit())
+            with self.assertRaises(r3bg.DuplicateInputAction):
+                operations.quit()
             child.wait(timeout=5)
             self.assertEqual(child.returncode, 0)
+            delivered = [json.loads(row) for row in trace_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(delivered), 5)
+            self.assertEqual([batch[0]["type"] for batch in delivered],
+                             ["rel", "btn", "btn", "key", "key"])
+            self.assertEqual(ledger.state("qmp-shutdown"), "qmp_acknowledged")
+            self.assertTrue(all(row["state"] == "qmp_acknowledged"
+                                for row in ledger.action_records()))
+            self.assertGreaterEqual(len(qac_snapshot_times), 18)
         finally:
             if client is not None:
                 client.close()
@@ -629,6 +685,11 @@ conn.close(); server.close()
                     child.kill(); child.wait(timeout=3)
             if child.stderr:
                 child.stderr.close()
+            for path in (trace_path, screenshot_path, ledger_path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 if __name__ == "__main__":

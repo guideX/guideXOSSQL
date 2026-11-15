@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _datetime
 import enum
+import hashlib
 import ipaddress
 import json
 import os
@@ -18,6 +19,7 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
@@ -41,6 +43,11 @@ class OwnershipState(str, enum.Enum):
 
 
 MAX_QAC_SNAPSHOT_AGE_SECONDS = 2.0
+MAX_QMP_INPUT_EVENTS = 8
+MAX_QMP_RELATIVE_DELTA = 4096
+SUPPORTED_QMP_QCODES = frozenset({
+    "meta_l", "meta_r", "up", "down", "left", "right", "enter", "esc", "tab",
+})
 
 
 def _utc_now() -> _datetime.datetime:
@@ -803,6 +810,9 @@ class QmpClient:
         self.capabilities_ready = False
         self.initial_status: dict[str, Any] | None = None
         self.events: list[dict[str, Any]] = []
+        self.input_send_event_available: bool | None = None
+        self.current_mouse_available: bool | None = None
+        self.input_states: dict[tuple[str, str], str] = {}
 
     @classmethod
     def connect_verified(
@@ -832,7 +842,11 @@ class QmpClient:
             if "error" in capabilities or capabilities.get("return") != {}:
                 raise QmpProtocolError("QMP capabilities negotiation failed")
             client.capabilities_ready = True
-            status = client.command("query-status")
+            status_evidence = reverify()
+            _require_same_owned_identity(evidence, status_evidence, endpoint, "query-status")
+            require_connected_peer(status_evidence, endpoint, client.stream.getsockname())
+            client.evidence = status_evidence
+            status = client.command("query-status", fresh_evidence=status_evidence)
             result = status.get("return")
             if "error" in status or not isinstance(result, dict) or not isinstance(result.get("status"), str):
                 raise QmpProtocolError("correlated QMP query-status response is malformed")
@@ -886,7 +900,8 @@ class QmpClient:
             raise QmpProtocolError(f"QMP send failed: {exc!r}") from exc
         return wire
 
-    def command(self, execute: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def command(self, execute: str, arguments: dict[str, Any] | None = None,
+                *, fresh_evidence: OwnershipEvidence | None = None) -> dict[str, Any]:
         if not isinstance(execute, str) or not execute:
             raise PreflightError("QMP command name is empty")
         if execute in ("quit", "cont"):
@@ -895,6 +910,10 @@ class QmpClient:
             raise PreflightError(f"QMP command {execute!r} is outside the read-only qualification allowlist")
         if execute != "qmp_capabilities" and not self.capabilities_ready:
             raise PreflightError("QMP command refused before capabilities negotiation")
+        if execute != "qmp_capabilities":
+            if fresh_evidence is None:
+                raise PreflightError(f"QMP {execute} requires fresh ownership evidence")
+            self._require_fresh_peer(fresh_evidence, execute)
         if execute == "human-monitor-command":
             if (not isinstance(arguments, dict) or set(arguments) != {"command-line"}
                     or not isinstance(arguments.get("command-line"), str)
@@ -904,35 +923,157 @@ class QmpClient:
                 raise PreflightError("QMP HMP command is outside the read-only inspection allowlist")
         return self._exchange(execute, arguments)
 
+    def _require_fresh_peer(self, fresh_evidence: OwnershipEvidence, operation: str) -> None:
+        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, operation)
+        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
+        self.evidence = fresh_evidence
+
+    def query_qmp_schema(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
+        """Read the live QMP schema after checking ownership for this command."""
+        if not self.capabilities_ready:
+            raise PreflightError("QMP schema query refused before capabilities negotiation")
+        self._require_fresh_peer(fresh_evidence, "query-qmp-schema")
+        reply = self._exchange("query-qmp-schema")
+        schema = reply.get("return")
+        if "error" in reply or not isinstance(schema, list):
+            raise QmpProtocolError("QMP query-qmp-schema response is malformed")
+        self.input_send_event_available = any(
+            isinstance(item, dict) and item.get("name") == "input-send-event"
+            and item.get("meta-type") == "command"
+            for item in schema
+        )
+        return reply
+
+    def query_mice(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
+        """Read QEMU's configured mouse inventory using the supported query-mice command."""
+        if not self.capabilities_ready:
+            raise PreflightError("QMP mouse query refused before capabilities negotiation")
+        self._require_fresh_peer(fresh_evidence, "query-mice")
+        reply = self._exchange("query-mice")
+        if "error" in reply or not isinstance(reply.get("return"), list):
+            raise QmpProtocolError("QMP query-mice response is malformed")
+        self.current_mouse_available = any(
+            isinstance(item, dict) and item.get("current") is True
+            and isinstance(item.get("name"), str) and bool(item["name"].strip())
+            for item in reply["return"]
+        )
+        return reply
+
+    def screendump(self, fresh_evidence: OwnershipEvidence,
+                   path: str | os.PathLike[str]) -> dict[str, Any]:
+        """Capture the primary guest display and bind the frame hash to this QAC child."""
+        if not self.capabilities_ready:
+            raise PreflightError("QMP screendump refused before capabilities negotiation")
+        output = Path(path)
+        if output.exists():
+            raise PreflightError("QMP screendump path already exists; refusing to overwrite evidence")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        self._require_fresh_peer(fresh_evidence, "screendump")
+        started_at = _utc_now().isoformat().replace("+00:00", "Z")
+        reply = self._exchange("screendump", {"filename": str(output), "format": "png"})
+        completed_at = _utc_now().isoformat().replace("+00:00", "Z")
+        if "error" in reply or reply.get("return") != {}:
+            raise QmpProtocolError("QMP screendump command was rejected")
+        try:
+            with output.open("rb") as image_file:
+                header = image_file.read(24)
+            if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+                raise QmpProtocolError("QMP screendump did not create a valid PNG header")
+            width = int.from_bytes(header[16:20], "big")
+            height = int.from_bytes(header[20:24], "big")
+            if width <= 0 or height <= 0 or output.stat().st_size < 33:
+                raise QmpProtocolError("QMP screendump PNG dimensions or file size are invalid")
+            digest = hashlib.sha256()
+            size = 0
+            with output.open("rb") as image_file:
+                for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    digest.update(chunk)
+        except OSError as exc:
+            raise QmpProtocolError(f"QMP screendump output is unavailable: {exc}") from exc
+        return {
+            "source": "qmp-screendump",
+            "captureStartedAtUtc": started_at,
+            "capturedAtUtc": completed_at,
+            "guestIdentity": {
+                "reservationId": fresh_evidence.reservation_id,
+                "qemuPid": fresh_evidence.qemu_pid,
+                "endpoint": self.endpoint.qemu_value,
+            },
+            "path": str(output),
+            "bytes": size,
+            "sha256": digest.hexdigest(),
+            "width": width,
+            "height": height,
+            "qmpResponse": reply,
+            "qmpAcknowledgementIsGuestInputEvidence": False,
+        }
+
     def move_pointer(self, fresh_evidence: OwnershipEvidence,
                      delta_x: int, delta_y: int) -> dict[str, Any]:
         """Move the guest pointer only with fresh evidence for this QAC-owned QMP peer."""
         if (isinstance(delta_x, bool) or not isinstance(delta_x, int)
                 or isinstance(delta_y, bool) or not isinstance(delta_y, int)
-                or not -4096 <= delta_x <= 4096 or not -4096 <= delta_y <= 4096):
+                or not -MAX_QMP_RELATIVE_DELTA <= delta_x <= MAX_QMP_RELATIVE_DELTA
+                or not -MAX_QMP_RELATIVE_DELTA <= delta_y <= MAX_QMP_RELATIVE_DELTA):
             raise PreflightError("QMP pointer movement is outside the bounded relative-input range")
-        return self._send_guarded_input(fresh_evidence, [{
-            "type": "rel", "data": {"axis": "x", "value": delta_x}}, {
-            "type": "rel", "data": {"axis": "y", "value": delta_y}}])
+        events = []
+        if delta_x:
+            events.append({"type": "rel", "data": {"axis": "x", "value": delta_x}})
+        if delta_y:
+            events.append({"type": "rel", "data": {"axis": "y", "value": delta_y}})
+        if not events:
+            raise PreflightError("QMP pointer movement must change at least one axis")
+        return self.send_input_events(fresh_evidence, events)
 
     def left_button(self, fresh_evidence: OwnershipEvidence, down: bool) -> dict[str, Any]:
         """Send one left-button transition to the guest after ownership revalidation."""
         if not isinstance(down, bool):
             raise PreflightError("QMP left-button state must be a boolean")
-        return self._send_guarded_input(fresh_evidence, [{
+        return self.send_input_events(fresh_evidence, [{
             "type": "btn", "data": {"button": "left", "down": down}}])
 
-    def _send_guarded_input(self, fresh_evidence: OwnershipEvidence,
-                            events: list[dict[str, Any]]) -> dict[str, Any]:
+    def key_transition(self, fresh_evidence: OwnershipEvidence,
+                       qcode: str, down: bool) -> dict[str, Any]:
+        """Send one QMP qcode key transition; callers refresh ownership before down and up."""
+        if not isinstance(qcode, str) or qcode not in SUPPORTED_QMP_QCODES:
+            raise PreflightError(f"unsupported QMP qcode {qcode!r}")
+        if not isinstance(down, bool):
+            raise PreflightError("QMP key state must be a boolean")
+        return self.send_input_events(fresh_evidence, [{
+            "type": "key",
+            "data": {"key": {"type": "qcode", "data": qcode}, "down": down},
+        }])
+
+    def send_input_events(self, fresh_evidence: OwnershipEvidence,
+                          events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Send a bounded, supported QMP input sequence after fresh ownership checks."""
         if not self.capabilities_ready:
             raise PreflightError("QMP input refused before capabilities negotiation")
         if not isinstance(self.initial_status, dict) or self.initial_status.get("running") is not True:
             raise PreflightError("QMP input refused unless the guest is verified running")
-        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "input")
-        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
-        reply = self._exchange("input-send-event", {"events": events})
-        if "error" in reply or reply.get("return") != {}:
-            raise QmpProtocolError("QMP guest input event was rejected")
+        if self.input_send_event_available is not True:
+            raise PreflightError("QMP input refused until live schema confirms input-send-event")
+        final_states = _validate_input_events(events, self.input_states)
+        if any(event.get("type") == "rel" for event in events) \
+                and self.current_mouse_available is not True:
+            raise PreflightError("QMP pointer input refused until query-mice confirms a current mouse")
+        self._require_fresh_peer(fresh_evidence, "input")
+        try:
+            reply = self._exchange("input-send-event", {"events": events})
+            if "error" in reply or reply.get("return") != {}:
+                raise QmpProtocolError("QMP guest input event was rejected")
+        except Exception as exc:
+            # Once _exchange starts, a transport or protocol failure can leave
+            # delivery uncertain. The one-shot caller records this as ambiguous.
+            try:
+                setattr(exc, "qmp_send_attempted", True)
+            except Exception:
+                pass
+            for key in final_states:
+                self.input_states[key] = "unknown"
+            raise
+        self.input_states.update(final_states)
         return reply
 
     def _exchange(self, execute: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -959,16 +1100,15 @@ class QmpClient:
 
     def quit(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
         """Send quit only with a fresh successful ownership snapshot for the same endpoint."""
-        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "quit")
-        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
+        self._require_fresh_peer(fresh_evidence, "quit")
         if not self.capabilities_ready:
             raise PreflightError("QMP quit refused before capabilities negotiation")
         return self._exchange("quit")
 
-    def continue_guest(self, fresh_evidence: OwnershipEvidence) -> dict[str, Any]:
+    def continue_guest(self, fresh_evidence: OwnershipEvidence, *,
+                       reverify: Callable[[], OwnershipEvidence]) -> dict[str, Any]:
         """Resume a -S guest only after revalidating the same current QAC-owned listener."""
-        _require_same_owned_identity(self.evidence, fresh_evidence, self.endpoint, "cont")
-        require_connected_peer(fresh_evidence, self.endpoint, self.stream.getsockname())
+        self._require_fresh_peer(fresh_evidence, "cont")
         if not self.capabilities_ready or not isinstance(self.initial_status, dict):
             raise PreflightError("QMP cont refused before capabilities and status negotiation")
         if self.initial_status.get("running") is not False:
@@ -976,7 +1116,9 @@ class QmpClient:
         reply = self._exchange("cont")
         if "error" in reply:
             raise QmpProtocolError("QMP cont command was rejected")
-        status = self.command("query-status")
+        status_evidence = reverify()
+        self._require_fresh_peer(status_evidence, "post-cont query-status")
+        status = self.command("query-status", fresh_evidence=status_evidence)
         result = status.get("return")
         if ("error" in status or not isinstance(result, dict)
                 or result.get("running") is not True or result.get("status") != "running"):
@@ -995,6 +1137,65 @@ class QmpClient:
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+
+
+def _validate_input_events(
+    events: Any,
+    current_states: dict[tuple[str, str], str],
+) -> dict[tuple[str, str], str]:
+    """Validate the narrow key, left-button, and relative-pointer input contract."""
+    if not isinstance(events, list) or not 1 <= len(events) <= MAX_QMP_INPUT_EVENTS:
+        raise PreflightError(f"QMP input must contain 1..{MAX_QMP_INPUT_EVENTS} events")
+    states = dict(current_states)
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or set(event) != {"type", "data"}:
+            raise PreflightError(f"QMP input event {index} has an unsupported shape")
+        kind, data = event["type"], event["data"]
+        if not isinstance(data, dict):
+            raise PreflightError(f"QMP input event {index} data must be an object")
+        if kind == "key":
+            if set(data) != {"key", "down"} or not isinstance(data["down"], bool):
+                raise PreflightError(f"QMP key event {index} has invalid fields")
+            key = data["key"]
+            if (not isinstance(key, dict) or set(key) != {"type", "data"}
+                    or key.get("type") != "qcode"
+                    or not isinstance(key.get("data"), str)
+                    or key.get("data") not in SUPPORTED_QMP_QCODES):
+                raise PreflightError(f"QMP key event {index} must use a supported qcode")
+            identity = ("key", key["data"])
+            state = states.get(identity, "up")
+            if data["down"]:
+                if state != "up":
+                    raise PreflightError(f"QMP key {key['data']!r} is already down or uncertain")
+                states[identity] = "down"
+            else:
+                if state not in ("down", "unknown"):
+                    raise PreflightError(f"QMP key {key['data']!r} release has no matching press")
+                states[identity] = "up"
+        elif kind == "btn":
+            if set(data) != {"button", "down"} or data.get("button") != "left" or not isinstance(data["down"], bool):
+                raise PreflightError(f"QMP button event {index} is outside the left-button contract")
+            identity = ("btn", "left")
+            state = states.get(identity, "up")
+            if data["down"]:
+                if state != "up":
+                    raise PreflightError("QMP left button is already down or uncertain")
+                states[identity] = "down"
+            else:
+                if state not in ("down", "unknown"):
+                    raise PreflightError("QMP left-button release has no matching press")
+                states[identity] = "up"
+        elif kind == "rel":
+            if set(data) != {"axis", "value"} or data.get("axis") not in ("x", "y"):
+                raise PreflightError(f"QMP relative-pointer event {index} has invalid fields")
+            value = data.get("value")
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or not -MAX_QMP_RELATIVE_DELTA <= value <= MAX_QMP_RELATIVE_DELTA
+                    or value == 0):
+                raise PreflightError(f"QMP relative-pointer event {index} is outside the bounded range")
+        else:
+            raise PreflightError(f"unsupported QMP input event type {kind!r}")
+    return states
 
 
 def _register_value(response: Any, expected_id: str, register: str) -> int:
