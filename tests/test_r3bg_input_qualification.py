@@ -127,6 +127,10 @@ class InputContractTests(unittest.TestCase):
                 client.current_mouse_available = False
                 with self.assertRaisesRegex(qmp.PreflightError, "current mouse"):
                     client.send_input_events(client.evidence, event)
+                with self.assertRaisesRegex(qmp.PreflightError, "current mouse"):
+                    client.send_input_events(client.evidence, [
+                        {"type": "btn", "data": {"button": "left", "down": True}}
+                    ])
                 guard.assert_not_called()
                 exchange.assert_not_called()
                 client.current_mouse_available = True

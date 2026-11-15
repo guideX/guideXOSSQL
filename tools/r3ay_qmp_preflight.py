@@ -1055,9 +1055,9 @@ class QmpClient:
         if self.input_send_event_available is not True:
             raise PreflightError("QMP input refused until live schema confirms input-send-event")
         final_states = _validate_input_events(events, self.input_states)
-        if any(event.get("type") == "rel" for event in events) \
+        if any(event.get("type") in ("rel", "btn") for event in events) \
                 and self.current_mouse_available is not True:
-            raise PreflightError("QMP pointer input refused until query-mice confirms a current mouse")
+            raise PreflightError("QMP mouse input refused until query-mice confirms a current mouse")
         self._require_fresh_peer(fresh_evidence, "input")
         try:
             reply = self._exchange("input-send-event", {"events": events})
