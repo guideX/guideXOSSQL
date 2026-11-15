@@ -1,7 +1,9 @@
 # NDB1R4P11R3BG — Native ELF QAC Input Qualification
 
-**Outcome:** `NATIVE_SQL_APP_INPUT_HOSTED_VERIFIED` (Outcome A)  
-**Phase boundary:** offline input tooling, QMP framing, evidence analysis, and R3BH procedure only  
+**Outcome:** `NATIVE_SQL_APP_INPUT_HOSTED_VERIFIED` (Outcome A)
+
+**Phase boundary:** offline input tooling, QMP framing, evidence analysis, and R3BH procedure only
+
 **Guest launches / QAC admissions in R3BG:** 0 / 0
 
 ## Result
