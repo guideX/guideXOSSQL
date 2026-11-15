@@ -25,6 +25,8 @@ The intended normal launch is **Start → All Programs → SQL Read Demo**. The 
 
 This invocation path and the code that will populate the Start Menu were reviewed statically. Because there was no R3BD guest launch, no claim is made that the guest displayed or launched this app.
 
+The qualification kernel does not currently emit a per-callback SQL dispatch counter or serial marker. A future guest run of this candidate could report application results, while the source trace establishes the intended callback path, but it would not provide an independent kernel-side runtime witness for each SQL call. The boot-time SQL diagnostic is not such a witness. This evidence gap needs a small qualification-only instrumentation change before a guest result can satisfy the separate kernel-confirmation criterion.
+
 ## Application checks exercised by the hosted harness
 
 The hosted harness invokes the SDK sample entry point with the real production SQL service installed through `installHostCalls`, the production VFS and approved R3AH fixture, and a harness log callback. It is useful hosted evidence, not guest evidence.
@@ -86,4 +88,4 @@ Native ELF executes in kernel address space. This work does not establish user/k
 
 R3BB Gate 9 remains **UNVERIFIED**. Its independent QMP walker stopped at the writable sidecar mapping at `0x3DD3F003` before completing the RAM-disk page-table/boundary witness. R3BD did not run that walker and does not change the R3BB evidence or close Gate 9. Track the witness separately from application API acceptance.
 
-After the R3BD guest acceptance is complete, the next bounded SQL functionality milestone should stay within immutable, manifest-approved reads: exercise a second approved fixture or caller-selected index case through the same public API and ownership limits. Do not expand this milestone into database writes or a general SQL parser.
+Before consuming the still-unused R3BD guest launch, the next step is a separate, reviewable qualification-instrumentation change: add kernel-side evidence for SQL callback dispatch and for the number of application-owned sessions reclaimed by `detach`, then arrange for the sample to leave one session open until `gx_main` returns. Rebuild and revalidate that candidate before any guest launch; do not patch or rebuild during acceptance. After guest qualification, the next bounded SQL functionality milestone should stay within immutable, manifest-approved reads: exercise a second approved fixture or caller-selected index case through the same public API and ownership limits. Do not expand this milestone into database writes or a general SQL parser.
