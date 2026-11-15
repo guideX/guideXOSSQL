@@ -58,13 +58,15 @@ Both fresh kernel builds exited with code 0. The ordinary build enabled the publ
 
 The RAM disk was made in the dedicated R3BD artifact tree from the accepted R3AR runtime files plus the compiled sample at `/Apps/SQLReadDemo`. Independent raw and PyFatFS validation passed: FAT32, 512-byte sectors, one sector per cluster, two FATs, 118,926 data clusters, 89 files, and nine directories. The trusted fixture remains 250,880 bytes with SHA-256 `cf100504a5cbe5eaeebaa483d3b9265e3042860cb8363e383819f5d1e88d3c57`; `FIXTURE.MAN` remains 12,937 bytes with SHA-256 `43687cbd0087e3ff8747605a1f3510dd4ee3eff780fe8a7e1ef5b45e7f90a8d3`.
 
-The repository ESP verifier passed. The ISO verifier confirmed a UEFI El Torito, no-emulation image. I extracted the boot image from the ISO and independently verified it as an ESP, then extracted the embedded RAM disk and checked the app manifest, app ELF, database fixture, and trusted manifest against their expected byte lengths and hashes. The embedded app ELF and manifest match the SDK build outputs byte-for-byte. Reports and the full candidate manifest are in `E:\CodexArtifacts\NDB1R4P11R3BD\candidate`.
+The repository ESP verifier passed. The ISO verifier confirmed a UEFI El Torito, no-emulation image. I extracted the boot image from the ISO and independently verified it as an ESP, then extracted the embedded RAM disk and checked the app manifest, app ELF, database fixture, and trusted manifest against their expected byte lengths and hashes. The embedded app ELF and manifest match the SDK build outputs byte-for-byte. Reports and the candidate manifests are in `E:\CodexArtifacts\NDB1R4P11R3BD\candidate`; `candidate-manifest-v3.json` records the final prelaunch-blocked outcome while preserving the earlier v2 snapshot.
 
 The affected QMP ownership helper tests had an earlier 20/20 pass during implementation. A later fresh run had 19 passing tests and one timeout in the synthetic Windows process/listener attribution test. A targeted rerun of that integration test passed 1/1 in 37.3 seconds. This Windows timing-sensitive helper result does not affect the built ISO; the existing two-second freshness and ownership correlation checks were not weakened.
 
 ## QAC admission and guest frontier
 
-A fresh authoritative QAC `status`, `list`, and `queue` census was captured at `2026-11-14T23:32:34Z` in `E:\CodexArtifacts\NDB1R4P11R3BD\candidate\qac-census-20261114T233234Z.txt`. QAC 2.0.0 was online with one managed acceptance session already running for the StellarNavigator workstream, zero foreign QEMU processes, and zero queued reservations. This occupies exclusive QAC admission. No R3BD request or reservation was made, no QEMU process was started for R3BD, and no guest serial/QMP evidence exists.
+The first fresh authoritative QAC `status`, `list`, and `queue` census was captured at `2026-11-14T23:32:34Z` in `E:\CodexArtifacts\NDB1R4P11R3BD\candidate\qac-census-20261114T233234Z.txt`; it found another team's managed acceptance. A later census at `2026-11-14T23:46:08Z`, `E:\CodexArtifacts\NDB1R4P11R3BD\candidate\qac-final-census-20261114T234608Z.txt`, found QAC clear. Candidate prelaunch checks then verified the immutable OVMF and ISO identities and a free local QMP port.
+
+The required fresh admission census immediately before submission was captured by the runner at `2026-11-15T00:03:01.401Z`. Its full `status`, `list`, and `queue` responses are preserved in `E:\CodexArtifacts\NDB1R4P11R3BD\attempt-20261114-single-launch\qac-pre-admission-census.json`. QAC was online, with one managed QEMU session and no queued or blocked reservations. `list` identified the active owner as `guideXOSUEFI-FONTS8R2` acceptance (reservation `2ce27cb50c5d4078a8c1ae2b9f463778`, QEMU PID 30884). The single-launch runner wrote `prelaunch-blocked.json` and stopped before invoking QAC's `run` command. Thus no R3BD reservation was submitted, no R3BD QEMU process was started, and no guest serial/QMP evidence exists. The change from the earlier clear census is an admission-time race with another managed run; that run was left undisturbed. The final blocked census is also recorded in `timeline.jsonl` in the attempt directory.
 
 | Required guest observation | R3BD status |
 |---|---|
@@ -76,7 +78,7 @@ A fresh authoritative QAC `status`, `list`, and `queue` census was captured at `
 | Cleanup of an outstanding session on guest app exit | Not observed; hosted detach cleanup passes |
 | Guest fault-free completion, shutdown, and QAC release | Not observed; no R3BD reservation |
 
-The classification is Outcome B because the pre-execution candidate and hosted/build checks passed, while the exclusive admission policy prevented live acceptance. It is not Outcome A. The next R3BD action is one QAC-managed launch of this exact candidate after the active reservation is released; there must be no duplicate launch or repair-and-retry in that acceptance lifecycle.
+The classification is Outcome B because the pre-execution candidate and hosted/build checks passed, while the fresh admission guard found QAC occupied and stopped before guest execution. It is not Outcome A. The exact candidate remains preserved for a separately authorized acceptance lifecycle when QAC is available; this blocked lifecycle did not start a guest and produced no guest evidence.
 
 ## Security boundary and separate R3BB issue
 
