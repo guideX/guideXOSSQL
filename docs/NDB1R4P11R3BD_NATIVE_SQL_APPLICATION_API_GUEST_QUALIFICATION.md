@@ -78,7 +78,7 @@ The required fresh admission census immediately before submission was captured b
 | Cleanup of an outstanding session on guest app exit | Not observed; hosted detach cleanup passes |
 | Guest fault-free completion, shutdown, and QAC release | Not observed; no R3BD reservation |
 
-The classification is Outcome B because the pre-execution candidate and hosted/build checks passed, while the fresh admission guard found QAC occupied and stopped before guest execution. It is not Outcome A. The exact candidate remains preserved for a separately authorized acceptance lifecycle when QAC is available; this blocked lifecycle did not start a guest and produced no guest evidence.
+The classification is Outcome B because the pre-execution candidate and hosted/build checks passed, while the fresh admission guard found QAC occupied and stopped before guest execution. It is not Outcome A. The exact candidate remains preserved for the still-unused single QAC-managed launch after a fresh admission census shows QAC clear. No guest started in this blocked admission, and no guest evidence exists.
 
 ## Security boundary and separate R3BB issue
 
