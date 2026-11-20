@@ -5,6 +5,7 @@
 #include "gx_index_integer_key.h"
 #include "gx_index_internal_node.h"
 #include "gx_index_lookup.h"
+#include "gx_page_codec.h"
 
 // The Server adds this diagnostic-gated bridge probe alongside its VFS. Keep
 // the native adapter source-compatible with the older hosted bridge used by
@@ -18,19 +19,33 @@ const char kFixturePath[] = "/system/Apps/R3AI/MULTI.gxdb";
 const uint32_t kPageSize = 512;
 const uint64_t kPageCount = 490;
 const uint64_t kCatalogRootPageId = 1;
-const uint64_t kPointRootPageId = 234;
-const uint32_t kPointOwnerIndexId = 1;
-const uint64_t kRangeRootPageId = 148;
-const uint32_t kRangeOwnerIndexId = 2;
 const uint64_t kCreationTimeUnixNanos = 1793556264120817800ull;
 const size_t kFixtureBytes = 250880;
 const uint32_t kMaxDepth = gxos::db::kMaxIndexDepth;
+const uint32_t kMaxResults = static_cast<uint32_t>(GX_NATIVE_SQL_READ_MAX_RESULTS);
 
 struct IndexIdentity {
+    GxNativeSqlReadIndex identity;
     uint64_t rootPageId;
     uint32_t ownerIndexId;
     uint8_t isInt64;
+    GxNativeSqlIndexCatalogEntry catalog;
 };
+
+// This trusted package configuration is also the query dispatch catalog.
+// Names/types/capabilities are sourced from the reviewed R3AH package
+// manifest; identity/root/owner must match the actual index pages at runtime.
+const IndexIdentity kIndexes[] = {
+    {GX_NATIVE_SQL_INDEX_ROWS_K64, 234, 1, 1,
+     {GX_NATIVE_SQL_INDEX_ROWS_K64, "IX_Rows_K64", GX_NATIVE_SQL_KEY_INT64,
+      GX_NATIVE_SQL_INDEX_CAP_POINT,
+      GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST, kMaxResults}},
+    {GX_NATIVE_SQL_INDEX_ROWS_K32, 148, 2, 0,
+     {GX_NATIVE_SQL_INDEX_ROWS_K32, "IX_Rows_K32", GX_NATIVE_SQL_KEY_INT32,
+      GX_NATIVE_SQL_INDEX_CAP_RANGE,
+      GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST, kMaxResults}}
+};
+const size_t kIndexCount = sizeof(kIndexes) / sizeof(kIndexes[0]);
 
 struct StagedLocator {
     uint64_t pageId;
@@ -50,17 +65,11 @@ const uint8_t kExpectedDatabaseId[16] = {
 
 bool identityFor(GxNativeSqlReadIndex index, IndexIdentity* out) {
     if (!out) return false;
-    if (index == GX_NATIVE_SQL_INDEX_ROWS_K64) {
-        out->rootPageId = kPointRootPageId;
-        out->ownerIndexId = kPointOwnerIndexId;
-        out->isInt64 = 1;
-        return true;
-    }
-    if (index == GX_NATIVE_SQL_INDEX_ROWS_K32) {
-        out->rootPageId = kRangeRootPageId;
-        out->ownerIndexId = kRangeOwnerIndexId;
-        out->isInt64 = 0;
-        return true;
+    for (size_t i = 0; i < kIndexCount; ++i) {
+        if (kIndexes[i].identity == index) {
+            *out = kIndexes[i];
+            return true;
+        }
     }
     return false;
 }
@@ -236,6 +245,70 @@ bool selectedRootMatches(GxNativeSqlIndexPageProviderContext* context,
         context->error == GX_NATIVE_SQL_IMAGE_OK;
 }
 
+bool catalogRootMatches(GxNativeSqlIndexPageProviderContext* context) {
+    uint64_t offset = 0;
+    if (!gxNativeSqlIndexPageOffset(context->catalogRootPageId,
+                                    context->pageSize, &offset)) {
+        context->error = GX_NATIVE_SQL_IMAGE_OFFSET_OVERFLOW;
+        return false;
+    }
+    context->nativeFileStatus = gx_db_file_read_at(
+        context->fileHandle, offset, context->pageBuffer, context->pageSize);
+    if (context->nativeFileStatus != GX_DB_FILE_OK) {
+        context->error = context->nativeFileStatus == GX_DB_FILE_SHORT_READ
+            ? GX_NATIVE_SQL_IMAGE_TRUNCATED
+            : GX_NATIVE_SQL_IMAGE_READ_FAILURE;
+        return false;
+    }
+
+    GxDatabasePageInfo pageInfo = {};
+    if (gxDatabasePageInspect(context->pageBuffer, context->pageSize,
+            context->pageSize, context->catalogRootPageId, &pageInfo) !=
+            GxStatus::Ok ||
+        pageInfo.pageType != static_cast<uint16_t>(gxos::db::PageType::Catalog) ||
+        pageInfo.payloadSize < 8) {
+        context->error = GX_NATIVE_SQL_IMAGE_CORRUPT_PAGE;
+        return false;
+    }
+
+    const uint8_t* payload = context->pageBuffer + gxos::db::kPageHeaderSize;
+    const uint16_t version = gxos::db::loadLe16(payload + 4);
+    const uint32_t rootHeaderSize = version == gxos::db::kCatalogVersionV3
+        ? gxos::db::kCatalogV3RootHeaderSize
+        : version == gxos::db::kCatalogVersionV4
+            ? gxos::db::kCatalogV4RootHeaderSize : 0;
+    if (gxos::db::loadLe32(payload) != gxos::db::kCatalogMagic ||
+        rootHeaderSize == 0 || pageInfo.payloadSize < rootHeaderSize ||
+        gxos::db::loadLe16(payload + 6) != 0) {
+        context->error = GX_NATIVE_SQL_IMAGE_CORRUPT_PAGE;
+        return false;
+    }
+
+    const uint32_t continuationCount = gxos::db::loadLe32(payload + 16);
+    const uint64_t firstContinuation = gxos::db::loadLe32(payload + 20);
+    const uint32_t tableCount = gxos::db::loadLe32(payload + 8);
+    const uint32_t rootRecordCount = gxos::db::loadLe32(payload + 24);
+    const uint32_t indexCount = gxos::db::loadLe32(payload + 28);
+    const uint32_t foreignKeyCount = version == gxos::db::kCatalogVersionV4
+        ? gxos::db::loadLe32(payload + 36) : 0;
+    if (tableCount > gxos::db::kMaxTables ||
+        continuationCount > context->pageCount ||
+        (continuationCount == 0 && firstContinuation != 0) ||
+        (continuationCount != 0 &&
+         (firstContinuation == 0 || firstContinuation >= context->pageCount)) ||
+        indexCount < kIndexCount || indexCount > gxos::db::kMaxIndexes ||
+        rootRecordCount > tableCount + indexCount + foreignKeyCount ||
+        (version == gxos::db::kCatalogVersionV3 &&
+         gxos::db::loadLe32(payload + 36) != 0) ||
+        (version == gxos::db::kCatalogVersionV4 &&
+         (foreignKeyCount > gxos::db::kMaxForeignKeys ||
+          gxos::db::loadLe32(payload + 44) != 0))) {
+        context->error = GX_NATIVE_SQL_IMAGE_CORRUPT_PAGE;
+        return false;
+    }
+    return true;
+}
+
 GxNativeSqlReadStatus executeTraversal(
     const GxNativeSqlReadRequest& request,
     GxNativeSqlIndexPageProviderContext* context,
@@ -350,6 +423,9 @@ GxNativeSqlReadStatus gxNativeSqlExecuteRead(
     if (!headerMatches(context)) {
         operationStatus = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
         response->imageError = GX_NATIVE_SQL_IMAGE_METADATA_MISMATCH;
+    } else if (!catalogRootMatches(&context)) {
+        response->imageError = context.error;
+        operationStatus = imageFailureStatus(context.error);
     } else if (!selectedRootMatches(&context, index)) {
         response->imageError = context.error;
         operationStatus = context.error == GX_NATIVE_SQL_IMAGE_OK
@@ -450,6 +526,9 @@ GxNativeSqlReadStatus gxNativeSqlValidateDatabase(
     } else if (!headerMatches(context)) {
         *imageError = GX_NATIVE_SQL_IMAGE_METADATA_MISMATCH;
         status = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
+    } else if (!catalogRootMatches(&context)) {
+        *imageError = context.error;
+        status = imageFailureStatus(context.error);
     } else if (!selectedRootMatches(&context, index)) {
         if (context.error != GX_NATIVE_SQL_IMAGE_OK) {
             *imageError = context.error;
@@ -457,6 +536,103 @@ GxNativeSqlReadStatus gxNativeSqlValidateDatabase(
         } else {
             *imageError = GX_NATIVE_SQL_IMAGE_INVALID_ROOT;
             status = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
+        }
+    }
+
+    if (context.active) {
+        *cleanupError = gxNativeSqlIndexPageProviderClose(&context);
+    } else if (context.fileHandle != GX_DB_FILE_INVALID_HANDLE) {
+        *cleanupError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+    }
+    if (*cleanupError != GX_NATIVE_SQL_IMAGE_OK) {
+        return GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    }
+    return status;
+}
+
+size_t gxNativeSqlGetSupportedIndexCount(void) {
+    return kIndexCount;
+}
+
+const GxNativeSqlIndexCatalogEntry* gxNativeSqlGetSupportedIndexAt(
+    size_t index) {
+    return index < kIndexCount ? &kIndexes[index].catalog : 0;
+}
+
+int gxNativeSqlGetReadIndexIdentity(GxNativeSqlReadIndex index,
+    uint64_t* outCatalogRootPageId, uint64_t* outRootPageId,
+    uint32_t* outOwnerIndexId) {
+    if (!outCatalogRootPageId || !outRootPageId || !outOwnerIndexId) return 0;
+    *outCatalogRootPageId = 0;
+    *outRootPageId = 0;
+    *outOwnerIndexId = 0;
+    IndexIdentity identity = {};
+    if (!identityFor(index, &identity)) return 0;
+    *outCatalogRootPageId = kCatalogRootPageId;
+    *outRootPageId = identity.rootPageId;
+    *outOwnerIndexId = identity.ownerIndexId;
+    return 1;
+}
+
+GxNativeSqlReadStatus gxNativeSqlValidateCatalog(
+    GxNativeSqlReadFixture fixture,
+    GxNativeSqlImageError* imageError,
+    GxNativeSqlImageError* cleanupError) {
+    if (!imageError || !cleanupError) return GX_NATIVE_SQL_READ_INVALID_REQUEST;
+    *imageError = GX_NATIVE_SQL_IMAGE_OK;
+    *cleanupError = GX_NATIVE_SQL_IMAGE_OK;
+    if (fixture != GX_NATIVE_SQL_FIXTURE_R3AH_MULTILEVEL || kIndexCount == 0) {
+        return GX_NATIVE_SQL_READ_INVALID_REQUEST;
+    }
+
+    uint8_t pageBuffer[kPageSize] = {};
+    GxNativeSqlIndexPageProviderContext context = {};
+    gxNativeSqlIndexPageProviderInit(&context);
+    GxNativeSqlIndexImageIdentity imageIdentity = {};
+    imageIdentity.pageSize = kPageSize;
+    imageIdentity.pageCount = kPageCount;
+    imageIdentity.catalogRootPageId = kCatalogRootPageId;
+    imageIdentity.indexRootPageId = kIndexes[0].rootPageId;
+    imageIdentity.ownerIndexId = kIndexes[0].ownerIndexId;
+    imageIdentity.consistency = GX_NATIVE_SQL_CONSISTENCY_IMMUTABLE_IMAGE;
+
+    *imageError = gxNativeSqlIndexPageProviderOpen(
+        &context, kFixturePath, &imageIdentity, pageBuffer, sizeof(pageBuffer));
+    if (*imageError != GX_NATIVE_SQL_IMAGE_OK) {
+        const GxNativeSqlReadStatus status = imageFailureStatus(*imageError);
+        if (context.active) {
+            *cleanupError = gxNativeSqlIndexPageProviderClose(&context);
+        } else if (context.fileHandle != GX_DB_FILE_INVALID_HANDLE) {
+            *cleanupError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+        }
+        return *cleanupError == GX_NATIVE_SQL_IMAGE_OK
+            ? status : GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    }
+
+    uint8_t readOnlyMount = 0;
+    const GxDbFileStatus mountStatus = gx_db_file_is_read_only(
+        context.fileHandle, &readOnlyMount);
+    GxNativeSqlReadStatus status = GX_NATIVE_SQL_READ_OK;
+    if (mountStatus != GX_DB_FILE_OK) {
+        *imageError = GX_NATIVE_SQL_IMAGE_BAD_STATE;
+        status = GX_NATIVE_SQL_READ_STORAGE_FAILURE;
+    } else if (!readOnlyMount) {
+        *imageError = GX_NATIVE_SQL_IMAGE_UNSUPPORTED_MODE;
+        status = GX_NATIVE_SQL_READ_UNSUPPORTED_OPERATION;
+    } else if (!headerMatches(context)) {
+        *imageError = GX_NATIVE_SQL_IMAGE_METADATA_MISMATCH;
+        status = GX_NATIVE_SQL_READ_CORRUPT_INDEX;
+    } else if (!catalogRootMatches(&context)) {
+        *imageError = context.error == GX_NATIVE_SQL_IMAGE_OK
+            ? GX_NATIVE_SQL_IMAGE_CORRUPT_PAGE : context.error;
+        status = imageFailureStatus(*imageError);
+    } else {
+        for (size_t i = 0; i < kIndexCount; ++i) {
+            if (selectedRootMatches(&context, kIndexes[i])) continue;
+            *imageError = context.error == GX_NATIVE_SQL_IMAGE_OK
+                ? GX_NATIVE_SQL_IMAGE_INVALID_ROOT : context.error;
+            status = imageFailureStatus(*imageError);
+            break;
         }
     }
 

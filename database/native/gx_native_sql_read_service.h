@@ -33,6 +33,29 @@ enum GxNativeSqlReadStatus {
     GX_NATIVE_SQL_READ_RESOURCE_EXHAUSTED
 };
 
+enum GxNativeSqlIndexKeyType {
+    GX_NATIVE_SQL_KEY_INT32 = 1,
+    GX_NATIVE_SQL_KEY_INT64 = 2
+};
+
+enum GxNativeSqlIndexCapability {
+    GX_NATIVE_SQL_INDEX_CAP_POINT = 1u,
+    GX_NATIVE_SQL_INDEX_CAP_RANGE = 2u
+};
+
+enum GxNativeSqlIndexComparison {
+    GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST = 1u
+};
+
+struct GxNativeSqlIndexCatalogEntry {
+    uint32_t identity;
+    const char* name;
+    uint32_t keyType;
+    uint32_t capabilities;
+    uint32_t comparisonSemantics;
+    uint32_t maximumResults;
+};
+
 static const size_t GX_NATIVE_SQL_READ_MAX_RESULTS = 73;
 
 struct GxNativeSqlReadRequest {
@@ -90,6 +113,24 @@ GxNativeSqlReadStatus gxNativeSqlExecuteRead(
 // provider, header checks, and a trusted catalog index root. The provider is
 // always closed before this function returns; no VFS/SQL pointer is retained.
 GxNativeSqlReadStatus gxNativeSqlValidateDatabase(
+    GxNativeSqlReadFixture fixture,
+    GxNativeSqlImageError* imageError,
+    GxNativeSqlImageError* cleanupError);
+
+// Returns the compile-time trusted metadata used by identityFor() and query
+// dispatch. The entries are ordered by stable identity and do not expose page
+// roots. Call gxNativeSqlValidateCatalog before publishing them to an app.
+size_t gxNativeSqlGetSupportedIndexCount(void);
+const GxNativeSqlIndexCatalogEntry* gxNativeSqlGetSupportedIndexAt(
+    size_t index);
+int gxNativeSqlGetReadIndexIdentity(GxNativeSqlReadIndex index,
+    uint64_t* outCatalogRootPageId, uint64_t* outRootPageId,
+    uint32_t* outOwnerIndexId);
+
+// Validates the approved immutable image and every index the reader advertises
+// using the production VFS/page provider. This is an application catalog
+// preflight, not a general on-disk catalog parser.
+GxNativeSqlReadStatus gxNativeSqlValidateCatalog(
     GxNativeSqlReadFixture fixture,
     GxNativeSqlImageError* imageError,
     GxNativeSqlImageError* cleanupError);
