@@ -15,7 +15,8 @@ enum GxNativeSqlReadFixture {
 
 enum GxNativeSqlReadIndex {
     GX_NATIVE_SQL_INDEX_ROWS_K64 = 1,
-    GX_NATIVE_SQL_INDEX_ROWS_K32 = 2
+    GX_NATIVE_SQL_INDEX_ROWS_K32 = 2,
+    GX_NATIVE_SQL_INDEX_ROWS_KBOOL = 3
 };
 
 enum GxNativeSqlReadOperation {
@@ -35,7 +36,8 @@ enum GxNativeSqlReadStatus {
 
 enum GxNativeSqlIndexKeyType {
     GX_NATIVE_SQL_KEY_INT32 = 1,
-    GX_NATIVE_SQL_KEY_INT64 = 2
+    GX_NATIVE_SQL_KEY_INT64 = 2,
+    GX_NATIVE_SQL_KEY_BOOLEAN = 3
 };
 
 enum GxNativeSqlIndexCapability {
@@ -44,7 +46,8 @@ enum GxNativeSqlIndexCapability {
 };
 
 enum GxNativeSqlIndexComparison {
-    GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST = 1u
+    GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST = 1u,
+    GX_NATIVE_SQL_COMPARE_BOOLEAN_ASCENDING_NULLS_FIRST = 2u
 };
 
 struct GxNativeSqlIndexCatalogEntry {
@@ -69,7 +72,7 @@ struct GxNativeSqlReadRequest {
 
     // Point lookup uses keyBytes/keyLength. Range scan uses the lower/upper
     // encoded key spans and endpoint flags. Encodings are the existing tagged
-    // Int64 (K64) or Int32 (K32) logical-key formats.
+    // Int64 (K64), Int32 (K32), or Boolean (KBool) logical-key formats.
     const uint8_t* keyBytes;
     size_t keyLength;
     uint8_t hasLower;

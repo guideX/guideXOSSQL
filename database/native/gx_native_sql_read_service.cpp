@@ -2,6 +2,7 @@
 
 #include "database_endian.h"
 #include "database_format.h"
+#include "gx_index_boolean_key.h"
 #include "gx_index_integer_key.h"
 #include "gx_index_internal_node.h"
 #include "gx_index_lookup.h"
@@ -28,7 +29,7 @@ struct IndexIdentity {
     GxNativeSqlReadIndex identity;
     uint64_t rootPageId;
     uint32_t ownerIndexId;
-    uint8_t isInt64;
+    uint32_t keyType;
     GxNativeSqlIndexCatalogEntry catalog;
 };
 
@@ -36,14 +37,18 @@ struct IndexIdentity {
 // Names/types/capabilities are sourced from the reviewed R3AH package
 // manifest; identity/root/owner must match the actual index pages at runtime.
 const IndexIdentity kIndexes[] = {
-    {GX_NATIVE_SQL_INDEX_ROWS_K64, 234, 1, 1,
+    {GX_NATIVE_SQL_INDEX_ROWS_K64, 234, 1, GX_NATIVE_SQL_KEY_INT64,
      {GX_NATIVE_SQL_INDEX_ROWS_K64, "IX_Rows_K64", GX_NATIVE_SQL_KEY_INT64,
       GX_NATIVE_SQL_INDEX_CAP_POINT,
       GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST, kMaxResults}},
-    {GX_NATIVE_SQL_INDEX_ROWS_K32, 148, 2, 0,
+    {GX_NATIVE_SQL_INDEX_ROWS_K32, 148, 2, GX_NATIVE_SQL_KEY_INT32,
      {GX_NATIVE_SQL_INDEX_ROWS_K32, "IX_Rows_K32", GX_NATIVE_SQL_KEY_INT32,
       GX_NATIVE_SQL_INDEX_CAP_RANGE,
-      GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST, kMaxResults}}
+      GX_NATIVE_SQL_COMPARE_SIGNED_ASCENDING_NULLS_FIRST, kMaxResults}},
+    {GX_NATIVE_SQL_INDEX_ROWS_KBOOL, 124, 3, GX_NATIVE_SQL_KEY_BOOLEAN,
+     {GX_NATIVE_SQL_INDEX_ROWS_KBOOL, "IX_Rows_KBool", GX_NATIVE_SQL_KEY_BOOLEAN,
+      GX_NATIVE_SQL_INDEX_CAP_POINT,
+      GX_NATIVE_SQL_COMPARE_BOOLEAN_ASCENDING_NULLS_FIRST, kMaxResults}}
 };
 const size_t kIndexCount = sizeof(kIndexes) / sizeof(kIndexes[0]);
 
@@ -74,23 +79,34 @@ bool identityFor(GxNativeSqlReadIndex index, IndexIdentity* out) {
     return false;
 }
 
-bool validEncodedKey(const uint8_t* bytes, size_t length, bool isInt64) {
-    if (isInt64) {
+bool validEncodedKey(const uint8_t* bytes, size_t length, uint32_t keyType) {
+    if (keyType == GX_NATIVE_SQL_KEY_INT64) {
         int64_t value = 0;
         bool isNull = false;
         return gxDecodeIndexInt64Key(bytes, length, &value, &isNull) ==
             GxStatus::Ok;
     }
-    int32_t value = 0;
-    bool isNull = false;
-    return gxDecodeIndexInt32Key(bytes, length, &value, &isNull) ==
-        GxStatus::Ok;
+    if (keyType == GX_NATIVE_SQL_KEY_INT32) {
+        int32_t value = 0;
+        bool isNull = false;
+        return gxDecodeIndexInt32Key(bytes, length, &value, &isNull) ==
+            GxStatus::Ok;
+    }
+    if (keyType == GX_NATIVE_SQL_KEY_BOOLEAN) {
+        bool value = false;
+        bool isNull = false;
+        return gxDecodeIndexBooleanKey(bytes, length, &value, &isNull) ==
+            GxStatus::Ok;
+    }
+    return false;
 }
 
-bool validKeySpan(const uint8_t* bytes, size_t length, bool isInt64) {
-    const size_t maxLength = isInt64 ? 9u : 5u;
+bool validKeySpan(const uint8_t* bytes, size_t length, uint32_t keyType) {
+    const size_t maxLength = keyType == GX_NATIVE_SQL_KEY_INT64 ? 9u :
+        keyType == GX_NATIVE_SQL_KEY_INT32 ? 5u :
+        keyType == GX_NATIVE_SQL_KEY_BOOLEAN ? 2u : 0u;
     return bytes != 0 && length != 0 && length <= maxLength &&
-        validEncodedKey(bytes, length, isInt64);
+        validEncodedKey(bytes, length, keyType);
 }
 
 bool validRequest(const GxNativeSqlReadRequest& request,
@@ -117,11 +133,12 @@ bool validRequest(const GxNativeSqlReadRequest& request,
     }
     if (request.operation == GX_NATIVE_SQL_READ_POINT) {
         if (!validKeySpan(request.keyBytes, request.keyLength,
-                          index.isInt64) ||
+                          index.keyType) ||
             request.hasLower || request.lowerKeyBytes || request.lowerKeyLength ||
             request.lowerInclusive || request.hasUpper || request.upperKeyBytes ||
             request.upperKeyLength || request.upperInclusive ||
-            request.index != GX_NATIVE_SQL_INDEX_ROWS_K64) {
+            (request.index != GX_NATIVE_SQL_INDEX_ROWS_K64 &&
+             request.index != GX_NATIVE_SQL_INDEX_ROWS_KBOOL)) {
             *failure = GX_NATIVE_SQL_READ_INVALID_REQUEST;
             return false;
         }
@@ -136,11 +153,13 @@ bool validRequest(const GxNativeSqlReadRequest& request,
         return false;
     }
     if ((request.hasLower && !validKeySpan(request.lowerKeyBytes,
-                                            request.lowerKeyLength, false)) ||
+                                            request.lowerKeyLength,
+                                            GX_NATIVE_SQL_KEY_INT32)) ||
         (!request.hasLower && (request.lowerKeyBytes || request.lowerKeyLength ||
                                request.lowerInclusive)) ||
         (request.hasUpper && !validKeySpan(request.upperKeyBytes,
-                                            request.upperKeyLength, false)) ||
+                                            request.upperKeyLength,
+                                            GX_NATIVE_SQL_KEY_INT32)) ||
         (!request.hasUpper && (request.upperKeyBytes || request.upperKeyLength ||
                                request.upperInclusive))) {
         *failure = GX_NATIVE_SQL_READ_INVALID_REQUEST;
